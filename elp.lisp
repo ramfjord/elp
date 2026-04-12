@@ -13,7 +13,39 @@
    ;; Advanced/internal-use API
    :tokenize-file))
 
+
 (in-package :elp)
+
+;;;; mmap support
+
+(defconstant +prot-read+   #x1)
+(defconstant +map-private+ #x2)
+(defconstant +o-rdonly+    0)
+
+(defun %mmap-open (pathname)
+  "Open PATHNAME read-only and mmap it. Returns (values mmap-pointer file-size fd)."
+  (let* ((namestr (namestring pathname))
+         (fd (cffi:foreign-funcall "open" :string namestr :int +o-rdonly+ :int))
+         (size (with-open-file (f pathname) (file-length f))))
+    (when (< fd 0)
+      (error "open(2) failed for ~A" pathname))
+    (let ((ptr (cffi:foreign-funcall "mmap"
+                                     :pointer (cffi:null-pointer)
+                                     :size    size
+                                     :int     +prot-read+
+                                     :int     +map-private+
+                                     :int     fd
+                                     :size    0
+                                     :pointer)))
+      (when (cffi:pointer-eq ptr (cffi:make-pointer (1- (expt 2 64))))
+        (cffi:foreign-funcall "close" :int fd :int)
+        (error "mmap(2) failed for ~A" pathname))
+      (values ptr size fd))))
+
+(defun %mmap-close (ptr size fd)
+  "Unmap PTR (of SIZE bytes) and close FD."
+  (cffi:foreign-funcall "munmap" :pointer ptr :size size :int)
+  (cffi:foreign-funcall "close"  :int fd :int))
 
 ;;;; Public API
 
@@ -32,41 +64,51 @@
 (defmethod render ((pathname pathname) context-alist)
   "Render template file at PATHNAME with CONTEXT-ALIST.
 
-   Tokenizes the template file, generates executable Lisp code, and evaluates it
-   with the provided context bindings, returning the rendered output."
-  (let ((tokens (tokenize-file pathname)))
-    (let ((sexp (generate-render-code pathname tokens context-alist)))
-      (with-output-to-string (out)
-        (let ((*standard-output* out))
-          (eval sexp))))))
+   Tokenizes the file, generates a self-contained sexp that opens the mmap,
+   writes all text ranges via write(2), then closes it, and evals that sexp."
+  (let* ((tokens (tokenize-file pathname))
+         (sexp   (generate-render-code pathname tokens context-alist)))
+    (with-output-to-string (out)
+      (let ((*standard-output* out))
+        (eval sexp)))))
 
 ;;;; Internal Helper Functions
 
-(defun write-output-range (filename start end &optional (stream *standard-output*))
-  "Write bytes from START to END of FILENAME to STREAM.
+(defun write-output-range (mmap-ptr start end &optional (stream *standard-output*))
+  "Write bytes [START, END) from MMAP-PTR to STREAM.
 
-   Uses buffered reading to avoid loading the entire range into memory at once.
-   Buffer size is 8KB for efficient streaming of large template sections."
-  (with-open-file (f filename :direction :input :element-type 'character)
-    (let ((buffer-size 8192)
-          (remaining (- end start)))
-      (file-position f start)
-      (loop while (> remaining 0)
-            do (let* ((to-read (min buffer-size remaining))
-                      (buf (make-string to-read)))
-                 (read-sequence buf f)
-                 (write-string buf stream)
-                 (decf remaining to-read))))))
+   When STREAM is an SBCL fd-stream (e.g. stdout), flushes any buffered output
+   then issues a single write(2) syscall directly on the mapped memory — zero
+   copy through Lisp.  For other streams (e.g. the string stream used during
+   testing) it decodes the UTF-8 bytes from the mapped region and calls
+   write-string."
+  (let ((len (- end start))
+        (ptr (cffi:inc-pointer mmap-ptr start)))
+    (etypecase stream
+      (sb-sys:fd-stream
+       (finish-output stream)
+       (cffi:foreign-funcall "write"
+                             :int     (sb-sys:fd-stream-fd stream)
+                             :pointer ptr
+                             :size    len
+                             :long))
+      (stream
+       (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
+                     stream)))))
 
-(defun generate-render-code (filename tokens &optional context-alist)
-  "Generate executable Lisp code from tokenized template.
-   Returns an S-expression that renders the template when executed.
+(defun generate-render-code (pathname tokens &optional context-alist)
+  "Generate a self-contained executable sexp from PATHNAME and its TOKENS.
 
-   Optional context-alist is a list of (symbol . value) pairs that will be bound
-   as variables available to expressions in the template.
+   The returned sexp opens the file via mmap, writes all text ranges directly
+   from the mapped memory, evaluates expressions and code blocks, then unmaps
+   the file — all within an unwind-protect so the file is always closed.
 
-   Note: Currently only supports code blocks that fit within a single delimiter pair.
-   Multi-token code structures (like loops spanning delimiters) are not yet supported."
+   CONTEXT-ALIST is a list of (symbol . value) pairs bound as variables
+   available to template expressions.
+
+   Note: Currently only supports code blocks that fit within a single delimiter
+   pair.  Multi-token code structures (like loops spanning delimiters) are not
+   yet supported."
   (let ((code-parts '()))
     ;; Process each token and build code fragments
     (dolist (token tokens)
@@ -76,31 +118,25 @@
             (end (fourth token)))
         (case type
           (:text
-           ;; Text becomes a write-output-range call
-           (push (list 'write-output-range filename start end) code-parts))
+           ;; Text becomes a write-output-range call; ptr is the lexical
+           ;; variable bound by the mmap multiple-value-bind below.
+           (push `(elp::write-output-range ptr ,start ,end) code-parts))
           (:expr
-           ;; Expression: evaluate and write result to stream
-           (if (zerop (length (string-trim '(#\space #\tab #\newline) content)))
-               ;; Empty expression outputs nothing
-               nil
-               (let ((expr-form (read-from-string content)))
-                 (push (list 'format 't "~A" expr-form) code-parts))))
+           (unless (zerop (length (string-trim '(#\space #\tab #\newline) content)))
+             (push `(format t "~A" ,(read-from-string content)) code-parts)))
           (:code
-           ;; Code: read it as a form and include it
            (push (read-from-string content) code-parts))
-          (:comment
-           ;; Comments are ignored
-           nil))))
+          (:comment nil))))
 
-    ;; Build bindings from context-alist
-    (let ((bindings (mapcar (lambda (binding)
-                              (list (car binding) `',(cdr binding)))
-                            context-alist)))
-      ;; Wrap all parts in a progn, optionally wrapped in let
-      (let ((progn-form (cons 'progn (nreverse code-parts))))
-        (if bindings
-            `(let ,bindings ,progn-form)
-            progn-form)))))
+    ;; Build context let-bindings
+    (let* ((bindings  (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
+           (body      (cons 'progn (nreverse code-parts)))
+           (body-with-context (if bindings `(let ,bindings ,body) body)))
+      ;; Wrap everything in the mmap open/close lifecycle
+      `(multiple-value-bind (ptr size fd) (elp::%mmap-open ,pathname)
+         (unwind-protect
+             ,body-with-context
+           (elp::%mmap-close ptr size fd))))))
 
 (defun tokenize-file (filename)
   "Stream template file and yield tokens."
