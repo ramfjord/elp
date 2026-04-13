@@ -123,9 +123,17 @@
       (:expr "x" 0))
     "Result: 42"))
 
-;;;; TODO: nested-code-block-rendering
-;;;; This test is skipped because it requires handling code blocks that span multiple tokens
-;;;; Multi-token code structures like loops spanning delimiters need a different compilation strategy
+(test loop-with-inner-template
+  "Loop code block spanning multiple tokens renders inner template for each iteration"
+  (let ((newline (string #\newline)))
+    (expect-render (concatenate 'string "<% (dolist (item items) %>Item: <%= item %>" newline "<% ) %>")
+      `((:code "(dolist (item items)" 0)
+        (:text "Item: " 1)
+        (:expr "item" 1)
+        (:text ,newline 1)
+        (:code ")" 1))
+      (format nil "Item: foo~%Item: bar~%Item: baz~%")
+      '((items . ("foo" "bar" "baz"))))))
 
 ;;;; Test Group 3: Comments
 ;;;; ======================
@@ -200,9 +208,6 @@
 ;;;; Test Group 7: Variable Binding
 ;;;; ==============================
 
-;;;; TODO: variable-reference-in-code
-;;;; This test is skipped because it requires handling code blocks that span multiple tokens
-;;;; Multi-token structures like let bindings spanning delimiters need different compilation
 
 ;;;; Run Tests
 (defun run-tests ()

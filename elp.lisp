@@ -99,40 +99,37 @@
 (defun generate-render-code (pathname tokens &optional context-alist)
   "Generate a self-contained executable sexp from PATHNAME and its TOKENS.
 
-   The returned sexp opens the file via mmap, writes all text ranges directly
-   from the mapped memory, evaluates expressions and code blocks, then unmaps
-   the file — all within an unwind-protect so the file is always closed.
+   Builds the template body as a single string — code token content is spliced
+   in raw, text and expr tokens emit write-output-range/format calls — then
+   calls read-from-string once on the whole thing.  This means multi-token
+   constructs like loops work naturally: open parens in one code block are
+   closed by a later one.
+
+   The returned sexp opens the file via mmap, runs the body, then closes it
+   inside an unwind-protect.
 
    CONTEXT-ALIST is a list of (symbol . value) pairs bound as variables
-   available to template expressions.
-
-   Note: Currently only supports code blocks that fit within a single delimiter
-   pair.  Multi-token code structures (like loops spanning delimiters) are not
-   yet supported."
-  (let ((code-parts '()))
-    ;; Process each token and build code fragments
+   available to template expressions."
+  (let ((parts '()))
     (dolist (token tokens)
-      (let ((type (first token))
+      (let ((type    (first token))
             (content (second token))
-            (start (third token))
-            (end (fourth token)))
+            (start   (third token))
+            (end     (fourth token)))
         (case type
           (:text
-           ;; Text becomes a write-output-range call; ptr is the lexical
-           ;; variable bound by the mmap multiple-value-bind below.
-           (push `(elp::write-output-range ptr ,start ,end) code-parts))
+           (push (format nil "(elp::write-output-range elp::ptr ~D ~D)" start end) parts))
           (:expr
            (unless (zerop (length (string-trim '(#\space #\tab #\newline) content)))
-             (push `(format t "~A" ,(read-from-string content)) code-parts)))
+             (push (format nil "(format t \"~~A\" ~A)" content) parts)))
           (:code
-           (push (read-from-string content) code-parts))
+           (push content parts))
           (:comment nil))))
 
-    ;; Build context let-bindings
-    (let* ((bindings  (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
-           (body      (cons 'progn (nreverse code-parts)))
+    (let* ((body-string (format nil "(progn ~{~A ~})" (nreverse parts)))
+           (body        (read-from-string body-string))
+           (bindings    (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
            (body-with-context (if bindings `(let ,bindings ,body) body)))
-      ;; Wrap everything in the mmap open/close lifecycle
       `(multiple-value-bind (ptr size fd) (elp::%mmap-open ,pathname)
          (unwind-protect
              ,body-with-context
