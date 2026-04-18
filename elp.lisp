@@ -145,8 +145,7 @@
                      (read-sequence str f)
                      str)))
         (tokens '())
-        (pos 0)
-        (depth 0))
+        (pos 0))
 
     (loop while (< pos (length content))
           do
@@ -171,13 +170,13 @@
               ;; No delimiter found, rest is text
               (progn
                 (when (< pos (length content))
-                  (push (list :text (subseq content pos) pos (length content) depth) tokens))
+                  (push (list :text (subseq content pos) pos (length content)) tokens))
                 (setf pos (length content)))
               ;; Found delimiter
               (progn
                 ;; Add text before delimiter if any
                 (when (< pos next-delim)
-                  (push (list :text (subseq content pos next-delim) pos next-delim depth) tokens))
+                  (push (list :text (subseq content pos next-delim) pos next-delim) tokens))
 
                 ;; Find closing %>
                 (let ((content-start (+ next-delim delim-len))
@@ -187,18 +186,11 @@
                       ;; Found closing delimiter
                       (let ((token-content (string-trim '(#\space #\tab #\newline) (subseq content content-start close-pos)))
                             (token-end (+ close-pos 2)))
-                        (push (list delim-type token-content next-delim token-end depth) tokens)
-                        ;; Update depth for code tokens
-                        (when (eq delim-type :code)
-                          (let ((opens 0) (closes 0))
-                            (loop for ch across token-content
-                                  do (cond ((member ch '(#\( #\[ #\{)) (incf opens))
-                                           ((member ch '(#\) #\] #\})) (incf closes))))
-                            (setf depth (+ depth (- opens closes)))))
+                        (push (list delim-type token-content next-delim token-end) tokens)
                         (setf pos token-end))
                       ;; No closing delimiter
                       (let ((token-content (string-trim '(#\space #\tab #\newline) (subseq content content-start))))
-                        (push (list delim-type token-content next-delim (length content) depth) tokens)
+                        (push (list delim-type token-content next-delim (length content)) tokens)
                         (setf pos (length content))))))))))
 
     (nreverse tokens)))

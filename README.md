@@ -97,12 +97,11 @@ Renders a template file with the given context variables.
 
 For advanced use cases, tokenize a template file and inspect/manipulate tokens directly.
 
-Each token is a list: `(type content start-byte end-byte depth)`
+Each token is a list: `(type content start-byte end-byte)`
 
 - `type`: `:text`, `:expr`, `:code`, or `:comment`
 - `content`: The token content as a string
 - `start-byte`, `end-byte`: Byte offsets in the file
-- `depth`: Nesting depth (for tracking code block structure)
 
 ## Features
 
@@ -110,7 +109,6 @@ Each token is a list: `(type content start-byte end-byte depth)`
 - Simple syntax familiar to ERB users
 - Supports loops, conditionals, function calls, etc.
 - Byte-position tracking for error reporting
-- Nesting depth tracking for code structure analysis
 
 ## Installation
 

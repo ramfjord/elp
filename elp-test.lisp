@@ -30,13 +30,12 @@
 
 (defun tokens-match-structure (actual expected-structure)
   "Check if tokens match expected structure, ignoring byte positions.
-   expected-structure is a list of (type content depth) tuples."
+   expected-structure is a list of (type content) tuples."
   (and (= (length actual) (length expected-structure))
        (every (lambda (token exp-struct)
-                (destructuring-bind (type content depth) exp-struct
+                (destructuring-bind (type content) exp-struct
                   (and (eq (first token) type)
-                       (equal (second token) content)
-                       (= (fifth token) depth))))
+                       (equal (second token) content))))
               actual
               expected-structure)))
 
@@ -46,7 +45,7 @@
    2. Code generation produces valid S-expression
    3. Rendering produces expected output
 
-   Expected token structure is a list of (type content depth) tuples.
+   Expected token structure is a list of (type content) tuples.
    Optional context is an alist of (symbol . value) pairs for variable bindings.
 
    Example: (expect-render \"Hello <%= (list 1 2 3) %>\"
@@ -78,38 +77,38 @@
 (test text-only-rendering
   "Plain text template with no tags"
   (expect-render "Hello World"
-    '((:text "Hello World" 0))
+    '((:text "Hello World"))
     "Hello World"))
 
 (test simple-expression-rendering
   "Template with single expression evaluating to a value"
   (expect-render "Hello <%= (list 1 2 3) %>"
-    '((:text "Hello " 0)
-      (:expr "(list 1 2 3)" 0))
+    '((:text "Hello ")
+      (:expr "(list 1 2 3)"))
     "Hello (1 2 3)"))
 
 (test variable-binding-and-reference
   "Template with context variables bound and referenced in expressions"
   (expect-render "Name: <%= name %>, Age: <%= age %>"
-    '((:text "Name: " 0)
-      (:expr "name" 0)
-      (:text ", Age: " 0)
-      (:expr "age" 0))
+    '((:text "Name: ")
+      (:expr "name")
+      (:text ", Age: ")
+      (:expr "age"))
     "Name: Alice, Age: 30"
     '((name . "Alice") (age . 30))))
 
 (test expression-only-rendering
   "Template with only an expression"
   (expect-render "<%= (+ 10 20) %>"
-    '((:expr "(+ 10 20)" 0))
+    '((:expr "(+ 10 20)"))
     "30"))
 
 (test multiple-expressions-rendering
   "Template with multiple expressions"
   (expect-render "<%= (+ 1 2) %> and <%= (+ 3 4) %>"
-    '((:expr "(+ 1 2)" 0)
-      (:text " and " 0)
-      (:expr "(+ 3 4)" 0))
+    '((:expr "(+ 1 2)")
+      (:text " and ")
+      (:expr "(+ 3 4)"))
     "3 and 7"))
 
 ;;;; Test Group 2: Code Blocks
@@ -118,20 +117,20 @@
 (test simple-code-block-rendering
   "Code block that doesn't produce output"
   (expect-render "<% (setf x 42) %>Result: <%= x %>"
-    '((:code "(setf x 42)" 0)
-      (:text "Result: " 0)
-      (:expr "x" 0))
+    '((:code "(setf x 42)")
+      (:text "Result: ")
+      (:expr "x"))
     "Result: 42"))
 
 (test loop-with-inner-template
   "Loop code block spanning multiple tokens renders inner template for each iteration"
   (let ((newline (string #\newline)))
     (expect-render (concatenate 'string "<% (dolist (item items) %>Item: <%= item %>" newline "<% ) %>")
-      `((:code "(dolist (item items)" 0)
-        (:text "Item: " 1)
-        (:expr "item" 1)
-        (:text ,newline 1)
-        (:code ")" 1))
+      `((:code "(dolist (item items)")
+        (:text "Item: ")
+        (:expr "item")
+        (:text ,newline)
+        (:code ")"))
       (format nil "Item: foo~%Item: bar~%Item: baz~%")
       '((items . ("foo" "bar" "baz"))))))
 
@@ -141,17 +140,17 @@
 (test comment-removal
   "Comments should be stripped from output"
   (expect-render "Start<%# This is a comment %>End"
-    '((:text "Start" 0)
-      (:comment "This is a comment" 0)
-      (:text "End" 0))
+    '((:text "Start")
+      (:comment "This is a comment")
+      (:text "End"))
     "StartEnd"))
 
 (test inline-comment
   "Comment between text sections"
   (expect-render "A<%# TODO %>B"
-    '((:text "A" 0)
-      (:comment "TODO" 0)
-      (:text "B" 0))
+    '((:text "A")
+      (:comment "TODO")
+      (:text "B"))
     "AB"))
 
 ;;;; Test Group 4: Complex Expressions
@@ -160,15 +159,15 @@
 (test string-concatenation-expression
   "Expression with string operations"
   (expect-render "Name: <%= (concatenate 'string \"Mr. \" \"Smith\") %>"
-    '((:text "Name: " 0)
-      (:expr "(concatenate 'string \"Mr. \" \"Smith\")" 0))
+    '((:text "Name: ")
+      (:expr "(concatenate 'string \"Mr. \" \"Smith\")"))
     "Name: Mr. Smith"))
 
 (test list-expression
   "Expression evaluating to a list"
   (expect-render "Items: <%= (quote (a b c)) %>"
-    '((:text "Items: " 0)
-      (:expr "(quote (a b c))" 0))
+    '((:text "Items: ")
+      (:expr "(quote (a b c))"))
     "Items: (A B C)"))
 
 ;;;; Test Group 5: Edge Cases
@@ -177,16 +176,16 @@
 (test empty-expression
   "Expression with whitespace only (after trimming)"
   (expect-render "Value: <%=   %>after"
-    '((:text "Value: " 0)
-      (:expr "" 0)
-      (:text "after" 0))
+    '((:text "Value: ")
+      (:expr "")
+      (:text "after"))
     "Value: after"))
 
 (test consecutive-delimiters
   "Multiple delimiters back-to-back"
   (expect-render "<%= 1 %><%= 2 %>"
-    '((:expr "1" 0)
-      (:expr "2" 0))
+    '((:expr "1")
+      (:expr "2"))
     "12"))
 
 ;;;; Test Group 6: Whitespace in Templates
@@ -196,18 +195,14 @@
   "Text tokens with newlines are preserved"
   (let ((template-with-newline (concatenate 'string "Hello" (string #\newline) "World")))
     (expect-render template-with-newline
-      `((:text ,template-with-newline 0))
+      `((:text ,template-with-newline))
       template-with-newline)))
 
 (test spaces-in-expression
   "Whitespace inside expression tags is trimmed"
   (expect-render "<%=   (+ 1 2)   %>"
-    '((:expr "(+ 1 2)" 0))
+    '((:expr "(+ 1 2)"))
     "3"))
-
-;;;; Test Group 7: Variable Binding
-;;;; ==============================
-
 
 ;;;; Run Tests
 (defun run-tests ()
