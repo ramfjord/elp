@@ -8,11 +8,11 @@ test:
 	     --eval "(load \"elp-test.lisp\")" \
 	     --eval "(elp-test:run-tests)"
 
-bin/elp:
+bin/elp: elp.lisp elp.asd cli.lisp
 	mkdir -p bin
 	sbcl --eval "(require :asdf)" \
 	     --eval "(push #p\"$(CURDIR)/\" asdf:*central-registry*)" \
 	     --eval "(asdf:load-system :elp)" \
-	     --eval "(sb-ext:save-lisp-and-die \"bin/elp\" :toplevel $(SHARP)'elp/cli:main :executable t :compression t)"
+	     --eval "(sb-ext:save-lisp-and-die \"bin/elp\" :toplevel $(SHARP)'elp/cli:main :executable t :compression t :save-runtime-options t)"
 
 SHARP := \#

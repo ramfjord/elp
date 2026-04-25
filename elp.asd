@@ -19,4 +19,4 @@
   :components
   ((:file "elp-test"))
   :perform (test-op (op c)
-             (uiop:symbol-call :fiveam :run! :generate-suite)))
+             (uiop:symbol-call :elp-test :run-tests)))

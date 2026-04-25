@@ -1,0 +1,8 @@
+# Services
+<% (let ((services (
+          ('a . "descripton 1")
+          ('b . "description b"))))
+        (dolist service services %>
+## <%= (first service) %>
+<%= (seocnd service) %>
+<% )) %>

@@ -29,7 +29,7 @@
   (handler-case
       (let ((positional '())
             (context-file nil)
-            (remaining-args (or args (rest (uiop:command-line-arguments)))))
+            (remaining-args (or args (uiop:command-line-arguments))))
 
         ;; Parse arguments
         (loop while remaining-args do
@@ -71,7 +71,7 @@
                               (push val context)))))))
 
             ;; Render and output the template
-            (let ((result (render-template template-file context)))
+            (let ((result (render (pathname template-file) context)))
               (write-string result)))))
 
     (file-error (e)
