@@ -268,6 +268,74 @@
              :file pathname :line line :column col
              :original condition))))
 
+(defun tokenize-mmap (ptr size)
+  "Tokenize the byte range PTR[0,SIZE) as an ELP template.
+
+   Returns the same shape as TOKENIZE-FILE: a list of
+   (type content start end content-start content-end). For :text and
+   :comment tokens, CONTENT is NIL — the bytes live in the mmap and
+   the renderer reads them directly via offsets. For :code and :expr,
+   CONTENT is a trimmed Lisp string extracted from the mapped region
+   via foreign-string-to-lisp; its size is bounded by embedded-code
+   length, not template length."
+  (let ((tokens '())
+        (pos 0))
+    (loop while (< pos size) do
+      (let* ((rem (- size pos))
+             (base (cffi:inc-pointer ptr pos))
+             (rel-comment (%memmem base rem "<%#"))
+             (rel-expr    (%memmem base rem "<%="))
+             (rel-code    (%memmem base rem "<%"))
+             (comment-pos (and rel-comment (+ pos rel-comment)))
+             (expr-pos    (and rel-expr    (+ pos rel-expr)))
+             (code-pos    (and rel-code    (+ pos rel-code)))
+             (next-delim nil) (delim-type nil) (delim-len nil))
+        (when comment-pos
+          (setf next-delim comment-pos delim-type :comment delim-len 3))
+        (when (and expr-pos (or (not comment-pos) (< expr-pos comment-pos)))
+          (setf next-delim expr-pos delim-type :expr delim-len 3))
+        (when (and code-pos (or (not comment-pos) (< code-pos comment-pos))
+                            (or (not expr-pos)    (< code-pos expr-pos)))
+          (setf next-delim code-pos delim-type :code delim-len 2))
+        (cond
+          ((not next-delim)
+           (push (list :text nil pos size pos size) tokens)
+           (setf pos size))
+          (t
+           (when (< pos next-delim)
+             (push (list :text nil pos next-delim pos next-delim) tokens))
+           (let* ((content-start (+ next-delim delim-len))
+                  (rel-close (and (<= content-start size)
+                                  (%memmem (cffi:inc-pointer ptr content-start)
+                                           (- size content-start)
+                                           "%>")))
+                  (close-pos (and rel-close (+ content-start rel-close))))
+             (cond
+               (close-pos
+                (let* ((token-end (+ close-pos 2))
+                       (extract (cffi:foreign-string-to-lisp
+                                 (cffi:inc-pointer ptr content-start)
+                                 :count (- close-pos content-start)
+                                 :encoding :utf-8))
+                       (trimmed (string-trim '(#\space #\tab #\newline) extract)))
+                  (push (list delim-type
+                              (if (eq delim-type :comment) nil trimmed)
+                              next-delim token-end content-start close-pos)
+                        tokens)
+                  (setf pos token-end)))
+               (t
+                (let* ((extract (cffi:foreign-string-to-lisp
+                                 (cffi:inc-pointer ptr content-start)
+                                 :count (- size content-start)
+                                 :encoding :utf-8))
+                       (trimmed (string-trim '(#\space #\tab #\newline) extract)))
+                  (push (list delim-type
+                              (if (eq delim-type :comment) nil trimmed)
+                              next-delim size content-start size)
+                        tokens)
+                  (setf pos size)))))))))
+    (nreverse tokens)))
+
 (defun tokenize-file (filename)
   "Stream template file and yield tokens."
   (unless (probe-file filename)

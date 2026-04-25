@@ -307,6 +307,74 @@
     (with-ascii-buffer (p len s)
       (is (eql 5 (elp::%memchr p len (char-code #\newline)))))))
 
+;;;; Test Group 9: tokenize-mmap parity with tokenize-file
+;;;; ======================================================
+;;;; tokenize-mmap reads bytes directly from a memory-mapped file
+;;;; instead of slurping into a Lisp string. Its output must agree
+;;;; with tokenize-file modulo :text and :comment tokens carrying
+;;;; NIL content (the mmap path leaves those as offsets only).
+
+(defun nil-text/comment-content (tokens)
+  "Return TOKENS with :text and :comment content replaced by NIL.
+   Used to compare tokenize-file output against tokenize-mmap output."
+  (mapcar (lambda (tk)
+            (let ((copy (copy-list tk)))
+              (when (member (first copy) '(:text :comment))
+                (setf (second copy) nil))
+              copy))
+          tokens))
+
+(defun tokenize-mmap-of-file (pathname)
+  "mmap PATHNAME, run tokenize-mmap, close. Return the token list."
+  (multiple-value-bind (ptr size fd) (elp::%mmap-open pathname)
+    (unwind-protect (elp::tokenize-mmap ptr size)
+      (elp::%mmap-close ptr size fd))))
+
+(defmacro tokenizers-agree-on (template-string)
+  "Write TEMPLATE-STRING to a temp file, tokenize via both paths,
+   assert they agree modulo :text/:comment content being NIL on the
+   mmap side."
+  `(let ((tmp (template-string-to-file ,template-string)))
+     (unwind-protect
+          (let ((file-toks (tokenize-file tmp))
+                (mmap-toks (tokenize-mmap-of-file tmp)))
+            (is (equal (nil-text/comment-content file-toks) mmap-toks)
+                (format nil "tokenize-mmap should match tokenize-file ~
+                             (modulo :text/:comment content nil).~%~
+                             file: ~S~%mmap: ~S" file-toks mmap-toks)))
+       (cleanup-file tmp))))
+
+(test tokenize-mmap-text-only
+  (tokenizers-agree-on "Hello World"))
+
+(test tokenize-mmap-simple-expression
+  (tokenizers-agree-on "Hello <%= (list 1 2 3) %>"))
+
+(test tokenize-mmap-multiple-expressions
+  (tokenizers-agree-on "<%= (+ 1 2) %> and <%= (+ 3 4) %>"))
+
+(test tokenize-mmap-code-and-expr
+  (tokenizers-agree-on "<% (setf x 42) %>Result: <%= x %>"))
+
+(test tokenize-mmap-comment
+  (tokenizers-agree-on "Start<%# This is a comment %>End"))
+
+(test tokenize-mmap-loop-spanning-tokens
+  (let ((newline (string #\newline)))
+    (tokenizers-agree-on
+      (concatenate 'string
+                   "<% (dolist (item items) %>Item: <%= item %>"
+                   newline "<% ) %>"))))
+
+(test tokenize-mmap-consecutive-delimiters
+  (tokenizers-agree-on "<%= 1 %><%= 2 %>"))
+
+(test tokenize-mmap-newlines-in-text
+  (tokenizers-agree-on (concatenate 'string "Hello" (string #\newline) "World")))
+
+(test tokenize-mmap-empty-expression
+  (tokenizers-agree-on "Value: <%=   %>after"))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"
