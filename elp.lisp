@@ -87,6 +87,33 @@
   (cffi:foreign-funcall "munmap" :pointer ptr :size size :int)
   (cffi:foreign-funcall "close"  :int fd :int))
 
+;;;; Vectorized byte search (libc memmem / memchr)
+
+(defun %memmem (haystack-ptr haystack-len needle)
+  "Return the byte offset of NEEDLE (an ASCII string) in HAYSTACK-PTR[0,HAYSTACK-LEN),
+   or NIL if not present. Wraps glibc's vectorized memmem(3)."
+  (cffi:with-foreign-string ((nptr nbytes) needle
+                             :encoding :ascii
+                             :null-terminated-p nil)
+    (let ((found (cffi:foreign-funcall "memmem"
+                                       :pointer haystack-ptr :size haystack-len
+                                       :pointer nptr         :size nbytes
+                                       :pointer)))
+      (and (not (cffi:null-pointer-p found))
+           (- (cffi:pointer-address found)
+              (cffi:pointer-address haystack-ptr))))))
+
+(defun %memchr (haystack-ptr haystack-len byte)
+  "Return the byte offset of BYTE (an integer 0–255) in HAYSTACK-PTR[0,HAYSTACK-LEN),
+   or NIL if not present. Wraps libc's vectorized memchr(3)."
+  (let ((found (cffi:foreign-funcall "memchr"
+                                     :pointer haystack-ptr :int byte
+                                     :size    haystack-len
+                                     :pointer)))
+    (and (not (cffi:null-pointer-p found))
+         (- (cffi:pointer-address found)
+            (cffi:pointer-address haystack-ptr)))))
+
 ;;;; Public API
 
 (defgeneric render (input context)

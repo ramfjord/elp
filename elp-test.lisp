@@ -245,6 +245,68 @@
     (is (>= (elp:elp-template-error-line err) 1))
     (is (>= (elp:elp-template-error-column err) 1))))
 
+;;;; Test Group 8: Vectorized byte search wrappers (%memmem, %memchr)
+;;;; ==================================================================
+
+(defmacro with-ascii-buffer ((ptr len string) &body body)
+  "Bind PTR/LEN to a foreign ASCII buffer holding STRING (no NUL terminator)."
+  `(cffi:with-foreign-string ((,ptr ,len) ,string
+                              :encoding :ascii
+                              :null-terminated-p nil)
+     ,@body))
+
+(test memmem-finds-at-start
+  "Needle at offset 0 returns 0."
+  (with-ascii-buffer (p len "hello world")
+    (is (eql 0 (elp::%memmem p len "hello")))))
+
+(test memmem-finds-at-end
+  "Needle flush against end of buffer."
+  (with-ascii-buffer (p len "hello world")
+    (is (eql 6 (elp::%memmem p len "world")))))
+
+(test memmem-finds-multibyte-needle
+  "ELP's actual delimiters as needles."
+  ;; "a<%= x %>b" — <% at 1, %> at 7.
+  (with-ascii-buffer (p len "a<%= x %>b")
+    (is (eql 1 (elp::%memmem p len "<%=")))
+    (is (eql 1 (elp::%memmem p len "<%")))
+    (is (eql 7 (elp::%memmem p len "%>")))))
+
+(test memmem-returns-nil-on-miss
+  "Absent needle returns NIL, not 0."
+  (with-ascii-buffer (p len "hello world")
+    (is (null (elp::%memmem p len "ZZZ")))))
+
+(test memmem-overlapping-matches-returns-first
+  "When matches overlap, return the first (leftmost) one."
+  (with-ascii-buffer (p len "aaaa")
+    (is (eql 0 (elp::%memmem p len "aa")))))
+
+(test memmem-empty-haystack
+  "Zero-length haystack: any nonempty needle misses."
+  (with-ascii-buffer (p len "")
+    (is (zerop len))
+    (is (null (elp::%memmem p 0 "x")))))
+
+(test memchr-finds-at-start
+  (with-ascii-buffer (p len "hello")
+    (is (eql 0 (elp::%memchr p len (char-code #\h))))))
+
+(test memchr-finds-at-end
+  (with-ascii-buffer (p len "hello")
+    (is (eql 4 (elp::%memchr p len (char-code #\o))))))
+
+(test memchr-returns-nil-on-miss
+  (with-ascii-buffer (p len "hello")
+    (is (null (elp::%memchr p len (char-code #\z))))))
+
+(test memchr-finds-newline
+  "memchr is the primitive for newline counting; verify it finds one."
+  (let ((s (format nil "line1~%line2~%line3")))
+    (with-ascii-buffer (p len s)
+      (is (eql 5 (elp::%memchr p len (char-code #\newline)))))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"
