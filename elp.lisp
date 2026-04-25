@@ -10,6 +10,7 @@
   (:export
    ;; Primary public API
    :render
+   :render-to-stream
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -39,6 +40,13 @@
 (defvar *current-template-span* nil
   "When non-nil, a list (file-byte-start file-byte-end) identifying the
    byte range in the source template currently being evaluated.")
+
+(defvar *template-ptr* nil
+  "When the file-path renderer is active, bound to the foreign pointer
+   for the mmap'd template. The generated render sexp references this
+   symbol when emitting WRITE-OUTPUT-RANGE calls, so the sexp itself
+   stays free of free lexical variables and can be EVAL'd in the null
+   lexical environment.")
 
 (defun byte->line+column (pathname byte-offset)
   "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in PATHNAME.
@@ -116,44 +124,62 @@
 
 ;;;; Public API
 
+(defgeneric render-to-stream (input context-alist &optional stream)
+  (:documentation "Render a template from INPUT with CONTEXT-ALIST, writing
+   directly to STREAM (defaults to *STANDARD-OUTPUT*).
+
+   This is the streaming primitive: output bytes go to STREAM as they are
+   produced, with no intermediate Lisp string. When STREAM is an
+   SB-SYS:FD-STREAM (e.g. the CLI's *STANDARD-OUTPUT* in a saved binary),
+   text ranges are written via a single WRITE(2) syscall directly on the
+   mmap'd source — zero copy through Lisp.
+
+   INPUT is a pathname; the file is mmap'd once, tokenized via
+   TOKENIZE-MMAP, and the generated body is evaluated against that same
+   mapping. Returns no useful value; consumers care about side effects on
+   STREAM. Use RENDER if you want the output as a string."))
+
 (defgeneric render (input context)
-  (:documentation "Render a template from INPUT with CONTEXT variable bindings.
+  (:documentation "Render a template from INPUT with CONTEXT variable bindings,
+   returning the rendered output as a string.
 
-   INPUT must be a pathname (file path). The template file is rendered
-   efficiently by reading directly from the file without loading it entirely
-   into memory.
+   Thin wrapper around RENDER-TO-STREAM for callers that genuinely want a
+   string (tests, library consumers building HTTP bodies, etc.). Streaming
+   callers (the CLI, file exporters) should use RENDER-TO-STREAM directly
+   to avoid materializing the entire output in Lisp memory."))
 
-   CONTEXT is an alist of (symbol . value) pairs that will be available
-   as variables in template expressions.
-
-   Returns the rendered output as a string."))
+(defmethod render-to-stream ((pathname pathname) context-alist
+                             &optional (stream *standard-output*))
+  (let ((file-size (with-open-file (f pathname) (file-length f))))
+    ;; Linux mmap rejects size 0 with EINVAL. Skip the mapping entirely.
+    (when (zerop file-size)
+      (return-from render-to-stream (values))))
+  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
+    (unwind-protect
+         (let ((tokens (tokenize-mmap ptr size)))
+           (multiple-value-bind (sexp checkpoints body-string)
+               (generate-render-code pathname tokens context-alist)
+             (declare (ignore checkpoints body-string))
+             (let ((*template-ptr* ptr)
+                   (*standard-output* stream))
+               (handler-bind
+                   ((elp-template-error (lambda (c) (error c)))
+                    (error
+                      (lambda (c)
+                        (when *current-template-span*
+                          (let ((byte (first *current-template-span*)))
+                            (multiple-value-bind (line col)
+                                (byte->line+column pathname byte)
+                              (error 'elp-template-error
+                                     :file pathname :line line :column col
+                                     :original c)))))))
+                 (eval sexp)))))
+      (%mmap-close ptr size fd)))
+  (values))
 
 (defmethod render ((pathname pathname) context-alist)
-  "Render template file at PATHNAME with CONTEXT-ALIST.
-
-   Tokenizes the file, generates a self-contained sexp that opens the mmap,
-   writes all text ranges via write(2), then closes it, and evals that sexp.
-
-   Any error raised during read-time assembly or eval-time execution of the
-   generated code is translated into an ELP-TEMPLATE-ERROR pointing at the
-   corresponding source byte."
-  (let ((tokens (tokenize-file pathname)))
-    (multiple-value-bind (sexp checkpoints body-string)
-        (generate-render-code pathname tokens context-alist)
-      (declare (ignore checkpoints body-string))
-      (with-output-to-string (out)
-        (let ((*standard-output* out))
-          (handler-bind
-              ((elp-template-error (lambda (c) (error c)))
-               (error
-                 (lambda (c)
-                   (when *current-template-span*
-                     (let ((byte (first *current-template-span*)))
-                       (multiple-value-bind (line col) (byte->line+column pathname byte)
-                         (error 'elp-template-error
-                                :file pathname :line line :column col
-                                :original c)))))))
-            (eval sexp)))))))
+  (with-output-to-string (s)
+    (render-to-stream pathname context-alist s)))
 
 ;;;; Internal Helper Functions
 
@@ -180,7 +206,7 @@
                      stream)))))
 
 (defun generate-render-code (pathname tokens &optional context-alist)
-  "Generate a self-contained executable sexp from PATHNAME and its TOKENS.
+  "Generate an executable sexp from PATHNAME and its TOKENS.
 
    Builds the template body as a single string — code token content is spliced
    in raw, text and expr tokens emit write-output-range/format calls — then
@@ -188,8 +214,10 @@
    constructs like loops work naturally: open parens in one code block are
    closed by a later one.
 
-   The returned sexp opens the file via mmap, runs the body, then closes it
-   inside an unwind-protect.
+   The returned sexp is a plain (progn …) referencing ELP::*TEMPLATE-PTR*
+   for the mmap base pointer; the caller (RENDER-TO-STREAM) is
+   responsible for opening the mmap and binding *TEMPLATE-PTR* around
+   EVAL.
 
    CONTEXT-ALIST is a list of (symbol . value) pairs bound as variables
    available to template expressions."
@@ -206,7 +234,8 @@
         (declare (ignore end))
         (case type
           (:text
-           (format out "(elp::write-output-range elp::ptr ~D ~D) " start content-end))
+           (format out "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+                   start content-end))
           (:expr
            (unless (zerop (length (string-trim '(#\space #\tab #\newline) content)))
              (format out "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
@@ -228,13 +257,7 @@
                      (translate-read-error c pathname body-string checkpoints))))
            (bindings    (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
            (body-with-context (if bindings `(let ,bindings ,body) body)))
-      (values
-       `(multiple-value-bind (ptr size fd) (elp::%mmap-open ,pathname)
-          (unwind-protect
-              ,body-with-context
-            (elp::%mmap-close ptr size fd)))
-       checkpoints
-       body-string))))
+      (values body-with-context checkpoints body-string))))
 
 (defun file-position-of-stream (stream)
   "Length (in characters) written so far to a string-output-stream."
