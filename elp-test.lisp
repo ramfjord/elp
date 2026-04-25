@@ -204,6 +204,47 @@
     '((:expr "(+ 1 2)"))
     "3"))
 
+;;;; Test Group 7: Error Reporting
+;;;; ==============================
+;;;; Column semantics: the reported column is the first byte after the
+;;;; opening delimiter (<%= or <%) — i.e. the start of the expression/code
+;;;; content region, whitespace included. This is a v1 approximation;
+;;;; column is not refined further within the expression.
+
+(defun render-error (template-string &optional context)
+  "Render TEMPLATE-STRING from a temp file and capture any elp-template-error."
+  (let ((temp-file (template-string-to-file template-string)))
+    (unwind-protect
+         (handler-case (progn (elp:render temp-file (or context '())) nil)
+           (elp:elp-template-error (c) c))
+      (cleanup-file temp-file))))
+
+(test runtime-error-undefined-variable
+  "Runtime error signals elp-template-error pointing at the expression."
+  (let ((err (render-error (format nil "hello~%<%= undefined-var %>~%"))))
+    (is (typep err 'elp:elp-template-error))
+    (is (= 2 (elp:elp-template-error-line err)))
+    ;; Expression content starts immediately after <%= on line 2, at col 4.
+    (is (= 4 (elp:elp-template-error-column err)))))
+
+(test runtime-error-column-with-leading-whitespace
+  "Column points at the expression content region (just past <%=),
+   not at column 1 and not at the <."
+  (let ((err (render-error (format nil "line1~%    <%=    bad-var %>~%"))))
+    (is (typep err 'elp:elp-template-error))
+    (is (= 2 (elp:elp-template-error-line err)))
+    ;; Line 2 is "    <%=    bad-var %>"; <%= ends at col 7, content at col 8.
+    (is (= 8 (elp:elp-template-error-column err)))))
+
+(test readtime-error-unbalanced-paren
+  "Read-time error inside embedded Lisp signals elp-template-error."
+  (let ((err (render-error (format nil "hi~%<% (let ((x 1) %>~%"))))
+    (is (typep err 'elp:elp-template-error))
+    (is (typep (elp:elp-template-error-original err) 'condition))
+    ;; Should point somewhere inside the template, not outside.
+    (is (>= (elp:elp-template-error-line err) 1))
+    (is (>= (elp:elp-template-error-column err) 1))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

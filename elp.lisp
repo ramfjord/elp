@@ -10,11 +10,51 @@
   (:export
    ;; Primary public API
    :render
+   ;; Error condition
+   :elp-template-error
+   :elp-template-error-file
+   :elp-template-error-line
+   :elp-template-error-column
+   :elp-template-error-original
    ;; Advanced/internal-use API
    :tokenize-file))
 
 
 (in-package :elp)
+
+;;;; Error reporting
+
+(define-condition elp-template-error (error)
+  ((file     :initarg :file     :reader elp-template-error-file)
+   (line     :initarg :line     :reader elp-template-error-line)
+   (column   :initarg :column   :reader elp-template-error-column)
+   (original :initarg :original :reader elp-template-error-original))
+  (:report (lambda (c stream)
+             (format stream "Template error at ~A:~D:~D: ~A"
+                     (elp-template-error-file c)
+                     (elp-template-error-line c)
+                     (elp-template-error-column c)
+                     (elp-template-error-original c)))))
+
+(defvar *current-template-span* nil
+  "When non-nil, a list (file-byte-start file-byte-end) identifying the
+   byte range in the source template currently being evaluated.")
+
+(defun byte->line+column (pathname byte-offset)
+  "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in PATHNAME.
+   Counts in characters read from the file (good enough for ASCII templates)."
+  (with-open-file (f pathname :direction :input)
+    (let ((line 1)
+          (col 1)
+          (i 0))
+      (loop while (< i byte-offset)
+            for ch = (read-char f nil nil)
+            while ch do
+              (if (char= ch #\newline)
+                  (setf line (1+ line) col 1)
+                  (incf col))
+              (incf i))
+      (values line col))))
 
 ;;;; mmap support
 
@@ -65,12 +105,28 @@
   "Render template file at PATHNAME with CONTEXT-ALIST.
 
    Tokenizes the file, generates a self-contained sexp that opens the mmap,
-   writes all text ranges via write(2), then closes it, and evals that sexp."
-  (let* ((tokens (tokenize-file pathname))
-         (sexp   (generate-render-code pathname tokens context-alist)))
-    (with-output-to-string (out)
-      (let ((*standard-output* out))
-        (eval sexp)))))
+   writes all text ranges via write(2), then closes it, and evals that sexp.
+
+   Any error raised during read-time assembly or eval-time execution of the
+   generated code is translated into an ELP-TEMPLATE-ERROR pointing at the
+   corresponding source byte."
+  (let ((tokens (tokenize-file pathname)))
+    (multiple-value-bind (sexp checkpoints body-string)
+        (generate-render-code pathname tokens context-alist)
+      (declare (ignore checkpoints body-string))
+      (with-output-to-string (out)
+        (let ((*standard-output* out))
+          (handler-bind
+              ((elp-template-error (lambda (c) (error c)))
+               (error
+                 (lambda (c)
+                   (when *current-template-span*
+                     (let ((byte (first *current-template-span*)))
+                       (multiple-value-bind (line col) (byte->line+column pathname byte)
+                         (error 'elp-template-error
+                                :file pathname :line line :column col
+                                :original c)))))))
+            (eval sexp)))))))
 
 ;;;; Internal Helper Functions
 
@@ -110,30 +166,80 @@
 
    CONTEXT-ALIST is a list of (symbol . value) pairs bound as variables
    available to template expressions."
-  (let ((parts '()))
+  (let ((out (make-string-output-stream))
+        (checkpoints '()))
+    (write-string "(progn " out)
     (dolist (token tokens)
-      (let ((type    (first token))
-            (content (second token))
-            (start   (third token))
-            (end     (fourth token)))
+      (let ((type         (first token))
+            (content      (second token))
+            (start        (third token))
+            (end          (fourth token))
+            (content-start (fifth token))
+            (content-end   (sixth token)))
+        (declare (ignore end))
         (case type
           (:text
-           (push (format nil "(elp::write-output-range elp::ptr ~D ~D)" start end) parts))
+           (format out "(elp::write-output-range elp::ptr ~D ~D) " start content-end))
           (:expr
            (unless (zerop (length (string-trim '(#\space #\tab #\newline) content)))
-             (push (format nil "(format t \"~~A\" ~A)" content) parts)))
+             (format out "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                     content-start content-end)
+             (push (cons (file-position-of-stream out) content-start) checkpoints)
+             (write-string content out)
+             (write-string ")) " out)))
           (:code
-           (push content parts))
+           (push (cons (file-position-of-stream out) content-start) checkpoints)
+           (write-string content out)
+           (write-char #\space out))
           (:comment nil))))
-
-    (let* ((body-string (format nil "(progn ~{~A ~})" (nreverse parts)))
-           (body        (read-from-string body-string))
+    (write-string ")" out)
+    (let* ((body-string (get-output-stream-string out))
+           (checkpoints (nreverse checkpoints))
+           (body (handler-case
+                     (read-from-string body-string)
+                   ((or reader-error end-of-file) (c)
+                     (translate-read-error c pathname body-string checkpoints))))
            (bindings    (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
            (body-with-context (if bindings `(let ,bindings ,body) body)))
-      `(multiple-value-bind (ptr size fd) (elp::%mmap-open ,pathname)
-         (unwind-protect
-             ,body-with-context
-           (elp::%mmap-close ptr size fd))))))
+      (values
+       `(multiple-value-bind (ptr size fd) (elp::%mmap-open ,pathname)
+          (unwind-protect
+              ,body-with-context
+            (elp::%mmap-close ptr size fd)))
+       checkpoints
+       body-string))))
+
+(defun file-position-of-stream (stream)
+  "Length (in characters) written so far to a string-output-stream."
+  (file-position stream))
+
+(defun body-offset->file-byte (offset checkpoints)
+  "Given a char offset into the body-string, find the nearest preceding
+   checkpoint and compute the corresponding file byte offset.  Returns NIL
+   when OFFSET is before any checkpoint."
+  (let ((best nil))
+    (dolist (cp checkpoints)
+      (when (<= (car cp) offset)
+        (setf best cp)))
+    (when best
+      (+ (cdr best) (- offset (car best))))))
+
+(defun translate-read-error (condition pathname body-string checkpoints)
+  "Translate a reader-error raised while reading BODY-STRING into an
+   elp-template-error that points into PATHNAME using CHECKPOINTS."
+  (let* ((offset (or (ignore-errors
+                      (with-input-from-string (s body-string)
+                        (handler-case
+                            (progn (read s) (file-position s))
+                          (error () (file-position s)))))
+                     (length body-string)))
+         (file-byte (or (body-offset->file-byte offset checkpoints)
+                        (cdar (last checkpoints))
+                        0)))
+    (multiple-value-bind (line col) (byte->line+column pathname file-byte)
+      (error 'elp-template-error
+             :file pathname :line line :column col
+             :original condition))))
 
 (defun tokenize-file (filename)
   "Stream template file and yield tokens."
@@ -170,13 +276,14 @@
               ;; No delimiter found, rest is text
               (progn
                 (when (< pos (length content))
-                  (push (list :text (subseq content pos) pos (length content)) tokens))
+                  (let ((eof (length content)))
+                    (push (list :text (subseq content pos) pos eof pos eof) tokens)))
                 (setf pos (length content)))
               ;; Found delimiter
               (progn
                 ;; Add text before delimiter if any
                 (when (< pos next-delim)
-                  (push (list :text (subseq content pos next-delim) pos next-delim) tokens))
+                  (push (list :text (subseq content pos next-delim) pos next-delim pos next-delim) tokens))
 
                 ;; Find closing %>
                 (let ((content-start (+ next-delim delim-len))
@@ -186,11 +293,12 @@
                       ;; Found closing delimiter
                       (let ((token-content (string-trim '(#\space #\tab #\newline) (subseq content content-start close-pos)))
                             (token-end (+ close-pos 2)))
-                        (push (list delim-type token-content next-delim token-end) tokens)
+                        (push (list delim-type token-content next-delim token-end content-start close-pos) tokens)
                         (setf pos token-end))
                       ;; No closing delimiter
-                      (let ((token-content (string-trim '(#\space #\tab #\newline) (subseq content content-start))))
-                        (push (list delim-type token-content next-delim (length content)) tokens)
+                      (let ((token-content (string-trim '(#\space #\tab #\newline) (subseq content content-start)))
+                            (eof (length content)))
+                        (push (list delim-type token-content next-delim eof content-start eof) tokens)
                         (setf pos (length content))))))))))
 
     (nreverse tokens)))

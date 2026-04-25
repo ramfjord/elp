@@ -97,11 +97,21 @@ Renders a template file with the given context variables.
 
 For advanced use cases, tokenize a template file and inspect/manipulate tokens directly.
 
-Each token is a list: `(type content start-byte end-byte)`
+Each token is a list: `(type content start-byte end-byte content-start-byte content-end-byte)`
 
 - `type`: `:text`, `:expr`, `:code`, or `:comment`
 - `content`: The token content as a string
-- `start-byte`, `end-byte`: Byte offsets in the file
+- `start-byte`, `end-byte`: Byte offsets of the full token (including `<% %>` delimiters) in the file
+- `content-start-byte`, `content-end-byte`: Byte offsets of the token's inner content (between the delimiters); used for error reporting
+
+### Errors
+
+**`elp-template-error`**
+
+Errors signaled during template read or rendering are translated to an
+`elp-template-error` condition with readers `elp-template-error-file`,
+`elp-template-error-line`, `elp-template-error-column`, and
+`elp-template-error-original`.
 
 ## Features
 
