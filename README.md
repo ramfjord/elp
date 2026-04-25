@@ -146,9 +146,7 @@ Or load directly:
 
 ## Known Limitations
 
-- Multi-token code blocks (e.g., loops spanning delimiters) are not yet supported
-- Only file-based rendering is supported (efficient streaming design via direct file access)
-- Empty expressions in output are not rendered
+See [TODOs.md](TODOs.md).
 
 ## Future Enhancements
 
