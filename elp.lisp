@@ -10,6 +10,7 @@
   (:export
    ;; Primary public API
    :render
+   :template-code
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -45,7 +46,30 @@
    stays free of free lexical variables and can be EVAL'd in the null
    lexical environment.")
 
-(defun byte->line+column (ptr size byte-offset)
+;;;; Runtime helpers
+;;;;
+;;;; Functions tagged with DEFINE-HELPER are installed both as top-level
+;;;; DEFUNs (for REPL / M-. ergonomics) and registered in
+;;;; *HELPER-SOURCES*, so the codegen in WRAP-RENDER-FORM can splice them
+;;;; into a LABELS block at the head of the generated render program.
+;;;; That keeps TEMPLATE-CODE output self-contained: a printed form can
+;;;; be re-EVAL'd without depending on these specific internals being
+;;;; present.
+
+(defvar *helper-sources* '()
+  "List of (NAME LAMBDA-LIST . BODY) entries, in registration order, for
+   helpers that should be embedded as LABELS in generated render code.")
+
+(defmacro define-helper (name lambda-list &body body)
+  "Like DEFUN, but also records the source under *HELPER-SOURCES* so the
+   codegen can embed the helper as a LABELS clause."
+  `(progn
+     (setf *helper-sources*
+           (append (remove ',name *helper-sources* :key #'car)
+                   (list '(,name ,lambda-list ,@body))))
+     (defun ,name ,lambda-list ,@body)))
+
+(define-helper byte->line+column (ptr size byte-offset)
   "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in the
    mmap'd region PTR[0,SIZE). Counts newlines in the prefix
    [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the per-line cost
@@ -72,18 +96,18 @@
 (defconstant +map-private+ #x2)
 (defconstant +o-rdonly+    0)
 
-(defun %mmap-open (pathname)
+(define-helper %mmap-open (pathname)
   "Open PATHNAME read-only and mmap it. Returns (values mmap-pointer file-size fd)."
   (let* ((namestr (namestring pathname))
-         (fd (cffi:foreign-funcall "open" :string namestr :int +o-rdonly+ :int))
+         (fd (cffi:foreign-funcall "open" :string namestr :int #.+o-rdonly+ :int))
          (size (with-open-file (f pathname) (file-length f))))
     (when (< fd 0)
       (error "open(2) failed for ~A" pathname))
     (let ((ptr (cffi:foreign-funcall "mmap"
                                      :pointer (cffi:null-pointer)
                                      :size    size
-                                     :int     +prot-read+
-                                     :int     +map-private+
+                                     :int     #.+prot-read+
+                                     :int     #.+map-private+
                                      :int     fd
                                      :size    0
                                      :pointer)))
@@ -92,7 +116,7 @@
         (error "mmap(2) failed for ~A" pathname))
       (values ptr size fd))))
 
-(defun %mmap-close (ptr size fd)
+(define-helper %mmap-close (ptr size fd)
   "Unmap PTR (of SIZE bytes) and close FD."
   (cffi:foreign-funcall "munmap" :pointer ptr :size size :int)
   (cffi:foreign-funcall "close"  :int fd :int))
@@ -113,7 +137,7 @@
            (- (cffi:pointer-address found)
               (cffi:pointer-address haystack-ptr))))))
 
-(defun %memchr (haystack-ptr haystack-len byte)
+(define-helper %memchr (haystack-ptr haystack-len byte)
   "Return the byte offset of BYTE (an integer 0–255) in HAYSTACK-PTR[0,HAYSTACK-LEN),
    or NIL if not present. Wraps libc's vectorized memchr(3)."
   (let ((found (cffi:foreign-funcall "memchr"
@@ -143,35 +167,58 @@
    STREAM. Wrap in WITH-OUTPUT-TO-STRING if you want the output as a
    string."))
 
-(defmethod render ((pathname pathname) context-alist
-                   &optional (stream *standard-output*))
+(defun template-code (pathname &optional context-alist)
+  "Return a self-contained sexp that, when EVALuated, renders the template
+   at PATHNAME to *STANDARD-OUTPUT*. The form embeds the runtime helpers
+   as LABELS, opens its own mmap, runs the body under an error handler
+   that translates host conditions into ELP-TEMPLATE-ERROR, and unmaps on
+   the way out — eval-able anywhere ELP is loaded, without depending on
+   any internal (non-exported) ELP symbol."
   (let ((file-size (with-open-file (f pathname) (file-length f))))
-    ;; Linux mmap rejects size 0 with EINVAL. Skip the mapping entirely.
     (when (zerop file-size)
-      (return-from render (values))))
+      (return-from template-code '(values))))
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
     (unwind-protect
-         (let ((sexp (build-render-form pathname ptr size context-alist)))
-           (let ((*template-ptr* ptr)
-                 (*standard-output* stream))
-             (handler-bind
-                 ((elp-template-error (lambda (c) (error c)))
-                  (error
-                    (lambda (c)
-                      (when *current-template-span*
-                        (let ((byte (first *current-template-span*)))
-                          (multiple-value-bind (line col)
-                              (byte->line+column ptr size byte)
-                            (error 'elp-template-error
-                                   :file pathname :line line :column col
-                                   :original c)))))))
-               (eval sexp))))
-      (%mmap-close ptr size fd)))
-  (values))
+         (wrap-render-form pathname
+                           (build-render-form pathname ptr size context-alist))
+      (%mmap-close ptr size fd))))
+
+(defun wrap-render-form (pathname body)
+  "Wrap BODY (the body sexp produced by BUILD-RENDER-FORM) with a LABELS
+   block defining the runtime helpers and the MMAP-OPEN/CLOSE plumbing,
+   producing a self-contained, EVAL-able form."
+  (let ((helpers (mapcar (lambda (entry)
+                           (destructuring-bind (name lambda-list &rest body) entry
+                             `(,name ,lambda-list ,@body)))
+                         *helper-sources*)))
+    `(labels ,helpers
+       (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
+         (let ((*template-ptr* ptr))
+           (unwind-protect
+                (handler-bind
+                    ((elp-template-error (lambda (c) (error c)))
+                     (error
+                       (lambda (c)
+                         (when *current-template-span*
+                           (let ((byte (first *current-template-span*)))
+                             (multiple-value-bind (line col)
+                                 (byte->line+column ptr size byte)
+                               (error 'elp-template-error
+                                      :file ,pathname
+                                      :line line :column col
+                                      :original c)))))))
+                  ,body)
+             (%mmap-close ptr size fd))))
+       (values))))
+
+(defmethod render ((pathname pathname) context-alist
+                   &optional (stream *standard-output*))
+  (let ((*standard-output* stream))
+    (eval (template-code pathname context-alist))))
 
 ;;;; Internal Helper Functions
 
-(defun write-output-range (mmap-ptr start end &optional (stream *standard-output*))
+(define-helper write-output-range (mmap-ptr start end &optional (stream *standard-output*))
   "Write bytes [START, END) from MMAP-PTR to STREAM.
 
    When STREAM is an SBCL fd-stream (e.g. stdout), flushes any buffered output
