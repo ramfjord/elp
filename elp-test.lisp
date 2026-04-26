@@ -277,6 +277,56 @@
       (format nil "head<%=  -%>~%tail")
       "headtail"))
 
+;;;; Test Group 8d: Open-trim (`<%-`)
+;;;; =================================
+;;;; `<%-` strips ASCII spaces/tabs immediately preceding the open
+;;;; delimiter, back to (but keeping) the prior newline — or to start
+;;;; of file if every preceding byte on the line is whitespace.
+
+(test open-trim-strips-leading-indent
+  "Indentation before `<%-` on its own line is dropped."
+  (expect-render
+      (format nil "head~%   <%- (setf x 1) %>tail")
+      (format nil "head~%tail")))
+
+(test open-trim-at-start-of-file
+  "Leading whitespace before the very first `<%-` (no newline) is dropped."
+  (expect-render
+      "   <%- (setf x 1) %>after"
+      "after"))
+
+(test open-trim-keeps-the-newline-itself
+  "Open-trim removes spaces/tabs but preserves the prior newline."
+  (expect-render
+      (format nil "a~%   <%- (setf x 1) %>b")
+      (format nil "a~%b")))
+
+(test open-trim-non-whitespace-on-line-no-strip
+  "If anything non-whitespace precedes `<%-` on the same line, no
+   stripping happens — the spaces are part of real content."
+  (expect-render
+      "abc   <%- (setf x 1) %>def"
+      "abc   def"))
+
+(test open-trim-on-expr
+  "`<%-= ... %>` strips leading indent and emits the value."
+  (expect-render
+      (format nil "head~%   <%-= 99 %>")
+      (format nil "head~%99")))
+
+(test open-trim-on-comment
+  "`<%-# ... %>` strips leading indent and emits nothing."
+  (expect-render
+      (format nil "head~%   <%-# silenced %>tail")
+      (format nil "head~%tail")))
+
+(test goal-example-dolist-trim
+  "Combined open+close trim on a dolist matches the plan's Goal example."
+  (expect-render
+      (format nil "<% (dolist (x xs) -%>~%  - <%= x %>~%<%- ) -%>~%")
+      (format nil "  - A~%  - B~%  - C~%")
+      '((xs . (a b c)))))
+
 ;;;; ============================================================================
 
 (defun template-stream-of (template-string)

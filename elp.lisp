@@ -346,6 +346,30 @@
        (>= close 1)
        (= (%byte-at (ts-ptr s) (1- close)) (char-code #\-))))
 
+(defun ts-open-trim-p (s delim-pos)
+  "T when the byte immediately after `<%` at DELIM-POS is `-`,
+   i.e. the opening delimiter is `<%-`."
+  (let ((after (+ delim-pos 2)))
+    (and (< after (ts-size s))
+         (= (%byte-at (ts-ptr s) after) (char-code #\-)))))
+
+(defun ts-open-trim-emit-end (s delim-pos)
+  "Walk backward from DELIM-POS over ASCII space/tab bytes. If the walk
+   reaches a newline, return the position just past it; if it reaches
+   the start of the file through pure whitespace, return 0. Otherwise
+   return DELIM-POS (no trim — there is non-whitespace on the line)."
+  (let ((i (1- delim-pos)))
+    (loop while (>= i 0) do
+      (let ((b (%byte-at (ts-ptr s) i)))
+        (cond
+          ((or (= b (char-code #\space)) (= b (char-code #\tab)))
+           (decf i))
+          ((= b (char-code #\newline))
+           (return-from ts-open-trim-emit-end (1+ i)))
+          (t
+           (return-from ts-open-trim-emit-end delim-pos)))))
+    0))
+
 (defun ts-skip-trailing-newline (s)
   "Advance S's byte cursor past at most one `\\r\\n` or `\\n`. Used
    after a close-trim `-%>` to drop the trailing line break."
@@ -409,14 +433,21 @@
            (cond
              ((and delim-pos (> delim-pos cur))
               ;; Emit a write-output-range form for [cur, delim-pos).
+              ;; If the upcoming tag is open-trim (`<%-`), shorten the
+              ;; emit's end back over [\ \t]+ to the prior newline (or
+              ;; start of file) so leading indentation is dropped.
               ;; Cursor stops AT the delimiter; the next read will
               ;; re-enter :TEXT mode and dispatch by the byte after <%.
               ;; No checkpoint here: the wrapper chars are synth, not
               ;; mmap content, and the standard reader doesn't error
               ;; on its own valid output. POSITION-MAP entries are
               ;; only useful for queries that fall inside user code.
-              (ts-emit-text-form s cur delim-pos)
-              (setf (ts-byte-cursor s) delim-pos))
+              (let ((emit-end (if (ts-open-trim-p s delim-pos)
+                                  (max cur (ts-open-trim-emit-end s delim-pos))
+                                  delim-pos)))
+                (when (> emit-end cur)
+                  (ts-emit-text-form s cur emit-end))
+                (setf (ts-byte-cursor s) delim-pos)))
              ((null delim-pos)
               ;; Trailing literal text up to EOF.
               (cond ((> size cur)
@@ -425,8 +456,10 @@
                     (t (return-from sb-gray:stream-read-char :eof))))
              (t
               ;; Cursor sits at <%. Classify by the byte after the
-              ;; opening delimiter and dispatch.
-              (let* ((after (+ delim-pos 2))
+              ;; opening delimiter and dispatch. For `<%-`, skip the
+              ;; trim marker so the next-byte check sees `=`, `#`, or
+              ;; the first code byte exactly as in the non-trim case.
+              (let* ((after (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
                      (next-byte (and (< after size)
                                      (%byte-at (ts-ptr s) after))))
                 (cond
