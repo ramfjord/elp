@@ -70,9 +70,11 @@
                             (when val
                               (push val context)))))))
 
-            ;; Render and output the template
-            (let ((result (render (pathname template-file) context)))
-              (write-string result)))))
+            ;; Render the template, streaming output through *standard-output*.
+            ;; In a saved binary, *standard-output* is an sb-sys:fd-stream, so
+            ;; write-output-range fires its zero-copy write(2) path on the
+            ;; mmap'd source instead of routing every text range through Lisp.
+            (render-to-stream (pathname template-file) context))))
 
     (file-error (e)
       (format *error-output* "Error: ~A~%" e)
