@@ -464,6 +464,108 @@
   (let ((form (stream-read-form "<%# x %>tail")))
     (is (equal form '(elp::write-output-range elp::*template-ptr* 8 12)))))
 
+;;;; Test Group 11: template-stream position-map (commit 3)
+;;;; =====================================================
+
+(defun stream-position-map-after-drain (template-string)
+  "Drain TEMPLATE-STRING through a template-stream and return the
+   final position-map (oldest first)."
+  (multiple-value-bind (s cleanup) (template-stream-of template-string)
+    (unwind-protect
+         (progn
+           (loop for c = (read-char s nil :eof) until (eq c :eof))
+           (reverse (elp::ts-position-map s)))
+      (funcall cleanup))))
+
+(test position-map-text-only-empty
+  "Text-only templates have no mmap-content runs, so no checkpoints."
+  (is (equal '() (stream-position-map-after-drain "Hello"))))
+
+(test position-map-comment-only-empty
+  "<%# %> alone produces no characters and no checkpoints."
+  (is (equal '() (stream-position-map-after-drain "<%# anything %>"))))
+
+(test position-map-code-block
+  "A <% ... %> code block pushes one checkpoint anchored at its first
+   body byte, keyed at the reader position where the body starts."
+  ;; Bytes 0-1 = '<%'; byte 2 is the first code-body byte (' ').
+  ;; No leading text wrapper, so reader-pos = 0 when :lisp begins.
+  (is (equal '((0 . 2)) (stream-position-map-after-drain "<% (foo) %>"))))
+
+(test position-map-text-then-code
+  "Leading text emits a wrapper (synth) before the code body. The
+   checkpoint key is the wrapper length (chars-read after drain),
+   anchored at the code body's first byte."
+  ;; "ab<% (foo) %>cd" — wrapper for [0,2) is 50 chars; body at byte 4.
+  (let ((expected-key
+          (length (format nil
+                          "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+                          0 2))))
+    (is (equal `((,expected-key . 4))
+               (stream-position-map-after-drain "ab<% (foo) %>cd")))))
+
+(test position-map-expr-block
+  "An <%= ... %> block pushes one checkpoint anchored at its first
+   body byte, keyed AFTER the let-prefix is drained."
+  ;; "<%= 1 %>" — content [3,6); prefix is the let/format wrapper.
+  (let ((expected-key
+          (length (format nil
+                          "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                          3 6))))
+    (is (equal `((,expected-key . 3))
+               (stream-position-map-after-drain "<%= 1 %>")))))
+
+(test stream-byte-position-inside-code-body
+  "STREAM-BYTE-POSITION at a reader position inside a code body
+   returns the corresponding mmap byte."
+  ;; "<% (foo) %>": :lisp run starts at chars-read=0, byte 2.
+  ;; chars-read=3 corresponds to byte 5 ('o' in "foo").
+  (multiple-value-bind (s cleanup) (template-stream-of "<% (foo) %>")
+    (unwind-protect
+         (progn
+           ;; Read 3 chars: ' ', '(', 'f'. Reader-pos = 3, next byte = 5.
+           (read-char s) (read-char s) (read-char s)
+           (is (= 3 (elp::ts-chars-read s)))
+           (is (= 5 (elp::stream-byte-position s))))
+      (funcall cleanup))))
+
+(test stream-byte-position-default-uses-chars-read
+  "Calling STREAM-BYTE-POSITION with no second argument uses the
+   stream's current CHARS-READ value."
+  (multiple-value-bind (s cleanup) (template-stream-of "<% xyz %>")
+    (unwind-protect
+         (progn
+           (read-char s) (read-char s)         ; ' ', 'x'
+           (is (= (elp::stream-byte-position s (elp::ts-chars-read s))
+                  (elp::stream-byte-position s))))
+      (funcall cleanup))))
+
+(test stream-byte-position-before-first-checkpoint
+  "Reader positions that precede every checkpoint return NIL — the
+   stream cannot anchor them to a source byte."
+  ;; "Hello" has no checkpoints; any query returns NIL.
+  (multiple-value-bind (s cleanup) (template-stream-of "Hello")
+    (unwind-protect
+         (is (null (elp::stream-byte-position s 5)))
+      (funcall cleanup))))
+
+(test stream-byte-position-roundtrip-mid-expr-body
+  "Inside the body of an <%= ... %> block, STREAM-BYTE-POSITION
+   returns the exact mmap byte for each character read."
+  ;; "<%= xy %>" — body bytes [3,6) = ' ', 'x', 'y'. After draining the
+  ;; let-prefix the checkpoint key equals chars-read; reading further
+  ;; advances key+1 → byte 4, key+2 → byte 5.
+  (multiple-value-bind (s cleanup) (template-stream-of "<%= xy %>")
+    (unwind-protect
+         (progn
+           (loop for c = (read-char s nil :eof) until (eq c :eof))
+           (let* ((map (elp::ts-position-map s))
+                  (key (caar map)))
+             (is (= 3 (elp::stream-byte-position s key)))
+             (is (= 4 (elp::stream-byte-position s (1+ key))))
+             (is (= 5 (elp::stream-byte-position s (+ 2 key))))))
+      (funcall cleanup))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

@@ -304,25 +304,36 @@
 ;;;; without an intermediate source-string assembly step.
 ;;;;
 ;;;; Modes: :TEXT, :LISP, :EXPR-BODY. <%# comments are skipped during
-;;;; the :TEXT-mode dispatch and produce no characters. The
-;;;; position-map (for error / source-location mapping) is still
-;;;; deferred to a follow-up commit. Nothing in the engine consumes
-;;;; this yet — the existing TOKENIZE-MMAP / GENERATE-RENDER-CODE
-;;;; pipeline is still what RENDER-TO-STREAM uses.
+;;;; the :TEXT-mode dispatch and produce no characters. The stream
+;;;; tracks (CHARS-READ . MMAP-BYTE) checkpoints in POSITION-MAP, so
+;;;; STREAM-BYTE-POSITION can translate a reader position back to a
+;;;; source byte. Nothing in the engine consumes this yet — the
+;;;; existing TOKENIZE-MMAP / GENERATE-RENDER-CODE pipeline is still
+;;;; what RENDER-TO-STREAM uses.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
-  ((ptr         :initarg :ptr        :reader ts-ptr)
-   (size        :initarg :size       :reader ts-size)
-   (byte-cursor :initform 0          :accessor ts-byte-cursor)
-   (mode        :initform :text      :accessor ts-mode)
-   (synth       :initform ""         :accessor ts-synth)
-   (synth-pos   :initform 0          :accessor ts-synth-pos)
-   (pushback    :initform nil        :accessor ts-pushback))
+  ((ptr          :initarg :ptr        :reader   ts-ptr)
+   (size         :initarg :size       :reader   ts-size)
+   (byte-cursor  :initform 0          :accessor ts-byte-cursor)
+   (mode         :initform :text      :accessor ts-mode)
+   (synth        :initform ""         :accessor ts-synth)
+   (synth-pos    :initform 0          :accessor ts-synth-pos)
+   (pushback     :initform nil        :accessor ts-pushback)
+   (chars-read   :initform 0          :accessor ts-chars-read)
+   (position-map :initform '()        :accessor ts-position-map))
   (:documentation
    "Gray input stream wrapping an mmap'd ELP template. The standard
     Lisp reader can READ from it directly; the stream synthesizes
     WRITE-OUTPUT-RANGE wrapper forms around literal text spans and
-    feeds the bytes inside <% ... %> blocks straight through."))
+    feeds the bytes inside <% ... %> blocks straight through.
+
+    POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints, oldest
+    last (push to front). A checkpoint says: at the moment the reader
+    has consumed READER-POS chars, the next character will correspond
+    to MMAP-BYTE in the source template (for chars that come from the
+    mapping) or to the byte where the surrounding template construct
+    began (for synthesized wrapper chars). STREAM-BYTE-POSITION uses
+    it to translate a reader position back to a source byte."))
 
 (defun %byte-at (ptr offset)
   (cffi:mem-aref (cffi:inc-pointer ptr offset) :unsigned-char 0))
@@ -352,10 +363,32 @@
                           (- size from) "%>")))
         (and rel (+ from rel))))))
 
+(defun ts-push-checkpoint (s anchor &optional (key (ts-chars-read s)))
+  "Push (KEY . ANCHOR) onto S's POSITION-MAP unless it is already the
+   most recent entry. Checkpoints are pushed every time the source of
+   the next characters changes (text wrapper, code body, expr body)."
+  (let ((top (car (ts-position-map s))))
+    (unless (and top (= (car top) key) (= (cdr top) anchor))
+      (push (cons key anchor) (ts-position-map s)))))
+
+(defun stream-byte-position (s &optional (reader-pos (ts-chars-read s)))
+  "Map READER-POS (defaulting to S's current CHARS-READ) to the
+   corresponding mmap byte. Finds the largest checkpoint with
+   key <= READER-POS and adds (READER-POS - key) to its anchor.
+   Returns NIL when READER-POS precedes every checkpoint."
+  (let ((best nil))
+    (dolist (cp (ts-position-map s))
+      (when (<= (car cp) reader-pos)
+        (when (or (null best) (> (car cp) (car best)))
+          (setf best cp))))
+    (when best
+      (+ (cdr best) (- reader-pos (car best))))))
+
 (defmethod sb-gray:stream-read-char ((s template-stream))
   (let ((pb (ts-pushback s)))
     (when pb
       (setf (ts-pushback s) nil)
+      (incf (ts-chars-read s))
       (return-from sb-gray:stream-read-char pb)))
   (loop
     ;; Drain pending synthesized characters first.
@@ -363,6 +396,7 @@
           (sp  (ts-synth-pos s)))
       (when (< sp (length buf))
         (setf (ts-synth-pos s) (1+ sp))
+        (incf (ts-chars-read s))
         (return-from sb-gray:stream-read-char (char buf sp))))
     ;; No synth chars: advance state machine.
     (ecase (ts-mode s)
@@ -380,6 +414,10 @@
               ;; Emit a write-output-range form for [cur, delim-pos).
               ;; Cursor stops AT the delimiter; the next read will
               ;; re-enter :TEXT mode and dispatch by the byte after <%.
+              ;; No checkpoint here: the wrapper chars are synth, not
+              ;; mmap content, and the standard reader doesn't error
+              ;; on its own valid output. POSITION-MAP entries are
+              ;; only useful for queries that fall inside user code.
               (ts-emit-text-form s cur delim-pos)
               (setf (ts-byte-cursor s) delim-pos))
              ((null delim-pos)
@@ -408,13 +446,22 @@
                         (setf (ts-byte-cursor s)
                               (if close (+ close 2) size)))
                        (t
-                        (setf (ts-synth s)
-                              (format nil
-                                      "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                                      cstart cend))
-                        (setf (ts-synth-pos s) 0)
-                        (setf (ts-byte-cursor s) cstart)
-                        (setf (ts-mode s) :expr-body)))))
+                        ;; Checkpoint anchored at the first body byte
+                        ;; (CSTART), keyed at the chars-read value
+                        ;; the reader will reach AFTER draining the
+                        ;; let-prefix synth. The prefix itself is
+                        ;; valid Lisp the reader will not error on.
+                        (let ((prefix
+                                (format nil
+                                        "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                        cstart cend)))
+                          (ts-push-checkpoint s cstart
+                                              (+ (ts-chars-read s)
+                                                 (length prefix)))
+                          (setf (ts-synth s) prefix)
+                          (setf (ts-synth-pos s) 0)
+                          (setf (ts-byte-cursor s) cstart)
+                          (setf (ts-mode s) :expr-body))))))
                   ;; <%# comment block — skip entirely.
                   ((and next-byte (= next-byte (char-code #\#)))
                    (let* ((cstart (1+ after))
@@ -423,6 +470,7 @@
                            (if close (+ close 2) size))))
                   ;; Plain <% code block.
                   (t
+                   (ts-push-checkpoint s after)
                    (setf (ts-byte-cursor s) after)
                    (setf (ts-mode s) :lisp)))))))))
       ((:lisp :expr-body)
@@ -444,10 +492,12 @@
            (t
             (let ((b (%byte-at (ts-ptr s) cur)))
               (setf (ts-byte-cursor s) (1+ cur))
+              (incf (ts-chars-read s))
               (return-from sb-gray:stream-read-char (code-char b))))))))))
 
 (defmethod sb-gray:stream-unread-char ((s template-stream) char)
   (setf (ts-pushback s) char)
+  (decf (ts-chars-read s))
   nil)
 
 (defun tokenize-mmap (ptr size)
