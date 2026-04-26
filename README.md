@@ -31,7 +31,7 @@ silently formats only `+` and discards `1 2`.
 (render #p"template.elp"
   '((name . "Alice")
     (age . 30)))
-;; Output: "Hello Alice, you are 30 years old."
+;; Writes to *standard-output*: Hello Alice, you are 30 years old.
 ```
 
 Where `template.elp` contains:
@@ -50,7 +50,7 @@ Name: <%= name %><% (when (> age 30) %> (senior)<% ) %>
 (render #p"template.elp"
   '((name . "Bob")
     (age . 35)))
-;; Output: "Name: Bob (senior)"
+;; Writes to *standard-output*: Name: Bob (senior)
 ```
 
 ### Using with Full Lisp Power
@@ -96,30 +96,27 @@ Active
 
 ### Public API
 
-**`(render-to-stream pathname context-alist &optional stream)`**
+**`(render pathname context-alist &optional stream)`**
 
-Streams a rendered template directly to `stream` (defaults to
-`*standard-output*`). This is the engine's primitive — output bytes are
-written as they are produced, with no intermediate Lisp string. When
-`stream` is an `sb-sys:fd-stream` (e.g. the CLI's `*standard-output*`
-in a saved binary), literal text ranges are written via a single
-`write(2)` syscall directly on the mmap'd source — zero copy through
-Lisp.
+Renders a template, streaming output bytes directly to `stream`
+(defaults to `*standard-output*`). Output is produced as bytes are
+generated, with no intermediate Lisp string. When `stream` is an
+`sb-sys:fd-stream` (e.g. the CLI's `*standard-output*` in a saved
+binary), literal text ranges are written via a single `write(2)`
+syscall directly on the mmap'd source — zero copy through Lisp.
 
 - `pathname`: A file path (pathname object)
 - `context-alist`: List of `(symbol . value)` pairs
 - `stream`: Destination stream (default: `*standard-output*`)
 - Returns: no useful value; consumers care about side effects on `stream`
 
-**`(render pathname context-alist) → string`**
+For callers that want the output as a string, wrap in
+`with-output-to-string`:
 
-Thin wrapper around `render-to-stream` for callers that want the output
-as a string. Equivalent to
-`(with-output-to-string (s) (render-to-stream pathname context-alist s))`.
-
-- `pathname`: A file path (pathname object)
-- `context-alist`: List of `(symbol . value)` pairs
-- Returns: Rendered output as a string
+```lisp
+(with-output-to-string (s)
+  (render #p"template.elp" '((name . "Alice")) s))
+```
 
 ### Errors
 

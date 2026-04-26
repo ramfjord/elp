@@ -10,7 +10,6 @@
   (:export
    ;; Primary public API
    :render
-   :render-to-stream
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -127,37 +126,29 @@
 
 ;;;; Public API
 
-(defgeneric render-to-stream (input context-alist &optional stream)
+(defgeneric render (input context-alist &optional stream)
   (:documentation "Render a template from INPUT with CONTEXT-ALIST, writing
    directly to STREAM (defaults to *STANDARD-OUTPUT*).
 
-   This is the streaming primitive: output bytes go to STREAM as they are
-   produced, with no intermediate Lisp string. When STREAM is an
-   SB-SYS:FD-STREAM (e.g. the CLI's *STANDARD-OUTPUT* in a saved binary),
-   text ranges are written via a single WRITE(2) syscall directly on the
-   mmap'd source — zero copy through Lisp.
+   Output bytes go to STREAM as they are produced, with no intermediate
+   Lisp string. When STREAM is an SB-SYS:FD-STREAM (e.g. the CLI's
+   *STANDARD-OUTPUT* in a saved binary), text ranges are written via a
+   single WRITE(2) syscall directly on the mmap'd source — zero copy
+   through Lisp.
 
    INPUT is a pathname; the file is mmap'd once, walked by the standard
    Lisp reader through a TEMPLATE-STREAM (via BUILD-RENDER-FORM), and
    the resulting body sexp is evaluated against the same mapping.
    Returns no useful value; consumers care about side effects on
-   STREAM. Use RENDER if you want the output as a string."))
+   STREAM. Wrap in WITH-OUTPUT-TO-STRING if you want the output as a
+   string."))
 
-(defgeneric render (input context)
-  (:documentation "Render a template from INPUT with CONTEXT variable bindings,
-   returning the rendered output as a string.
-
-   Thin wrapper around RENDER-TO-STREAM for callers that genuinely want a
-   string (tests, library consumers building HTTP bodies, etc.). Streaming
-   callers (the CLI, file exporters) should use RENDER-TO-STREAM directly
-   to avoid materializing the entire output in Lisp memory."))
-
-(defmethod render-to-stream ((pathname pathname) context-alist
-                             &optional (stream *standard-output*))
+(defmethod render ((pathname pathname) context-alist
+                   &optional (stream *standard-output*))
   (let ((file-size (with-open-file (f pathname) (file-length f))))
     ;; Linux mmap rejects size 0 with EINVAL. Skip the mapping entirely.
     (when (zerop file-size)
-      (return-from render-to-stream (values))))
+      (return-from render (values))))
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
     (unwind-protect
          (let ((sexp (build-render-form pathname ptr size context-alist)))
@@ -177,10 +168,6 @@
                (eval sexp))))
       (%mmap-close ptr size fd)))
   (values))
-
-(defmethod render ((pathname pathname) context-alist)
-  (with-output-to-string (s)
-    (render-to-stream pathname context-alist s)))
 
 ;;;; Internal Helper Functions
 

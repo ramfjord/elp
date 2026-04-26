@@ -74,7 +74,7 @@
             ;; In a saved binary, *standard-output* is an sb-sys:fd-stream, so
             ;; write-output-range fires its zero-copy write(2) path on the
             ;; mmap'd source instead of routing every text range through Lisp.
-            (render-to-stream (pathname template-file) context))))
+            (render (pathname template-file) context))))
 
     (file-error (e)
       (format *error-output* "Error: ~A~%" e)

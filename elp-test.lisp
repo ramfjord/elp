@@ -34,7 +34,8 @@
    EXPECTED-OUTPUT."
   `(let ((temp-file (template-string-to-file ,template-string)))
      (unwind-protect
-          (let ((output (elp:render temp-file (or ,context '()))))
+          (let ((output (with-output-to-string (s)
+                          (elp:render temp-file (or ,context '()) s))))
             (is (equal output ,expected-output)
                 (format nil "Rendered output should match. Got: ~S" output)))
        (cleanup-file temp-file))))
@@ -133,9 +134,11 @@
 
 (defun render-error (template-string &optional context)
   "Render TEMPLATE-STRING from a temp file and capture any elp-template-error."
-  (let ((temp-file (template-string-to-file template-string)))
+  (let ((temp-file (template-string-to-file template-string))
+        (sink (make-broadcast-stream)))
     (unwind-protect
-         (handler-case (progn (elp:render temp-file (or context '())) nil)
+         (handler-case
+             (progn (elp:render temp-file (or context '()) sink) nil)
            (elp:elp-template-error (c) c))
       (cleanup-file temp-file))))
 
