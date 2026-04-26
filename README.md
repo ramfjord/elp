@@ -21,6 +21,39 @@ A `<%= … %>` tag emits `(format t "~A" <contents>)`, so the contents
 must be a single Lisp form. `<%= (+ 1 2) %>` works; `<%= + 1 2 %>`
 silently formats only `+` and discards `1 2`.
 
+### Whitespace trim
+
+Per-tag opt-in trimming, matching ERB's `-` flag:
+
+- `-%>` — at the close, drop a single trailing line break (`\r?\n`)
+  immediately after the delimiter.
+- `<%-`, `<%-=`, `<%-#` — at the open, strip ASCII spaces and tabs
+  immediately *preceding* the delimiter back to (but keeping) the
+  prior newline. If anything non-whitespace shares the line, no
+  stripping happens.
+
+Plain `<% %>` and `<%= %>` are unchanged.
+
+The combined form makes multi-tag block constructs render cleanly:
+
+```erb
+<% (dolist (x xs) -%>
+  - <%= x %>
+<%- ) -%>
+```
+
+with `xs = (a b c)` renders as:
+
+```
+  - a
+  - b
+  - c
+```
+
+Caveat: as with bare `%>`, `-%>` inside a Lisp string literal (e.g.
+`<% (format t "-%>") %>`) still ends the tag — the engine does not
+track reader state when scanning for the close.
+
 ## Usage
 
 ### Basic Example - Render from File
@@ -185,5 +218,6 @@ See [TODOs.md](TODOs.md).
 ## Future Enhancements
 
 - Caching of parsed templates and generated code
-- Whitespace trimming modes (`%-`, `-%`)
+- Global trim mode (ERB's `>` and `<>`) — implicit whitespace
+  collapse around tag-only lines, no per-tag opt-in
 - Custom delimiter sets
