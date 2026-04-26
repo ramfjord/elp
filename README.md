@@ -19,7 +19,10 @@ first tag and the closing paren in the last:
 
 A `<%= … %>` tag emits `(format t "~A" <contents>)`, so the contents
 must be a single Lisp form. `<%= (+ 1 2) %>` works; `<%= + 1 2 %>`
-silently formats only `+` and discards `1 2`.
+silently formats only `+` (printing `#<FUNCTION +>`) and discards
+`1 2` as unused `format` arguments — no error, just wrong output.
+Tracked as a known sharp edge in
+[#9](https://github.com/ramfjord/elp/issues/9).
 
 ### Whitespace trim
 
@@ -211,13 +214,3 @@ Or load directly:
   byte and counting newlines in the prefix via libc `memchr` — the
   prefix scan is vectorized rather than per-byte.
 
-## Known Limitations
-
-See [TODOs.md](TODOs.md).
-
-## Future Enhancements
-
-- Caching of parsed templates and generated code
-- Global trim mode (ERB's `>` and `<>`) — implicit whitespace
-  collapse around tag-only lines, no per-tag opt-in
-- Custom delimiter sets
