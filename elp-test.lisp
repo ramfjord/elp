@@ -409,6 +409,61 @@
   (let ((form (stream-read-form "<% (+ 1 2) %>")))
     (is (equal form '(+ 1 2)))))
 
+;;;; Test Group 10: template-stream <%= and <%# (commit 2)
+;;;; ====================================================
+
+(test stream-expr-only
+  "<%= 1 %> wraps the body in a (let ((*current-template-span* '(C1 C2)))
+   (format t \"~A\" ... )) call. Content range is bytes [3, 6) — the
+   body bytes between <%= and %>, including surrounding whitespace."
+  (let* ((tmpl     "<%= 1 %>")
+         (expected (concatenate 'string
+                                "(let ((elp::*current-template-span* '(3 6))) (format t \"~A\" "
+                                " 1 "
+                                ")) ")))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-expr-empty-skipped
+  "<%=   %> with whitespace-only body emits nothing — matches the
+   existing engine's <%= empty %> behavior."
+  (is (equal "" (stream-drain "<%=   %>"))))
+
+(test stream-comment-only
+  "<%# comment %> produces no characters."
+  (is (equal "" (stream-drain "<%# anything in here %>"))))
+
+(test stream-comment-between-text
+  "Comment between text spans drops out, leaving two text-emit forms."
+  (let* ((tmpl     "a<%# c %>b")
+         (expected (concatenate 'string
+                                "(elp::write-output-range elp::*template-ptr* 0 1) "
+                                "(elp::write-output-range elp::*template-ptr* 9 10) ")))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-expr-between-text
+  "<%= ... %> between text spans: text wrapper, expr let-form, text wrapper."
+  (let* ((tmpl     "a<%= 1 %>b")
+         (expected (concatenate 'string
+                                "(elp::write-output-range elp::*template-ptr* 0 1) "
+                                "(let ((elp::*current-template-span* '(4 7))) (format t \"~A\" "
+                                " 1 "
+                                ")) "
+                                "(elp::write-output-range elp::*template-ptr* 9 10) ")))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-read-on-expr
+  "(READ stream) on <%= 1 %> returns the wrapped let/format form."
+  (let ((form (stream-read-form "<%= 1 %>")))
+    (is (equal form
+               '(let ((elp::*current-template-span* '(3 6)))
+                 (format t "~A" 1))))))
+
+(test stream-read-on-comment-then-text
+  "(READ stream) skips a leading comment and returns the trailing text
+   wrapper as the first form."
+  (let ((form (stream-read-form "<%# x %>tail")))
+    (is (equal form '(elp::write-output-range elp::*template-ptr* 8 12)))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

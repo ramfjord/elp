@@ -303,12 +303,12 @@
 ;;;; reader can walk the template directly and produce the body sexp
 ;;;; without an intermediate source-string assembly step.
 ;;;;
-;;;; This commit lands the spike: :TEXT and :LISP modes only.
-;;;; <%= (expr) and <%# (comment) blocks are deferred to a follow-up,
-;;;; and the position-map (for error / source-location mapping) is
-;;;; deferred as well. Nothing in the engine consumes this yet — the
-;;;; existing TOKENIZE-MMAP / GENERATE-RENDER-CODE pipeline is still
-;;;; what RENDER-TO-STREAM uses.
+;;;; Modes: :TEXT, :LISP, :EXPR-BODY. <%# comments are skipped during
+;;;; the :TEXT-mode dispatch and produce no characters. The
+;;;; position-map (for error / source-location mapping) is still
+;;;; deferred to a follow-up commit. Nothing in the engine consumes
+;;;; this yet — the existing TOKENIZE-MMAP / GENERATE-RENDER-CODE
+;;;; pipeline is still what RENDER-TO-STREAM uses.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr         :initarg :ptr        :reader ts-ptr)
@@ -335,6 +335,23 @@
                 start end))
   (setf (ts-synth-pos s) 0))
 
+(defun ts-whitespace-only-p (s start end)
+  "T iff every byte in [START, END) is ASCII whitespace."
+  (loop for i from start below end
+        always (let ((b (%byte-at (ts-ptr s) i)))
+                 (or (= b (char-code #\space))
+                     (= b (char-code #\tab))
+                     (= b (char-code #\newline))
+                     (= b (char-code #\return))))))
+
+(defun ts-find-close-delim (s from)
+  "Return the byte offset of the next %> at or after FROM, or NIL."
+  (let* ((size (ts-size s)))
+    (when (<= from size)
+      (let ((rel (%memmem (cffi:inc-pointer (ts-ptr s) from)
+                          (- size from) "%>")))
+        (and rel (+ from rel))))))
+
 (defmethod sb-gray:stream-read-char ((s template-stream))
   (let ((pb (ts-pushback s)))
     (when pb
@@ -357,23 +374,58 @@
          (let* ((rem       (- size cur))
                 (rel       (%memmem (cffi:inc-pointer (ts-ptr s) cur)
                                     rem "<%"))
-                (delim-pos (and rel (+ cur rel)))
-                (text-end  (or delim-pos size)))
+                (delim-pos (and rel (+ cur rel))))
            (cond
-             ((> text-end cur)
-              ;; Emit a write-output-range form for [cur, text-end).
-              (ts-emit-text-form s cur text-end)
-              (setf (ts-byte-cursor s) text-end)
-              (when delim-pos
-                (setf (ts-byte-cursor s) (+ delim-pos 2))
-                (setf (ts-mode s) :lisp)))
-             (delim-pos
-              ;; Empty text region right against <%; just transition.
-              (setf (ts-byte-cursor s) (+ delim-pos 2))
-              (setf (ts-mode s) :lisp))
+             ((and delim-pos (> delim-pos cur))
+              ;; Emit a write-output-range form for [cur, delim-pos).
+              ;; Cursor stops AT the delimiter; the next read will
+              ;; re-enter :TEXT mode and dispatch by the byte after <%.
+              (ts-emit-text-form s cur delim-pos)
+              (setf (ts-byte-cursor s) delim-pos))
+             ((null delim-pos)
+              ;; Trailing literal text up to EOF.
+              (cond ((> size cur)
+                     (ts-emit-text-form s cur size)
+                     (setf (ts-byte-cursor s) size))
+                    (t (return-from sb-gray:stream-read-char :eof))))
              (t
-              (return-from sb-gray:stream-read-char :eof))))))
-      (:lisp
+              ;; Cursor sits at <%. Classify by the byte after the
+              ;; opening delimiter and dispatch.
+              (let* ((after (+ delim-pos 2))
+                     (next-byte (and (< after size)
+                                     (%byte-at (ts-ptr s) after))))
+                (cond
+                  ;; <%= expression block
+                  ((and next-byte (= next-byte (char-code #\=)))
+                   (let* ((cstart (1+ after))
+                          (close  (ts-find-close-delim s cstart))
+                          (cend   (or close size)))
+                     (cond
+                       ((ts-whitespace-only-p s cstart cend)
+                        ;; Empty/whitespace-only expr: skip without
+                        ;; emitting anything, matching the existing
+                        ;; engine's treatment of <%= %>.
+                        (setf (ts-byte-cursor s)
+                              (if close (+ close 2) size)))
+                       (t
+                        (setf (ts-synth s)
+                              (format nil
+                                      "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                      cstart cend))
+                        (setf (ts-synth-pos s) 0)
+                        (setf (ts-byte-cursor s) cstart)
+                        (setf (ts-mode s) :expr-body)))))
+                  ;; <%# comment block — skip entirely.
+                  ((and next-byte (= next-byte (char-code #\#)))
+                   (let* ((cstart (1+ after))
+                          (close  (ts-find-close-delim s cstart)))
+                     (setf (ts-byte-cursor s)
+                           (if close (+ close 2) size))))
+                  ;; Plain <% code block.
+                  (t
+                   (setf (ts-byte-cursor s) after)
+                   (setf (ts-mode s) :lisp)))))))))
+      ((:lisp :expr-body)
        (let* ((cur  (ts-byte-cursor s))
               (size (ts-size s)))
          (cond
@@ -384,10 +436,11 @@
            ((and (<= (+ cur 2) size)
                  (= (%byte-at (ts-ptr s) cur)       (char-code #\%))
                  (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\>)))
-            (setf (ts-byte-cursor s) (+ cur 2))
-            (setf (ts-mode s) :text)
-            (setf (ts-synth s) " ")
-            (setf (ts-synth-pos s) 0))
+            (let ((suffix (if (eq (ts-mode s) :expr-body) ")) " " ")))
+              (setf (ts-byte-cursor s) (+ cur 2))
+              (setf (ts-mode s) :text)
+              (setf (ts-synth s) suffix)
+              (setf (ts-synth-pos s) 0)))
            (t
             (let ((b (%byte-at (ts-ptr s) cur)))
               (setf (ts-byte-cursor s) (1+ cur))
