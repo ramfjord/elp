@@ -28,58 +28,24 @@
   (when (probe-file filepath)
     (delete-file filepath)))
 
-(defun tokenize-mmap-of-file (pathname)
-  "mmap PATHNAME, run tokenize-mmap, close. Return the token list."
-  (multiple-value-bind (ptr size fd) (elp::%mmap-open pathname)
-    (unwind-protect (elp::tokenize-mmap ptr size)
-      (elp::%mmap-close ptr size fd))))
-
-(defun tokens-match-structure (actual expected-structure)
-  "Check if tokens match expected structure, ignoring byte positions.
-   Expected-structure is a list of (type content) tuples. Content
-   matching is skipped for :text and :comment tokens — the mmap-based
-   tokenizer leaves their content NIL (the bytes live in the mapping)
-   and the rendering check downstream is what proves the byte ranges
-   are correct."
-  (and (= (length actual) (length expected-structure))
-       (every (lambda (token exp-struct)
-                (destructuring-bind (type content) exp-struct
-                  (and (eq (first token) type)
-                       (or (member type '(:text :comment))
-                           (equal (second token) content)))))
-              actual
-              expected-structure)))
-
 (defmacro expect-render (template-string expected-token-structure expected-output &optional context)
-  "RSpec-style test wrapper that validates:
-   1. Tokenization produces tokens with correct structure
-   2. Code generation produces valid S-expression
-   3. Rendering produces expected output
+  "RSpec-style test wrapper that validates rendering via the public
+   RENDER API.
 
-   Expected token structure is a list of (type content) tuples.
-   Optional context is an alist of (symbol . value) pairs for variable bindings.
+   The EXPECTED-TOKEN-STRUCTURE argument is preserved as documentation
+   for what the template's intended structure looks like — the
+   reader-driven engine has no separate tokenizer phase to assert
+   against, so the rendered-output check is what proves the engine
+   walked the template correctly.
 
-   Example: (expect-render \"Hello <%= (list 1 2 3) %>\"
-              '((:text \"Hello \") (:expr \"(list 1 2 3)\"))
-              \"Hello (1 2 3)\")
-
-   With context: (expect-render \"Name: <%= name %>\"
-                  '((:text \"Name: \") (:expr \"name\"))
-                  \"Name: Alice\"
-                  '((name . \"Alice\")))"
+   Optional CONTEXT is an alist of (symbol . value) pairs bound as
+   variables for template expressions."
+  (declare (ignore expected-token-structure))
   `(let ((temp-file (template-string-to-file ,template-string)))
      (unwind-protect
-         (progn
-           ;; Step 1: Validate tokenization structure
-           (let ((tokens (tokenize-mmap-of-file temp-file)))
-             (is (tokens-match-structure tokens ,expected-token-structure)
-                 (format nil "Tokens structure should match. Got: ~S" tokens)))
-
-           ;; Step 2: Validate rendering via public API
-           (let ((output (elp:render temp-file (or ,context '()))))
-             (is (equal output ,expected-output)
-                 (format nil "Rendered output should match. Got: ~S" output))))
-       ;; Cleanup
+          (let ((output (elp:render temp-file (or ,context '()))))
+            (is (equal output ,expected-output)
+                (format nil "Rendered output should match. Got: ~S" output)))
        (cleanup-file temp-file))))
 
 ;;;; Test Group 1: Basic Template Rendering

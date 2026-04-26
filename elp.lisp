@@ -137,9 +137,10 @@
    text ranges are written via a single WRITE(2) syscall directly on the
    mmap'd source — zero copy through Lisp.
 
-   INPUT is a pathname; the file is mmap'd once, tokenized via
-   TOKENIZE-MMAP, and the generated body is evaluated against that same
-   mapping. Returns no useful value; consumers care about side effects on
+   INPUT is a pathname; the file is mmap'd once, walked by the standard
+   Lisp reader through a TEMPLATE-STREAM (via BUILD-RENDER-FORM), and
+   the resulting body sexp is evaluated against the same mapping.
+   Returns no useful value; consumers care about side effects on
    STREAM. Use RENDER if you want the output as a string."))
 
 (defgeneric render (input context)
@@ -159,24 +160,21 @@
       (return-from render-to-stream (values))))
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
     (unwind-protect
-         (let ((tokens (tokenize-mmap ptr size)))
-           (multiple-value-bind (sexp checkpoints body-string)
-               (generate-render-code pathname ptr size tokens context-alist)
-             (declare (ignore checkpoints body-string))
-             (let ((*template-ptr* ptr)
-                   (*standard-output* stream))
-               (handler-bind
-                   ((elp-template-error (lambda (c) (error c)))
-                    (error
-                      (lambda (c)
-                        (when *current-template-span*
-                          (let ((byte (first *current-template-span*)))
-                            (multiple-value-bind (line col)
-                                (byte->line+column ptr size byte)
-                              (error 'elp-template-error
-                                     :file pathname :line line :column col
-                                     :original c)))))))
-                 (eval sexp)))))
+         (let ((sexp (build-render-form pathname ptr size context-alist)))
+           (let ((*template-ptr* ptr)
+                 (*standard-output* stream))
+             (handler-bind
+                 ((elp-template-error (lambda (c) (error c)))
+                  (error
+                    (lambda (c)
+                      (when *current-template-span*
+                        (let ((byte (first *current-template-span*)))
+                          (multiple-value-bind (line col)
+                              (byte->line+column ptr size byte)
+                            (error 'elp-template-error
+                                   :file pathname :line line :column col
+                                   :original c)))))))
+               (eval sexp))))
       (%mmap-close ptr size fd)))
   (values))
 
@@ -208,89 +206,34 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-(defun generate-render-code (pathname ptr size tokens &optional context-alist)
-  "Generate an executable sexp from PATHNAME and its TOKENS.
+(defun build-render-form (pathname ptr size &optional context-alist)
+  "Read the template at PTR[0,SIZE) through a TEMPLATE-STREAM and
+   return the executable body sexp. CONTEXT-ALIST is a list of
+   (symbol . value) pairs wrapped in a LET around the body so that
+   template expressions can reference the bound variables.
 
-   Builds the template body as a single string — code token content is spliced
-   in raw, text and expr tokens emit write-output-range/format calls — then
-   calls read-from-string once on the whole thing.  This means multi-token
-   constructs like loops work naturally: open parens in one code block are
-   closed by a later one.
+   Reader errors are translated into ELP-TEMPLATE-ERROR via the
+   stream's POSITION-MAP — no intermediate body-string assembly,
+   no checkpoints list reconstruction."
+  (let* ((stream (make-instance 'template-stream :ptr ptr :size size))
+         (forms  '()))
+    (handler-case
+        (loop for form = (read stream nil :eof)
+              until (eq form :eof)
+              do (push form forms))
+      ((or reader-error end-of-file) (c)
+        (translate-read-error c pathname ptr size stream)))
+    (let* ((body     `(progn ,@(nreverse forms)))
+           (bindings (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist)))
+      (if bindings `(let ,bindings ,body) body))))
 
-   The returned sexp is a plain (progn …) referencing ELP::*TEMPLATE-PTR*
-   for the mmap base pointer; the caller (RENDER-TO-STREAM) is
-   responsible for opening the mmap and binding *TEMPLATE-PTR* around
-   EVAL.
-
-   CONTEXT-ALIST is a list of (symbol . value) pairs bound as variables
-   available to template expressions."
-  (let ((out (make-string-output-stream))
-        (checkpoints '()))
-    (write-string "(progn " out)
-    (dolist (token tokens)
-      (let ((type         (first token))
-            (content      (second token))
-            (start        (third token))
-            (end          (fourth token))
-            (content-start (fifth token))
-            (content-end   (sixth token)))
-        (declare (ignore end))
-        (case type
-          (:text
-           (format out "(elp::write-output-range elp::*template-ptr* ~D ~D) "
-                   start content-end))
-          (:expr
-           (unless (zerop (length (string-trim '(#\space #\tab #\newline) content)))
-             (format out "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                     content-start content-end)
-             (push (cons (file-position-of-stream out) content-start) checkpoints)
-             (write-string content out)
-             (write-string ")) " out)))
-          (:code
-           (push (cons (file-position-of-stream out) content-start) checkpoints)
-           (write-string content out)
-           (write-char #\space out))
-          (:comment nil))))
-    (write-string ")" out)
-    (let* ((body-string (get-output-stream-string out))
-           (checkpoints (nreverse checkpoints))
-           (body (handler-case
-                     (read-from-string body-string)
-                   ((or reader-error end-of-file) (c)
-                     (translate-read-error c pathname ptr size
-                                           body-string checkpoints))))
-           (bindings    (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
-           (body-with-context (if bindings `(let ,bindings ,body) body)))
-      (values body-with-context checkpoints body-string))))
-
-(defun file-position-of-stream (stream)
-  "Length (in characters) written so far to a string-output-stream."
-  (file-position stream))
-
-(defun body-offset->file-byte (offset checkpoints)
-  "Given a char offset into the body-string, find the nearest preceding
-   checkpoint and compute the corresponding file byte offset.  Returns NIL
-   when OFFSET is before any checkpoint."
-  (let ((best nil))
-    (dolist (cp checkpoints)
-      (when (<= (car cp) offset)
-        (setf best cp)))
-    (when best
-      (+ (cdr best) (- offset (car best))))))
-
-(defun translate-read-error (condition pathname ptr size body-string checkpoints)
-  "Translate a reader-error raised while reading BODY-STRING into an
-   elp-template-error that points into PATHNAME using CHECKPOINTS.
-   PTR/SIZE name the live mmap of PATHNAME used for line/column lookup."
-  (let* ((offset (or (ignore-errors
-                      (with-input-from-string (s body-string)
-                        (handler-case
-                            (progn (read s) (file-position s))
-                          (error () (file-position s)))))
-                     (length body-string)))
-         (file-byte (or (body-offset->file-byte offset checkpoints)
-                        (cdar (last checkpoints))
-                        0)))
+(defun translate-read-error (condition pathname ptr size stream)
+  "Translate a reader-error raised while reading STREAM into an
+   ELP-TEMPLATE-ERROR pointing at the source byte that produced the
+   offending reader position. Falls back to byte 0 when the stream
+   has not yet reached any checkpoint."
+  (let* ((reader-pos (ts-chars-read stream))
+         (file-byte  (or (stream-byte-position stream reader-pos) 0)))
     (multiple-value-bind (line col) (byte->line+column ptr size file-byte)
       (error 'elp-template-error
              :file pathname :line line :column col
@@ -307,9 +250,8 @@
 ;;;; the :TEXT-mode dispatch and produce no characters. The stream
 ;;;; tracks (CHARS-READ . MMAP-BYTE) checkpoints in POSITION-MAP, so
 ;;;; STREAM-BYTE-POSITION can translate a reader position back to a
-;;;; source byte. Nothing in the engine consumes this yet — the
-;;;; existing TOKENIZE-MMAP / GENERATE-RENDER-CODE pipeline is still
-;;;; what RENDER-TO-STREAM uses.
+;;;; source byte. RENDER-TO-STREAM consumes this stream via
+;;;; BUILD-RENDER-FORM — there is no separate tokenizer phase.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr          :initarg :ptr        :reader   ts-ptr)
@@ -478,8 +420,10 @@
               (size (ts-size s)))
          (cond
            ((>= cur size)
-            ;; Unterminated <% block. Treat as EOF here; commit-4 will
-            ;; route this through ELP-TEMPLATE-ERROR.
+            ;; Unterminated <% block. Returning :EOF from inside a
+            ;; reader-driven read causes the standard reader to signal
+            ;; END-OF-FILE, which BUILD-RENDER-FORM catches and routes
+            ;; through TRANSLATE-READ-ERROR.
             (return-from sb-gray:stream-read-char :eof))
            ((and (<= (+ cur 2) size)
                  (= (%byte-at (ts-ptr s) cur)       (char-code #\%))
@@ -499,72 +443,4 @@
   (setf (ts-pushback s) char)
   (decf (ts-chars-read s))
   nil)
-
-(defun tokenize-mmap (ptr size)
-  "Tokenize the byte range PTR[0,SIZE) as an ELP template.
-
-   Returns the same shape as TOKENIZE-FILE: a list of
-   (type content start end content-start content-end). For :text and
-   :comment tokens, CONTENT is NIL — the bytes live in the mmap and
-   the renderer reads them directly via offsets. For :code and :expr,
-   CONTENT is a trimmed Lisp string extracted from the mapped region
-   via foreign-string-to-lisp; its size is bounded by embedded-code
-   length, not template length."
-  (let ((tokens '())
-        (pos 0))
-    (loop while (< pos size) do
-      (let* ((rem (- size pos))
-             (base (cffi:inc-pointer ptr pos))
-             (rel-comment (%memmem base rem "<%#"))
-             (rel-expr    (%memmem base rem "<%="))
-             (rel-code    (%memmem base rem "<%"))
-             (comment-pos (and rel-comment (+ pos rel-comment)))
-             (expr-pos    (and rel-expr    (+ pos rel-expr)))
-             (code-pos    (and rel-code    (+ pos rel-code)))
-             (next-delim nil) (delim-type nil) (delim-len nil))
-        (when comment-pos
-          (setf next-delim comment-pos delim-type :comment delim-len 3))
-        (when (and expr-pos (or (not comment-pos) (< expr-pos comment-pos)))
-          (setf next-delim expr-pos delim-type :expr delim-len 3))
-        (when (and code-pos (or (not comment-pos) (< code-pos comment-pos))
-                            (or (not expr-pos)    (< code-pos expr-pos)))
-          (setf next-delim code-pos delim-type :code delim-len 2))
-        (cond
-          ((not next-delim)
-           (push (list :text nil pos size pos size) tokens)
-           (setf pos size))
-          (t
-           (when (< pos next-delim)
-             (push (list :text nil pos next-delim pos next-delim) tokens))
-           (let* ((content-start (+ next-delim delim-len))
-                  (rel-close (and (<= content-start size)
-                                  (%memmem (cffi:inc-pointer ptr content-start)
-                                           (- size content-start)
-                                           "%>")))
-                  (close-pos (and rel-close (+ content-start rel-close))))
-             (cond
-               (close-pos
-                (let* ((token-end (+ close-pos 2))
-                       (extract (cffi:foreign-string-to-lisp
-                                 (cffi:inc-pointer ptr content-start)
-                                 :count (- close-pos content-start)
-                                 :encoding :utf-8))
-                       (trimmed (string-trim '(#\space #\tab #\newline) extract)))
-                  (push (list delim-type
-                              (if (eq delim-type :comment) nil trimmed)
-                              next-delim token-end content-start close-pos)
-                        tokens)
-                  (setf pos token-end)))
-               (t
-                (let* ((extract (cffi:foreign-string-to-lisp
-                                 (cffi:inc-pointer ptr content-start)
-                                 :count (- size content-start)
-                                 :encoding :utf-8))
-                       (trimmed (string-trim '(#\space #\tab #\newline) extract)))
-                  (push (list delim-type
-                              (if (eq delim-type :comment) nil trimmed)
-                              next-delim size content-start size)
-                        tokens)
-                  (setf pos size)))))))))
-    (nreverse tokens)))
 
