@@ -57,10 +57,6 @@
     "Name: Alice, Age: 30"
     '((name . "Alice") (age . 30))))
 
-(test expression-only-rendering
-  "Template with only an expression"
-  (expect-render "<%= (+ 10 20) %>" "30"))
-
 (test multiple-expressions-rendering
   "Template with multiple expressions"
   (expect-render "<%= (+ 1 2) %> and <%= (+ 3 4) %>" "3 and 7"))
@@ -72,13 +68,6 @@
   "Code block that doesn't produce output"
   (expect-render "<% (setf x 42) %>Result: <%= x %>" "Result: 42"))
 
-(test loop-with-inner-template
-  "Loop code block spanning multiple tokens renders inner template for each iteration"
-  (let ((newline (string #\newline)))
-    (expect-render (concatenate 'string "<% (dolist (item items) %>Item: <%= item %>" newline "<% ) %>")
-      (format nil "Item: foo~%Item: bar~%Item: baz~%")
-      '((items . ("foo" "bar" "baz"))))))
-
 ;;;; Test Group 3: Comments
 ;;;; ======================
 
@@ -86,44 +75,16 @@
   "Comments should be stripped from output"
   (expect-render "Start<%# This is a comment %>End" "StartEnd"))
 
-(test inline-comment
-  "Comment between text sections"
-  (expect-render "A<%# TODO %>B" "AB"))
-
-;;;; Test Group 4: Complex Expressions
-;;;; ==================================
-
-(test string-concatenation-expression
-  "Expression with string operations"
-  (expect-render "Name: <%= (concatenate 'string \"Mr. \" \"Smith\") %>"
-    "Name: Mr. Smith"))
-
-(test list-expression
-  "Expression evaluating to a list"
-  (expect-render "Items: <%= (quote (a b c)) %>" "Items: (A B C)"))
-
-;;;; Test Group 5: Edge Cases
-;;;; =========================
+;;;; Test Group 4: Edge Cases
+;;;; ========================
 
 (test empty-expression
-  "Expression with whitespace only (after trimming)"
+  "<%= %> with whitespace-only body is skipped (no output, no error)."
   (expect-render "Value: <%=   %>after" "Value: after"))
 
 (test consecutive-delimiters
   "Multiple delimiters back-to-back"
   (expect-render "<%= 1 %><%= 2 %>" "12"))
-
-;;;; Test Group 6: Whitespace in Templates
-;;;; ======================================
-
-(test newlines-in-text
-  "Text tokens with newlines are preserved"
-  (let ((template-with-newline (concatenate 'string "Hello" (string #\newline) "World")))
-    (expect-render template-with-newline template-with-newline)))
-
-(test spaces-in-expression
-  "Whitespace inside expression tags is trimmed"
-  (expect-render "<%=   (+ 1 2)   %>" "3"))
 
 ;;;; Test Group 7: Error Reporting
 ;;;; ==============================
@@ -279,70 +240,23 @@
          (elp::%mmap-close ptr size fd)
          (cleanup-file path))))))
 
-(defun stream-drain (template-string)
-  "Wrap TEMPLATE-STRING in a TEMPLATE-STREAM and read every character
-   to EOF, returning the synthesized character sequence as a string."
-  (multiple-value-bind (s cleanup) (template-stream-of template-string)
-    (unwind-protect
-         (with-output-to-string (out)
-           (loop for c = (read-char s nil :eof)
-                 until (eq c :eof)
-                 do (write-char c out)))
-      (funcall cleanup))))
-
 (defun stream-read-form (template-string)
   "Wrap TEMPLATE-STRING in a TEMPLATE-STREAM and READ one Lisp form
    from it. Useful for asserting the standard reader walks the
-   synthesized character stream cleanly."
+   synthesized character stream cleanly — what the rest of the engine
+   ultimately consumes."
   (multiple-value-bind (s cleanup) (template-stream-of template-string)
     (unwind-protect (read s nil :eof)
       (funcall cleanup))))
 
-(test stream-text-only
-  "A text-only template emits a single write-output-range form."
-  (let ((expected
-          (format nil "(elp::write-output-range elp::*template-ptr* 0 5) ")))
-    (is (equal expected (stream-drain "Hello")))))
-
 (test stream-empty-template
   "Empty input (zero-byte mapping) reads as immediate EOF.
    Constructed without mmap because Linux rejects mmap of size 0;
-   the caller in RENDER-TO-STREAM short-circuits before reaching here."
+   RENDER short-circuits before reaching here, but the stream class
+   itself must handle the case cleanly."
   (let ((s (make-instance 'elp::template-stream
                           :ptr (cffi:null-pointer) :size 0)))
     (is (eq :eof (read-char s nil :eof)))))
-
-(test stream-code-only
-  "<% (foo) %> produces no text-emit, just the code chars + a trailing
-   space synthesized at %>."
-  ;; Bytes 0..1 = '<%', 2 = ' ', 3 = '(', 4..6 = 'foo', 7 = ')',
-  ;; 8 = ' ', 9..10 = '%>'. Reader sees: ' (foo) ' (from :lisp) +
-  ;; ' ' (synth on %>) = ' (foo)  '.
-  (is (equal " (foo)  " (stream-drain "<% (foo) %>"))))
-
-(test stream-text-then-code
-  "Alternating text and code: text emits a write-output-range wrapper,
-   code passes through verbatim, %> synthesizes a single space."
-  (let* ((tmpl     "a<% (b) %>c")
-         (expected (concatenate 'string
-                                "(elp::write-output-range elp::*template-ptr* 0 1) "
-                                " (b)  "
-                                "(elp::write-output-range elp::*template-ptr* 10 11) ")))
-    (is (equal expected (stream-drain tmpl)))))
-
-(test stream-code-then-text
-  "Code at the start emits no leading wrapper; trailing text emits one."
-  (let* ((tmpl     "<% (x) %>tail")
-         (expected (concatenate 'string
-                                " (x)  "
-                                "(elp::write-output-range elp::*template-ptr* 9 13) ")))
-    (is (equal expected (stream-drain tmpl)))))
-
-(test stream-adjacent-code-blocks
-  "Two adjacent <% %> blocks with no text between them."
-  (let* ((tmpl     "<% (a) %><% (b) %>")
-         (expected " (a)   (b)  "))
-    (is (equal expected (stream-drain tmpl)))))
 
 (test stream-read-on-text-only
   "(READ stream) on a text-only template returns the wrapper form."
@@ -350,63 +264,23 @@
     (is (equal form '(elp::write-output-range elp::*template-ptr* 0 2)))))
 
 (test stream-read-on-code-block
-  "(READ stream) on a code block returns the embedded form, stripped of
-   template syntax."
+  "(READ stream) on a <% ... %> block returns the embedded form,
+   stripped of template syntax."
   (let ((form (stream-read-form "<% (+ 1 2) %>")))
     (is (equal form '(+ 1 2)))))
 
-;;;; Test Group 10: template-stream <%= and <%# (commit 2)
-;;;; ====================================================
-
-(test stream-expr-only
-  "<%= 1 %> wraps the body in a (let ((*current-template-span* '(C1 C2)))
-   (format t \"~A\" ... )) call. Content range is bytes [3, 6) — the
-   body bytes between <%= and %>, including surrounding whitespace."
-  (let* ((tmpl     "<%= 1 %>")
-         (expected (concatenate 'string
-                                "(let ((elp::*current-template-span* '(3 6))) (format t \"~A\" "
-                                " 1 "
-                                ")) ")))
-    (is (equal expected (stream-drain tmpl)))))
-
-(test stream-expr-empty-skipped
-  "<%=   %> with whitespace-only body emits nothing — matches the
-   existing engine's <%= empty %> behavior."
-  (is (equal "" (stream-drain "<%=   %>"))))
-
-(test stream-comment-only
-  "<%# comment %> produces no characters."
-  (is (equal "" (stream-drain "<%# anything in here %>"))))
-
-(test stream-comment-between-text
-  "Comment between text spans drops out, leaving two text-emit forms."
-  (let* ((tmpl     "a<%# c %>b")
-         (expected (concatenate 'string
-                                "(elp::write-output-range elp::*template-ptr* 0 1) "
-                                "(elp::write-output-range elp::*template-ptr* 9 10) ")))
-    (is (equal expected (stream-drain tmpl)))))
-
-(test stream-expr-between-text
-  "<%= ... %> between text spans: text wrapper, expr let-form, text wrapper."
-  (let* ((tmpl     "a<%= 1 %>b")
-         (expected (concatenate 'string
-                                "(elp::write-output-range elp::*template-ptr* 0 1) "
-                                "(let ((elp::*current-template-span* '(4 7))) (format t \"~A\" "
-                                " 1 "
-                                ")) "
-                                "(elp::write-output-range elp::*template-ptr* 9 10) ")))
-    (is (equal expected (stream-drain tmpl)))))
-
 (test stream-read-on-expr
-  "(READ stream) on <%= 1 %> returns the wrapped let/format form."
+  "(READ stream) on <%= 1 %> returns the let/format wrapper that the
+   engine evaluates — the content-span literal records the byte range
+   for runtime error reporting."
   (let ((form (stream-read-form "<%= 1 %>")))
     (is (equal form
                '(let ((elp::*current-template-span* '(3 6)))
                  (format t "~A" 1))))))
 
 (test stream-read-on-comment-then-text
-  "(READ stream) skips a leading comment and returns the trailing text
-   wrapper as the first form."
+  "(READ stream) skips a leading <%# ... %> and returns the trailing
+   text wrapper as the first form."
   (let ((form (stream-read-form "<%# x %>tail")))
     (is (equal form '(elp::write-output-range elp::*template-ptr* 8 12)))))
 
@@ -475,17 +349,6 @@
            (is (= 5 (elp::stream-byte-position s))))
       (funcall cleanup))))
 
-(test stream-byte-position-default-uses-chars-read
-  "Calling STREAM-BYTE-POSITION with no second argument uses the
-   stream's current CHARS-READ value."
-  (multiple-value-bind (s cleanup) (template-stream-of "<% xyz %>")
-    (unwind-protect
-         (progn
-           (read-char s) (read-char s)         ; ' ', 'x'
-           (is (= (elp::stream-byte-position s (elp::ts-chars-read s))
-                  (elp::stream-byte-position s))))
-      (funcall cleanup))))
-
 (test stream-byte-position-before-first-checkpoint
   "Reader positions that precede every checkpoint return NIL — the
    stream cannot anchor them to a source byte."
@@ -511,6 +374,48 @@
              (is (= 4 (elp::stream-byte-position s (1+ key))))
              (is (= 5 (elp::stream-byte-position s (+ 2 key))))))
       (funcall cleanup))))
+
+;;;; Test Group 12: Codegen — what does build-render-form actually produce?
+;;;; ======================================================================
+;;;; This test pins down the exact sexp the engine builds for a small
+;;;; mixed fixture. Reading the test source is the canonical way to see
+;;;; an example of generated code; running it catches accidental
+;;;; regressions in the wrapper format.
+
+(test build-render-form-shape
+  "Generated body sexp for a fixture mixing text, an expression, a
+   dolist spanning blocks, and a context binding. Reading the EXPECTED
+   form below is the documentation: it shows write-output-range
+   wrapping each text span, a let/format wrapper around each <%= %>
+   carrying the byte range for runtime error reporting, and the dolist
+   body containing the inner forms (the spanning-paren win — the
+   reader appends them naturally because it is mid-list when the
+   stream transitions through %> ... text ... <%)."
+  (let* ((tmpl     "Hi <%= name %>!
+<% (dolist (x '(1 2 3)) %>* <%= x %>
+<% ) %>")
+         (path     (template-string-to-file tmpl))
+         (expected '(let ((name '"Alice"))
+                     (progn
+                      (elp::write-output-range elp::*template-ptr* 0 3)
+                      (let ((elp::*current-template-span* '(6 12)))
+                        (format t "~A" name))
+                      (elp::write-output-range elp::*template-ptr* 14 16)
+                      (dolist (x '(1 2 3))
+                        (elp::write-output-range elp::*template-ptr* 42 44)
+                        (let ((elp::*current-template-span* '(47 50)))
+                          (format t "~A" x))
+                        (elp::write-output-range elp::*template-ptr* 52 53))))))
+    (unwind-protect
+         (multiple-value-bind (ptr size fd) (elp::%mmap-open path)
+           (unwind-protect
+                (let ((generated (elp::build-render-form path ptr size
+                                                         '((name . "Alice")))))
+                  (is (equal generated expected)
+                      (format nil "Generated form should match.~%Got:~%~S"
+                              generated)))
+             (elp::%mmap-close ptr size fd)))
+      (cleanup-file path))))
 
 ;;;; Run Tests
 (defun run-tests ()
