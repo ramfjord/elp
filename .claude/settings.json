@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sbcl --version)",
+      "Bash(sbcl:*)",
+      "Bash(sbcl --load ~/quicklisp/setup.lisp --eval \"\\(ql:quickload :fiveam\\)\" --eval \"\\(quit\\)\")",
+      "Bash(make:*)",
+      "Bash(bin/elp --help)",
+      "Bash(bin/elp -h)",
+      "Bash(bin/elp examples/error-in-loop.md.elp)",
+      "Bash(./bin/elp examples/error-in-loop.md.elp)",
+      "Bash(./bin/elp examples/cli-smoke.elp)",
+      "Bash(grep -v \"^$\")",
+      "Bash(echo \"[exit=$?]\")",
+      "Bash(echo \"---exit=$?\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git restore *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git add *)",
+      "Bash(git show-ref *)",
+      "Bash(git worktree *)",
+      "Bash(git clone *)",
+      "Bash(tmux ls *)",
+      "Bash(tmux kill-session *)",
+      "Bash(tmux new-session *)",
+      "Bash(tmux send-keys *)",
+      "Bash(tmux capture-pane *)",
+      "Bash(netstat -tlnp)",
+      "Bash(curl -sL https://raw.githubusercontent.com/hanshuebner/lisp-mcp/main/README.md)",
+      "Read(//tmp/**)",
+      "mcp__lisp__eval_swank",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:gitlab.com)",
+      "WebFetch(domain:quickref.common-lisp.net)",
+      "WebFetch(domain:quickdocs.org)",
+      "WebFetch(domain:mcpmarket.com)",
+      "Skill(update-config)"
+    ]
+  }
+}
