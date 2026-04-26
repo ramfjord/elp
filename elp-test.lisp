@@ -284,7 +284,50 @@
     (with-ascii-buffer (p len s)
       (is (eql 5 (elp::%memchr p len (char-code #\newline)))))))
 
-;;;; Test Group 9: template-stream gray stream (commit 1: :text and :lisp only)
+;;;; Test Group 8b: Spanning-paren constructs (multi-block forms)
+;;;; ============================================================
+;;;; These constructs work because the standard Lisp reader is in the
+;;;; middle of building a list when the gray stream transitions
+;;;; through %> ... text ... <%. Each one exercises a different
+;;;; control-flow construct that splits its body across two or more
+;;;; <% ... %> blocks with literal text in between.
+
+(test spanning-dolist-literal-list
+  "dolist body iterating over a literal list, emitting each element."
+  (expect-render "<% (dolist (x '(1 2 3)) %><%= x %><% ) %>"
+    nil
+    "123"))
+
+(test spanning-nested-let
+  "Two LET bindings split across four <% %> blocks; the inner
+   expression references both outer variables."
+  (expect-render
+      "<% (let ((y 10)) %><% (let ((z 20)) %><%= (+ y z) %><% ) %><% ) %>"
+    nil
+    "30"))
+
+(test spanning-when
+  "WHEN with a multi-block body emits its inner text only when the
+   test is true."
+  (expect-render "<% (when t %>visible<% ) %>"
+    nil
+    "visible"))
+
+(test spanning-when-false-suppresses
+  "WHEN with a false test suppresses the entire spanned body,
+   including any literal text inside it."
+  (expect-render "before<% (when nil %>hidden<% ) %>after"
+    nil
+    "beforeafter"))
+
+(test spanning-progn-with-text
+  "PROGN body split across blocks: literal text and expression
+   results both emit."
+  (expect-render "<% (progn %>a<%= 1 %>b<% ) %>"
+    nil
+    "a1b"))
+
+
 ;;;; ============================================================================
 
 (defun template-stream-of (template-string)
