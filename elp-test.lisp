@@ -28,19 +28,10 @@
   (when (probe-file filepath)
     (delete-file filepath)))
 
-(defmacro expect-render (template-string expected-token-structure expected-output &optional context)
-  "RSpec-style test wrapper that validates rendering via the public
-   RENDER API.
-
-   The EXPECTED-TOKEN-STRUCTURE argument is preserved as documentation
-   for what the template's intended structure looks like — the
-   reader-driven engine has no separate tokenizer phase to assert
-   against, so the rendered-output check is what proves the engine
-   walked the template correctly.
-
-   Optional CONTEXT is an alist of (symbol . value) pairs bound as
-   variables for template expressions."
-  (declare (ignore expected-token-structure))
+(defmacro expect-render (template-string expected-output &optional context)
+  "RSpec-style test wrapper: render TEMPLATE-STRING (with optional
+   CONTEXT alist of variable bindings) and assert the output equals
+   EXPECTED-OUTPUT."
   `(let ((temp-file (template-string-to-file ,template-string)))
      (unwind-protect
           (let ((output (elp:render temp-file (or ,context '()))))
@@ -53,61 +44,37 @@
 
 (test text-only-rendering
   "Plain text template with no tags"
-  (expect-render "Hello World"
-    '((:text "Hello World"))
-    "Hello World"))
+  (expect-render "Hello World" "Hello World"))
 
 (test simple-expression-rendering
   "Template with single expression evaluating to a value"
-  (expect-render "Hello <%= (list 1 2 3) %>"
-    '((:text "Hello ")
-      (:expr "(list 1 2 3)"))
-    "Hello (1 2 3)"))
+  (expect-render "Hello <%= (list 1 2 3) %>" "Hello (1 2 3)"))
 
 (test variable-binding-and-reference
   "Template with context variables bound and referenced in expressions"
   (expect-render "Name: <%= name %>, Age: <%= age %>"
-    '((:text "Name: ")
-      (:expr "name")
-      (:text ", Age: ")
-      (:expr "age"))
     "Name: Alice, Age: 30"
     '((name . "Alice") (age . 30))))
 
 (test expression-only-rendering
   "Template with only an expression"
-  (expect-render "<%= (+ 10 20) %>"
-    '((:expr "(+ 10 20)"))
-    "30"))
+  (expect-render "<%= (+ 10 20) %>" "30"))
 
 (test multiple-expressions-rendering
   "Template with multiple expressions"
-  (expect-render "<%= (+ 1 2) %> and <%= (+ 3 4) %>"
-    '((:expr "(+ 1 2)")
-      (:text " and ")
-      (:expr "(+ 3 4)"))
-    "3 and 7"))
+  (expect-render "<%= (+ 1 2) %> and <%= (+ 3 4) %>" "3 and 7"))
 
 ;;;; Test Group 2: Code Blocks
 ;;;; ==========================
 
 (test simple-code-block-rendering
   "Code block that doesn't produce output"
-  (expect-render "<% (setf x 42) %>Result: <%= x %>"
-    '((:code "(setf x 42)")
-      (:text "Result: ")
-      (:expr "x"))
-    "Result: 42"))
+  (expect-render "<% (setf x 42) %>Result: <%= x %>" "Result: 42"))
 
 (test loop-with-inner-template
   "Loop code block spanning multiple tokens renders inner template for each iteration"
   (let ((newline (string #\newline)))
     (expect-render (concatenate 'string "<% (dolist (item items) %>Item: <%= item %>" newline "<% ) %>")
-      `((:code "(dolist (item items)")
-        (:text "Item: ")
-        (:expr "item")
-        (:text ,newline)
-        (:code ")"))
       (format nil "Item: foo~%Item: bar~%Item: baz~%")
       '((items . ("foo" "bar" "baz"))))))
 
@@ -116,19 +83,11 @@
 
 (test comment-removal
   "Comments should be stripped from output"
-  (expect-render "Start<%# This is a comment %>End"
-    '((:text "Start")
-      (:comment "This is a comment")
-      (:text "End"))
-    "StartEnd"))
+  (expect-render "Start<%# This is a comment %>End" "StartEnd"))
 
 (test inline-comment
   "Comment between text sections"
-  (expect-render "A<%# TODO %>B"
-    '((:text "A")
-      (:comment "TODO")
-      (:text "B"))
-    "AB"))
+  (expect-render "A<%# TODO %>B" "AB"))
 
 ;;;; Test Group 4: Complex Expressions
 ;;;; ==================================
@@ -136,34 +95,22 @@
 (test string-concatenation-expression
   "Expression with string operations"
   (expect-render "Name: <%= (concatenate 'string \"Mr. \" \"Smith\") %>"
-    '((:text "Name: ")
-      (:expr "(concatenate 'string \"Mr. \" \"Smith\")"))
     "Name: Mr. Smith"))
 
 (test list-expression
   "Expression evaluating to a list"
-  (expect-render "Items: <%= (quote (a b c)) %>"
-    '((:text "Items: ")
-      (:expr "(quote (a b c))"))
-    "Items: (A B C)"))
+  (expect-render "Items: <%= (quote (a b c)) %>" "Items: (A B C)"))
 
 ;;;; Test Group 5: Edge Cases
 ;;;; =========================
 
 (test empty-expression
   "Expression with whitespace only (after trimming)"
-  (expect-render "Value: <%=   %>after"
-    '((:text "Value: ")
-      (:expr "")
-      (:text "after"))
-    "Value: after"))
+  (expect-render "Value: <%=   %>after" "Value: after"))
 
 (test consecutive-delimiters
   "Multiple delimiters back-to-back"
-  (expect-render "<%= 1 %><%= 2 %>"
-    '((:expr "1")
-      (:expr "2"))
-    "12"))
+  (expect-render "<%= 1 %><%= 2 %>" "12"))
 
 ;;;; Test Group 6: Whitespace in Templates
 ;;;; ======================================
@@ -171,15 +118,11 @@
 (test newlines-in-text
   "Text tokens with newlines are preserved"
   (let ((template-with-newline (concatenate 'string "Hello" (string #\newline) "World")))
-    (expect-render template-with-newline
-      `((:text ,template-with-newline))
-      template-with-newline)))
+    (expect-render template-with-newline template-with-newline)))
 
 (test spaces-in-expression
   "Whitespace inside expression tags is trimmed"
-  (expect-render "<%=   (+ 1 2)   %>"
-    '((:expr "(+ 1 2)"))
-    "3"))
+  (expect-render "<%=   (+ 1 2)   %>" "3"))
 
 ;;;; Test Group 7: Error Reporting
 ;;;; ==============================
@@ -294,38 +237,29 @@
 
 (test spanning-dolist-literal-list
   "dolist body iterating over a literal list, emitting each element."
-  (expect-render "<% (dolist (x '(1 2 3)) %><%= x %><% ) %>"
-    nil
-    "123"))
+  (expect-render "<% (dolist (x '(1 2 3)) %><%= x %><% ) %>" "123"))
 
 (test spanning-nested-let
   "Two LET bindings split across four <% %> blocks; the inner
    expression references both outer variables."
   (expect-render
       "<% (let ((y 10)) %><% (let ((z 20)) %><%= (+ y z) %><% ) %><% ) %>"
-    nil
     "30"))
 
 (test spanning-when
   "WHEN with a multi-block body emits its inner text only when the
    test is true."
-  (expect-render "<% (when t %>visible<% ) %>"
-    nil
-    "visible"))
+  (expect-render "<% (when t %>visible<% ) %>" "visible"))
 
 (test spanning-when-false-suppresses
   "WHEN with a false test suppresses the entire spanned body,
    including any literal text inside it."
-  (expect-render "before<% (when nil %>hidden<% ) %>after"
-    nil
-    "beforeafter"))
+  (expect-render "before<% (when nil %>hidden<% ) %>after" "beforeafter"))
 
 (test spanning-progn-with-text
   "PROGN body split across blocks: literal text and expression
    results both emit."
-  (expect-render "<% (progn %>a<%= 1 %>b<% ) %>"
-    nil
-    "a1b"))
+  (expect-render "<% (progn %>a<%= 1 %>b<% ) %>" "a1b"))
 
 
 ;;;; ============================================================================

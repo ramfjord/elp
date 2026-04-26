@@ -155,22 +155,31 @@ Or load directly:
 
 ## Implementation Notes
 
-- The template file is `mmap`'d once. Tokenization scans the mapped bytes
-  directly via libc `memmem`, so the file is never slurped into a Lisp
-  string and the tokenizer cost scales with delimiter count rather than
-  template size.
-- Tokens carry byte offsets into the mapping. Literal text ranges are
-  written by `write-output-range`, which reads straight from the mmap.
-  When the destination is an `sb-sys:fd-stream` (e.g. the CLI's stdout
-  in a saved binary), this is a single `write(2)` syscall on the mapped
+- The template file is `mmap`'d once. The mapping is wrapped in a
+  custom Gray input stream (`template-stream`) that the standard Lisp
+  reader walks directly. Literal text spans are located via libc
+  `memmem`; only the bytes inside `<% ... %>` blocks are handed to the
+  reader as characters, plus a small synthesized prefix/suffix per
+  block. The file is never slurped into a Lisp string.
+- For each text span, the stream synthesizes a single
+  `(elp::write-output-range *template-ptr* START END)` call that, at
+  render time, writes those bytes straight from the mapping. When the
+  destination is an `sb-sys:fd-stream` (e.g. the CLI's stdout in a
+  saved binary), this is a single `write(2)` syscall on the mapped
   pages — zero copy through Lisp.
-- Embedded code (`<% %>`) and expressions (`<%= %>`) are spliced into a
-  single `(progn …)` body, read once via `read-from-string`, and
-  evaluated against the live mmap. Multi-token constructs like loops
-  work naturally because the body is one form, not many.
-- Error byte offsets are translated to (line, column) by counting
-  newlines in the mapping with libc `memchr`, so the prefix scan is
-  vectorized rather than per-byte.
+- The standard reader builds the body sexp directly from the stream;
+  there is no intermediate source-string assembly and no separate
+  tokenizer phase. Multi-block constructs like
+  `<% (dolist ... %> body <% ) %>` work because the reader is in the
+  middle of building a list when the stream transitions through `%>
+  ... text ... <%`, and the synthesized text-emit forms are appended
+  to the in-progress list.
+- A `position-map` on the stream records `(reader-position .
+  mmap-byte)` checkpoints at the start of each code or expression
+  body. Reader errors are translated into `elp-template-error` with
+  `file:line:column` by mapping the reader's stop position to a source
+  byte and counting newlines in the prefix via libc `memchr` — the
+  prefix scan is vectorized rather than per-byte.
 
 ## Known Limitations
 
