@@ -83,26 +83,30 @@ Active
 
 ### Public API
 
+**`(render-to-stream pathname context-alist &optional stream)`**
+
+Streams a rendered template directly to `stream` (defaults to
+`*standard-output*`). This is the engine's primitive — output bytes are
+written as they are produced, with no intermediate Lisp string. When
+`stream` is an `sb-sys:fd-stream` (e.g. the CLI's `*standard-output*`
+in a saved binary), literal text ranges are written via a single
+`write(2)` syscall directly on the mmap'd source — zero copy through
+Lisp.
+
+- `pathname`: A file path (pathname object)
+- `context-alist`: List of `(symbol . value)` pairs
+- `stream`: Destination stream (default: `*standard-output*`)
+- Returns: no useful value; consumers care about side effects on `stream`
+
 **`(render pathname context-alist) → string`**
 
-Renders a template file with the given context variables.
+Thin wrapper around `render-to-stream` for callers that want the output
+as a string. Equivalent to
+`(with-output-to-string (s) (render-to-stream pathname context-alist s))`.
 
 - `pathname`: A file path (pathname object)
 - `context-alist`: List of `(symbol . value)` pairs
 - Returns: Rendered output as a string
-
-### Advanced API
-
-**`(tokenize-file pathname) → token-list`**
-
-For advanced use cases, tokenize a template file and inspect/manipulate tokens directly.
-
-Each token is a list: `(type content start-byte end-byte content-start-byte content-end-byte)`
-
-- `type`: `:text`, `:expr`, `:code`, or `:comment`
-- `content`: The token content as a string
-- `start-byte`, `end-byte`: Byte offsets of the full token (including `<% %>` delimiters) in the file
-- `content-start-byte`, `content-end-byte`: Byte offsets of the token's inner content (between the delimiters); used for error reporting
 
 ### Errors
 
@@ -138,11 +142,22 @@ Or load directly:
 
 ## Implementation Notes
 
-- Templates are parsed into tokens (text, code, expressions, comments)
-- Code generation creates an executable S-expression
-- Variables are bound in a `let` form within the generated code
-- Text sections are output by `write-output-range` which reads directly from the template file
-- Expressions are formatted to strings with `format nil "~A"`
+- The template file is `mmap`'d once. Tokenization scans the mapped bytes
+  directly via libc `memmem`, so the file is never slurped into a Lisp
+  string and the tokenizer cost scales with delimiter count rather than
+  template size.
+- Tokens carry byte offsets into the mapping. Literal text ranges are
+  written by `write-output-range`, which reads straight from the mmap.
+  When the destination is an `sb-sys:fd-stream` (e.g. the CLI's stdout
+  in a saved binary), this is a single `write(2)` syscall on the mapped
+  pages — zero copy through Lisp.
+- Embedded code (`<% %>`) and expressions (`<%= %>`) are spliced into a
+  single `(progn …)` body, read once via `read-from-string`, and
+  evaluated against the live mmap. Multi-token constructs like loops
+  work naturally because the body is one form, not many.
+- Error byte offsets are translated to (line, column) by counting
+  newlines in the mapping with libc `memchr`, so the prefix scan is
+  vectorized rather than per-byte.
 
 ## Known Limitations
 
