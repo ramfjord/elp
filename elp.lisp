@@ -33,7 +33,24 @@
                      (elp-template-error-file c)
                      (elp-template-error-line c)
                      (elp-template-error-column c)
-                     (elp-template-error-original c)))))
+                     (elp-template-error-original c))))
+  (:documentation
+   "Signaled when reading or rendering a template fails. Wraps the host
+    condition (reader error, runtime error inside an embedded form, etc.)
+    with a source location resolved against the originating .elp file.
+
+    Errors raised from the engine itself (tokenizer/renderer) and from
+    Lisp code embedded in <% ... %> blocks are both translated into this
+    condition; the underlying condition is preserved in ORIGINAL."))
+
+(setf (documentation 'elp-template-error-file 'function)
+      "Pathname of the .elp source whose render raised the error.")
+(setf (documentation 'elp-template-error-line 'function)
+      "1-based line number in the .elp source where the error was located.")
+(setf (documentation 'elp-template-error-column 'function)
+      "1-based column number on the error's line in the .elp source.")
+(setf (documentation 'elp-template-error-original 'function)
+      "The underlying host condition that ELP-TEMPLATE-ERROR wraps.")
 
 (defvar *current-template-span* nil
   "When non-nil, a list (file-byte-start file-byte-end) identifying the
