@@ -48,21 +48,26 @@
    stays free of free lexical variables and can be EVAL'd in the null
    lexical environment.")
 
-(defun byte->line+column (pathname byte-offset)
-  "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in PATHNAME.
-   Counts in characters read from the file (good enough for ASCII templates)."
-  (with-open-file (f pathname :direction :input)
-    (let ((line 1)
-          (col 1)
-          (i 0))
-      (loop while (< i byte-offset)
-            for ch = (read-char f nil nil)
-            while ch do
-              (if (char= ch #\newline)
-                  (setf line (1+ line) col 1)
-                  (incf col))
-              (incf i))
-      (values line col))))
+(defun byte->line+column (ptr size byte-offset)
+  "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in the
+   mmap'd region PTR[0,SIZE). Counts newlines in the prefix
+   [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the per-line cost
+   is one foreign call rather than one read-char per byte. ASCII column
+   semantics, same as the previous implementation."
+  (let* ((target (min byte-offset size))
+         (line 1)
+         (line-start 0)
+         (cursor 0))
+    (loop while (< cursor target) do
+      (let ((rel (%memchr (cffi:inc-pointer ptr cursor)
+                          (- target cursor)
+                          (char-code #\newline))))
+        (cond
+          ((null rel) (return))
+          (t (incf line)
+             (setf line-start (+ cursor rel 1))
+             (setf cursor line-start)))))
+    (values line (1+ (- target line-start)))))
 
 ;;;; mmap support
 
@@ -158,7 +163,7 @@
     (unwind-protect
          (let ((tokens (tokenize-mmap ptr size)))
            (multiple-value-bind (sexp checkpoints body-string)
-               (generate-render-code pathname tokens context-alist)
+               (generate-render-code pathname ptr size tokens context-alist)
              (declare (ignore checkpoints body-string))
              (let ((*template-ptr* ptr)
                    (*standard-output* stream))
@@ -169,7 +174,7 @@
                         (when *current-template-span*
                           (let ((byte (first *current-template-span*)))
                             (multiple-value-bind (line col)
-                                (byte->line+column pathname byte)
+                                (byte->line+column ptr size byte)
                               (error 'elp-template-error
                                      :file pathname :line line :column col
                                      :original c)))))))
@@ -205,7 +210,7 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-(defun generate-render-code (pathname tokens &optional context-alist)
+(defun generate-render-code (pathname ptr size tokens &optional context-alist)
   "Generate an executable sexp from PATHNAME and its TOKENS.
 
    Builds the template body as a single string — code token content is spliced
@@ -254,7 +259,8 @@
            (body (handler-case
                      (read-from-string body-string)
                    ((or reader-error end-of-file) (c)
-                     (translate-read-error c pathname body-string checkpoints))))
+                     (translate-read-error c pathname ptr size
+                                           body-string checkpoints))))
            (bindings    (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist))
            (body-with-context (if bindings `(let ,bindings ,body) body)))
       (values body-with-context checkpoints body-string))))
@@ -274,9 +280,10 @@
     (when best
       (+ (cdr best) (- offset (car best))))))
 
-(defun translate-read-error (condition pathname body-string checkpoints)
+(defun translate-read-error (condition pathname ptr size body-string checkpoints)
   "Translate a reader-error raised while reading BODY-STRING into an
-   elp-template-error that points into PATHNAME using CHECKPOINTS."
+   elp-template-error that points into PATHNAME using CHECKPOINTS.
+   PTR/SIZE name the live mmap of PATHNAME used for line/column lookup."
   (let* ((offset (or (ignore-errors
                       (with-input-from-string (s body-string)
                         (handler-case
@@ -286,7 +293,7 @@
          (file-byte (or (body-offset->file-byte offset checkpoints)
                         (cdar (last checkpoints))
                         0)))
-    (multiple-value-bind (line col) (byte->line+column pathname file-byte)
+    (multiple-value-bind (line col) (byte->line+column ptr size file-byte)
       (error 'elp-template-error
              :file pathname :line line :column col
              :original condition))))
