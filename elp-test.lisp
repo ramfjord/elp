@@ -318,6 +318,97 @@
     (with-ascii-buffer (p len s)
       (is (eql 5 (elp::%memchr p len (char-code #\newline)))))))
 
+;;;; Test Group 9: template-stream gray stream (commit 1: :text and :lisp only)
+;;;; ============================================================================
+
+(defun template-stream-of (template-string)
+  "Materialize TEMPLATE-STRING in a temp file, mmap it, wrap it in a
+   TEMPLATE-STREAM. Returns (values stream cleanup-thunk). The cleanup
+   thunk closes the mmap and deletes the temp file."
+  (let* ((path (template-string-to-file template-string)))
+    (multiple-value-bind (ptr size fd) (elp::%mmap-open path)
+      (values
+       (make-instance 'elp::template-stream :ptr ptr :size size)
+       (lambda ()
+         (elp::%mmap-close ptr size fd)
+         (cleanup-file path))))))
+
+(defun stream-drain (template-string)
+  "Wrap TEMPLATE-STRING in a TEMPLATE-STREAM and read every character
+   to EOF, returning the synthesized character sequence as a string."
+  (multiple-value-bind (s cleanup) (template-stream-of template-string)
+    (unwind-protect
+         (with-output-to-string (out)
+           (loop for c = (read-char s nil :eof)
+                 until (eq c :eof)
+                 do (write-char c out)))
+      (funcall cleanup))))
+
+(defun stream-read-form (template-string)
+  "Wrap TEMPLATE-STRING in a TEMPLATE-STREAM and READ one Lisp form
+   from it. Useful for asserting the standard reader walks the
+   synthesized character stream cleanly."
+  (multiple-value-bind (s cleanup) (template-stream-of template-string)
+    (unwind-protect (read s nil :eof)
+      (funcall cleanup))))
+
+(test stream-text-only
+  "A text-only template emits a single write-output-range form."
+  (let ((expected
+          (format nil "(elp::write-output-range elp::*template-ptr* 0 5) ")))
+    (is (equal expected (stream-drain "Hello")))))
+
+(test stream-empty-template
+  "Empty input (zero-byte mapping) reads as immediate EOF.
+   Constructed without mmap because Linux rejects mmap of size 0;
+   the caller in RENDER-TO-STREAM short-circuits before reaching here."
+  (let ((s (make-instance 'elp::template-stream
+                          :ptr (cffi:null-pointer) :size 0)))
+    (is (eq :eof (read-char s nil :eof)))))
+
+(test stream-code-only
+  "<% (foo) %> produces no text-emit, just the code chars + a trailing
+   space synthesized at %>."
+  ;; Bytes 0..1 = '<%', 2 = ' ', 3 = '(', 4..6 = 'foo', 7 = ')',
+  ;; 8 = ' ', 9..10 = '%>'. Reader sees: ' (foo) ' (from :lisp) +
+  ;; ' ' (synth on %>) = ' (foo)  '.
+  (is (equal " (foo)  " (stream-drain "<% (foo) %>"))))
+
+(test stream-text-then-code
+  "Alternating text and code: text emits a write-output-range wrapper,
+   code passes through verbatim, %> synthesizes a single space."
+  (let* ((tmpl     "a<% (b) %>c")
+         (expected (concatenate 'string
+                                "(elp::write-output-range elp::*template-ptr* 0 1) "
+                                " (b)  "
+                                "(elp::write-output-range elp::*template-ptr* 10 11) ")))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-code-then-text
+  "Code at the start emits no leading wrapper; trailing text emits one."
+  (let* ((tmpl     "<% (x) %>tail")
+         (expected (concatenate 'string
+                                " (x)  "
+                                "(elp::write-output-range elp::*template-ptr* 9 13) ")))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-adjacent-code-blocks
+  "Two adjacent <% %> blocks with no text between them."
+  (let* ((tmpl     "<% (a) %><% (b) %>")
+         (expected " (a)   (b)  "))
+    (is (equal expected (stream-drain tmpl)))))
+
+(test stream-read-on-text-only
+  "(READ stream) on a text-only template returns the wrapper form."
+  (let ((form (stream-read-form "Hi")))
+    (is (equal form '(elp::write-output-range elp::*template-ptr* 0 2)))))
+
+(test stream-read-on-code-block
+  "(READ stream) on a code block returns the embedded form, stripped of
+   template syntax."
+  (let ((form (stream-read-form "<% (+ 1 2) %>")))
+    (is (equal form '(+ 1 2)))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

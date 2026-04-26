@@ -296,6 +296,107 @@
              :file pathname :line line :column col
              :original condition))))
 
+;;;; Reader-driven codegen: template-stream gray stream
+;;;;
+;;;; A SB-GRAY input stream wrapped around an mmap'd template region.
+;;;; Synthesizes Lisp source characters on the fly so that the standard
+;;;; reader can walk the template directly and produce the body sexp
+;;;; without an intermediate source-string assembly step.
+;;;;
+;;;; This commit lands the spike: :TEXT and :LISP modes only.
+;;;; <%= (expr) and <%# (comment) blocks are deferred to a follow-up,
+;;;; and the position-map (for error / source-location mapping) is
+;;;; deferred as well. Nothing in the engine consumes this yet — the
+;;;; existing TOKENIZE-MMAP / GENERATE-RENDER-CODE pipeline is still
+;;;; what RENDER-TO-STREAM uses.
+
+(defclass template-stream (sb-gray:fundamental-character-input-stream)
+  ((ptr         :initarg :ptr        :reader ts-ptr)
+   (size        :initarg :size       :reader ts-size)
+   (byte-cursor :initform 0          :accessor ts-byte-cursor)
+   (mode        :initform :text      :accessor ts-mode)
+   (synth       :initform ""         :accessor ts-synth)
+   (synth-pos   :initform 0          :accessor ts-synth-pos)
+   (pushback    :initform nil        :accessor ts-pushback))
+  (:documentation
+   "Gray input stream wrapping an mmap'd ELP template. The standard
+    Lisp reader can READ from it directly; the stream synthesizes
+    WRITE-OUTPUT-RANGE wrapper forms around literal text spans and
+    feeds the bytes inside <% ... %> blocks straight through."))
+
+(defun %byte-at (ptr offset)
+  (cffi:mem-aref (cffi:inc-pointer ptr offset) :unsigned-char 0))
+
+(defun ts-emit-text-form (s start end)
+  "Set the synth buffer to a (write-output-range ...) call covering
+   the byte range [START, END)."
+  (setf (ts-synth s)
+        (format nil "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+                start end))
+  (setf (ts-synth-pos s) 0))
+
+(defmethod sb-gray:stream-read-char ((s template-stream))
+  (let ((pb (ts-pushback s)))
+    (when pb
+      (setf (ts-pushback s) nil)
+      (return-from sb-gray:stream-read-char pb)))
+  (loop
+    ;; Drain pending synthesized characters first.
+    (let ((buf (ts-synth s))
+          (sp  (ts-synth-pos s)))
+      (when (< sp (length buf))
+        (setf (ts-synth-pos s) (1+ sp))
+        (return-from sb-gray:stream-read-char (char buf sp))))
+    ;; No synth chars: advance state machine.
+    (ecase (ts-mode s)
+      (:text
+       (let* ((cur  (ts-byte-cursor s))
+              (size (ts-size s)))
+         (when (>= cur size)
+           (return-from sb-gray:stream-read-char :eof))
+         (let* ((rem       (- size cur))
+                (rel       (%memmem (cffi:inc-pointer (ts-ptr s) cur)
+                                    rem "<%"))
+                (delim-pos (and rel (+ cur rel)))
+                (text-end  (or delim-pos size)))
+           (cond
+             ((> text-end cur)
+              ;; Emit a write-output-range form for [cur, text-end).
+              (ts-emit-text-form s cur text-end)
+              (setf (ts-byte-cursor s) text-end)
+              (when delim-pos
+                (setf (ts-byte-cursor s) (+ delim-pos 2))
+                (setf (ts-mode s) :lisp)))
+             (delim-pos
+              ;; Empty text region right against <%; just transition.
+              (setf (ts-byte-cursor s) (+ delim-pos 2))
+              (setf (ts-mode s) :lisp))
+             (t
+              (return-from sb-gray:stream-read-char :eof))))))
+      (:lisp
+       (let* ((cur  (ts-byte-cursor s))
+              (size (ts-size s)))
+         (cond
+           ((>= cur size)
+            ;; Unterminated <% block. Treat as EOF here; commit-4 will
+            ;; route this through ELP-TEMPLATE-ERROR.
+            (return-from sb-gray:stream-read-char :eof))
+           ((and (<= (+ cur 2) size)
+                 (= (%byte-at (ts-ptr s) cur)       (char-code #\%))
+                 (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\>)))
+            (setf (ts-byte-cursor s) (+ cur 2))
+            (setf (ts-mode s) :text)
+            (setf (ts-synth s) " ")
+            (setf (ts-synth-pos s) 0))
+           (t
+            (let ((b (%byte-at (ts-ptr s) cur)))
+              (setf (ts-byte-cursor s) (1+ cur))
+              (return-from sb-gray:stream-read-char (code-char b))))))))))
+
+(defmethod sb-gray:stream-unread-char ((s template-stream) char)
+  (setf (ts-pushback s) char)
+  nil)
+
 (defun tokenize-mmap (ptr size)
   "Tokenize the byte range PTR[0,SIZE) as an ELP template.
 
