@@ -339,6 +339,27 @@
                           (- size from) "%>")))
         (and rel (+ from rel))))))
 
+(defun ts-close-trim-p (s close)
+  "T when the byte immediately before CLOSE (the offset of `%>`) is
+   `-`, i.e. the close delimiter is `-%>`."
+  (and close
+       (>= close 1)
+       (= (%byte-at (ts-ptr s) (1- close)) (char-code #\-))))
+
+(defun ts-skip-trailing-newline (s)
+  "Advance S's byte cursor past at most one `\\r\\n` or `\\n`. Used
+   after a close-trim `-%>` to drop the trailing line break."
+  (let* ((cur  (ts-byte-cursor s))
+         (size (ts-size s)))
+    (cond
+      ((and (<= (+ cur 2) size)
+            (= (%byte-at (ts-ptr s) cur) (char-code #\return))
+            (= (%byte-at (ts-ptr s) (1+ cur)) (char-code #\newline)))
+       (setf (ts-byte-cursor s) (+ cur 2)))
+      ((and (< cur size)
+            (= (%byte-at (ts-ptr s) cur) (char-code #\newline)))
+       (setf (ts-byte-cursor s) (1+ cur))))))
+
 (defun ts-push-checkpoint (s anchor &optional (key (ts-chars-read s)))
   "Push (KEY . ANCHOR) onto S's POSITION-MAP unless it is already the
    most recent entry. Checkpoints are pushed every time the source of
@@ -413,14 +434,18 @@
                   ((and next-byte (= next-byte (char-code #\=)))
                    (let* ((cstart (1+ after))
                           (close  (ts-find-close-delim s cstart))
-                          (cend   (or close size)))
+                          (trim   (ts-close-trim-p s close))
+                          (cend   (cond ((null close) size)
+                                        (trim (1- close))
+                                        (t close))))
                      (cond
                        ((ts-whitespace-only-p s cstart cend)
                         ;; Empty/whitespace-only expr: skip without
                         ;; emitting anything, matching the existing
                         ;; engine's treatment of <%= %>.
                         (setf (ts-byte-cursor s)
-                              (if close (+ close 2) size)))
+                              (if close (+ close 2) size))
+                        (when trim (ts-skip-trailing-newline s)))
                        (t
                         ;; Checkpoint anchored at the first body byte
                         ;; (CSTART), keyed at the chars-read value
@@ -441,9 +466,11 @@
                   ;; <%# comment block — skip entirely.
                   ((and next-byte (= next-byte (char-code #\#)))
                    (let* ((cstart (1+ after))
-                          (close  (ts-find-close-delim s cstart)))
+                          (close  (ts-find-close-delim s cstart))
+                          (trim   (ts-close-trim-p s close)))
                      (setf (ts-byte-cursor s)
-                           (if close (+ close 2) size))))
+                           (if close (+ close 2) size))
+                     (when trim (ts-skip-trailing-newline s))))
                   ;; Plain <% code block.
                   (t
                    (ts-push-checkpoint s after)
@@ -459,6 +486,18 @@
             ;; END-OF-FILE, which BUILD-RENDER-FORM catches and routes
             ;; through TRANSLATE-READ-ERROR.
             (return-from sb-gray:stream-read-char :eof))
+           ((and (<= (+ cur 3) size)
+                 (= (%byte-at (ts-ptr s) cur)       (char-code #\-))
+                 (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\%))
+                 (= (%byte-at (ts-ptr s) (+ cur 2)) (char-code #\>)))
+            ;; Close-trim `-%>`: drop the `-`, consume `%>`, and skip
+            ;; one trailing newline before re-entering :TEXT.
+            (let ((suffix (if (eq (ts-mode s) :expr-body) ")) " " ")))
+              (setf (ts-byte-cursor s) (+ cur 3))
+              (setf (ts-mode s) :text)
+              (setf (ts-synth s) suffix)
+              (setf (ts-synth-pos s) 0)
+              (ts-skip-trailing-newline s)))
            ((and (<= (+ cur 2) size)
                  (= (%byte-at (ts-ptr s) cur)       (char-code #\%))
                  (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\>)))

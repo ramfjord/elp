@@ -226,6 +226,57 @@
   (expect-render "<% (progn %>a<%= 1 %>b<% ) %>" "a1b"))
 
 
+;;;; Test Group 8c: Close-trim (`-%>`)
+;;;; ==================================
+;;;; `-%>` strips at most one trailing `\r?\n` after the close
+;;;; delimiter. Applies to all three tag flavors: `<%`, `<%=`, `<%#`.
+
+(test close-trim-on-code-block
+  "<% ... -%>\\n drops the trailing newline after the code block."
+  (expect-render
+      (format nil "before~%<% (setf x 1) -%>~%after~%")
+      (format nil "before~%after~%")))
+
+(test close-trim-on-expr
+  "<%= ... -%>\\n drops the trailing newline after the expression."
+  (expect-render
+      (format nil "<%= 42 -%>~%tail")
+      "42tail"))
+
+(test close-trim-on-comment
+  "<%# ... -%>\\n drops the trailing newline after a comment."
+  (expect-render
+      (format nil "head~%<%# silenced -%>~%tail")
+      (format nil "head~%tail")))
+
+(test close-trim-handles-crlf
+  "Trim consumes `\\r\\n` as a single line break, not just `\\n`."
+  (expect-render
+      (format nil "<% (setf x 1) -%>~C~Ctail" #\Return #\Newline)
+      "tail"))
+
+(test close-trim-no-newline-after-is-fine
+  "If no newline follows `-%>`, no bytes are consumed beyond the close."
+  (expect-render "<%= 7 -%>x" "7x"))
+
+(test bare-close-still-keeps-newline
+  "Plain `%>` (no trim) is unchanged: trailing newline survives."
+  (expect-render
+      (format nil "<%= 1 %>~%after")
+      (format nil "1~%after")))
+
+(test bare-close-on-code-still-keeps-newline
+  "Plain `<% %>` regression — trailing newline still emitted."
+  (expect-render
+      (format nil "<% (setf x 1) %>~%after")
+      (format nil "~%after")))
+
+(test close-trim-on-empty-expr
+  "`<%= -%>\\n` (whitespace-only body with trim) skips block AND newline."
+  (expect-render
+      (format nil "head<%=  -%>~%tail")
+      "headtail"))
+
 ;;;; ============================================================================
 
 (defun template-stream-of (template-string)
