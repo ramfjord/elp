@@ -1,5 +1,8 @@
 # Reader-driven codegen (no source-string assembly)
 
+Branch: reader-macro-codegen
+Plan source: ./plans/reader-macro-codegen.md
+
 ## Goal
 
 Replace the current "tokenize → assemble Lisp source as a string →
@@ -337,7 +340,7 @@ flag this in commit 1 and decide based on what the spike learns.
 Ordered. Each leaves the tree green (`make test` passes) and is a
 single reviewable diff.
 
-1. **Spike + harness for the gray-stream class.** Add
+1. ✅ **Spike + harness for the gray-stream class.** Add
    `template-stream` as a `sb-gray:fundamental-character-input-stream`
    subclass with the slots above and a working `stream-read-char`
    for `:text` and `:lisp` modes only (no `:expr-body`, no
@@ -349,7 +352,7 @@ single reviewable diff.
    *Verify:* tests pass; manually `(read stream)` in the REPL on a
    tiny fixture and inspect the resulting form.
 
-2. **Add `:expr-body` and comment handling to `template-stream`.**
+2. ✅ **Add `:expr-body` and comment handling to `template-stream`.**
    Extend the stream class to handle `<%=` (synth prefix/suffix
    around the body) and `<%#` (skip via `%memmem` to next `%>`,
    produce no chars). Extend the unit tests from commit 1 to
@@ -359,7 +362,7 @@ single reviewable diff.
    strings; reading those streams with `read` produces the
    expected sexps.
 
-3. **Add position-map; expose `(stream-byte-position stream)`.**
+3. ✅ **Add position-map; expose `(stream-byte-position stream)`.**
    Track `(reader-position . mmap-byte)` checkpoints on every
    mode transition and at the start of each block. Add a public
    accessor that, given a reader position (e.g. from
@@ -370,7 +373,7 @@ single reviewable diff.
    *Verify:* position-map round-trip tests; existing tokenizer
    tests untouched (engine still uses `tokenize-mmap`).
 
-4. **Switch `render-to-stream` to use the gray stream.** Replace
+4. ✅ **Switch `render-to-stream` to use the gray stream.** Replace
    the `tokenize-mmap` + `generate-render-code` + `read-from-string`
    pipeline with `build-render-form` (the read-loop sketch above).
    `translate-read-error` collapses to a stream-position lookup.
@@ -385,7 +388,7 @@ single reviewable diff.
    `mmap-tokenize.md`); rendered output of every existing fixture
    is byte-identical to the pre-commit build (`git stash` + diff).
 
-5. **Spanning-paren regression test.** Add explicit fixtures for
+5. ✅ **Spanning-paren regression test.** Add explicit fixtures for
    `<% (dolist (x '(1 2 3)) %><%= x %><% ) %>` and a couple of
    variants (nested `let`, `when`, splitting an `if` across blocks).
    Today's implementation handles these "by accident" via string
@@ -395,32 +398,77 @@ single reviewable diff.
    `:lisp` → `:text` transition handling locally and confirm the
    tests fail.
 
-6. **Heap-allocation re-baseline.** The
-   `mmap-tokenize.md` regression test asserts heap delta scales
-   with `token-count + sum-of-code-content`, not file size. This
-   plan removes the per-token boilerplate string from heap
-   allocation entirely (the synthesized chars are small fixed
-   buffers reused across blocks rather than appended to a growing
-   string). Re-run the test, confirm the constant factor *drops*
-   (or at least doesn't rise), and tighten the assertion if the
-   improvement is meaningful. Update the test's comment to
-   reference the new implementation.
-   *Verify:* heap-allocation test passes with tightened bound;
-   `(elp::bench-render path)` from `mmap-tokenize.md` commit 7
-   shows no regression on a 50MB fixture.
+6. ⏭ **Heap-allocation re-baseline. (Deferred — never landed)**
+   The `mmap-tokenize.md` regression test this commit was supposed
+   to re-baseline was itself never landed (its plan's commit 8
+   didn't ship), so there is no test to re-baseline here. Adding a
+   fresh `< 2× bytes-consed` assertion is also a known-flaky shape
+   (sensitive to GC state, compile caching, fasl loading). The
+   render-output assertions across the suite already catch real
+   regressions. If a heap budget becomes worth defending later,
+   draft it as its own focused plan.
 
-7. **Per-form source-location hook.** Wire the gray stream's
-   position API into the read loop so each top-level form gets a
-   `.elp` byte offset attached (via plist on the form, or via
-   SBCL's `sb-c::source-location` machinery — pick whichever the
-   spike at commit 1 found tractable). Doesn't change `eval`
-   behavior on the file path; sets up the seam swank Layer 2 will
-   consume.
-   *Verify:* a unit test that reads a fixture through
-   `build-render-form-with-locations` and asserts each top-level
-   form's recorded byte offset matches a hand-computed expected
-   value. Deliberate scope: don't touch the swank/compile-file
-   integration here; that's the swank plan's job once redrafted.
+7. ⏭ **Per-form source-location hook. (Deferred — YAGNI)**
+   The stated motivation is "sets up the seam swank Layer 2 will
+   consume," but swank Layer 2 is in *Future plans* — undrafted,
+   unstarted. The load-bearing API (`stream-byte-position`,
+   `ts-chars-read`) is already public from commit 3; a future
+   consumer can write the read loop they need in three lines.
+   Building a public wrapper before the consumer exists locks in
+   shape decisions blind. Defer until the swank Layer 2 redraft
+   actually pulls on it.
+
+8. ✅ **Drop dead token-structure assertions; refresh README.**
+   Post-commit-4 cleanup: `expect-render` had been left with a
+   declared-ignored `expected-token-structure` parameter at every
+   call site (artifact of the old tokenizer-style assertion). Drop
+   the parameter, simplify all 15 engine-test bodies. Rewrite the
+   README's *Implementation Notes* section, which still described
+   the deleted `tokenize-mmap` pipeline, to describe the gray-stream
+   approach.
+   *Verify:* full suite green; README reads as documentation of the
+   current code, not the deleted code.
+
+9. ✅ **Collapse `render-to-stream` into `render`.** Drop the
+   string-returning `render` wrapper; rename `render-to-stream` to
+   `render` with the same signature
+   `(render pathname context-alist &optional stream)`. One public
+   entry point instead of two; callers that want a string wrap in
+   `with-output-to-string`. CLI updated to call `render` directly;
+   test helper `expect-render` wraps in `with-output-to-string` for
+   its string-equality assertion.
+   *Verify:* full suite green; `make bin/elp` produces a binary
+   that renders templates to stdout.
+
+   Note: this deliberately violates the original Non-goal of "no
+   public API surface change." Justified because the user is the
+   only consumer right now and the cost of carrying two near-
+   identical entry points outweighed the cost of a one-time rename.
+   See updated Non-goals below.
+
+10. ✅ **Trim redundant tests; add codegen-shape inspection.**
+    Drop 18 tests that didn't pull weight: engine duplicates
+    (`expression-only-rendering`, `newlines-in-text`,
+    `inline-comment`, `string-concatenation-expression`,
+    `list-expression`, `spaces-in-expression`,
+    `loop-with-inner-template`); 10 stream-drain tests that
+    overspec the internal synth-string format
+    (design-time scaffolding for C1/C2, redundant once the engine
+    is wired up end-to-end); one trivial defaulting test
+    (`stream-byte-position-default-uses-chars-read`). Keep the
+    `(read stream)` family — those test the user-facing contract
+    "reader produces this sexp" — and the position-map /
+    stream-byte-position tests on the public stream API.
+
+    Add `build-render-form-shape`: pins down the exact body sexp
+    generated for a small mixed fixture (text + `<%= %>` +
+    spanning `dolist` + context binding). Reading the test source
+    is the canonical way to see an example of generated code;
+    running it catches accidental regressions in the wrapper
+    format. Replaces the `--dump-form` CLI flag idea from the
+    original Future plans — the inspection happens in the test
+    suite where it has fixture context.
+    *Verify:* full suite green at 53 checks (down from 70).
 
 ## Future plans
 
@@ -438,16 +486,13 @@ When this plan ships, draft these (each its own branch):
   Layer 3 (nvim filetype) are unaffected and can land in either
   order.
 
-- **Pretty-print the generated form for debugging.** With
-  `render-form` in place (from stream-input commit 3) and the
-  generated form now structurally clean (no leftover whitespace
-  from string assembly), a `--dump-form` CLI flag would be a
-  cheap diagnostic.
+- *(superseded)* `--dump-form` CLI flag for codegen inspection.
+  Replaced by the `build-render-form-shape` test in commit 10 —
+  reading the test source shows an example of generated code, and
+  it doubles as a regression net.
 
 ## Non-goals
 
-- Changing the public API surface (`render`, `render-to-stream`,
-  `elp-template-error`). All the work here is internal.
 - Adding new template syntax. Same `<%`, `<%=`, `<%#`, `%>` set.
 - UTF-8 correctness fixes. Same caveat as today; same tracking in
   `stream-input.md`'s future-plans section.
@@ -456,3 +501,11 @@ When this plan ships, draft these (each its own branch):
 - Replacing `eval` with `compile`. Worthwhile (caches the compiled
   function per template) but orthogonal to this plan and overlaps
   with swank Layer 1; defer.
+
+### Scope changes during execution
+
+- *Originally non-goal, taken on in commit 9:* changing the public
+  API surface. `render-to-stream` was renamed to `render`, and the
+  string-returning `render` wrapper was deleted. Justified because
+  the user is the only current consumer; carrying two near-identical
+  entry points cost more than a one-time rename.
