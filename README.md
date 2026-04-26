@@ -8,6 +8,19 @@ A template system for Common Lisp that allows embedding Lisp code and expression
 - `<% lisp-code %>` — Executes Lisp code without producing output
 - `<%# comment %>` — Comments (removed from output)
 
+Tag contents are spliced raw into a single `(progn …)` body. Block forms
+that span multiple tags must therefore include the opening paren in the
+first tag and the closing paren in the last:
+
+```erb
+<% (when (> age 30) %>...<% ) %>
+<% (dolist (path config-files) %>...<% ) %>
+```
+
+A `<%= … %>` tag emits `(format t "~A" <contents>)`, so the contents
+must be a single Lisp form. `<%= (+ 1 2) %>` works; `<%= + 1 2 %>`
+silently formats only `+` and discards `1 2`.
+
 ## Usage
 
 ### Basic Example - Render from File
@@ -30,7 +43,7 @@ Hello <%= name %>, you are <%= age %> years old.
 
 `template.elp`:
 ```erb
-Name: <%= name %><% when (> age 30) %> (senior)<% ) %>
+Name: <%= name %><% (when (> age 30) %> (senior)<% ) %>
 ```
 
 ```lisp
@@ -47,7 +60,7 @@ Since the template has access to full Common Lisp, you can use any Lisp function
 ```erb
 [Unit]
 Description=<%= desc %> (<%= name %>)
-<% dolist (path config-files) %>
+<% (dolist (path config-files) %>
 PathChanged=<%= path %>
 <% ) %>
 ```
@@ -74,7 +87,7 @@ Inside templates, reference them directly:
 ```erb
 Name: <%= service-name %>
 Port: <%= port %>
-<% when enabled %>
+<% (when enabled %>
 Active
 <% ) %>
 ```
@@ -165,8 +178,6 @@ See [TODOs.md](TODOs.md).
 
 ## Future Enhancements
 
-- Error handling with line numbers for template syntax errors
 - Caching of parsed templates and generated code
 - Whitespace trimming modes (`%-`, `-%`)
 - Custom delimiter sets
-- Multi-token code block support (loops/lets spanning delimiters)
