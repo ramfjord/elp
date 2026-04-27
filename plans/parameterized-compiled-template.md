@@ -139,7 +139,7 @@ of `template-code` doesn't otherwise change.
 
 ## Commits
 
-1. **Refactor `build-render-form` to separate body construction
+1. ✅ **Refactor `build-render-form` to separate body construction
    from context wrapping.** Extract `build-template-body` returning
    the inner `(progn ,@forms)` only; existing `build-render-form`
    keeps the LET-of-literals wrapping for now. Pure refactor — no

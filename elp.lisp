@@ -257,11 +257,10 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-(defun build-render-form (pathname ptr size &optional context-alist)
+(defun build-template-body (pathname ptr size)
   "Read the template at PTR[0,SIZE) through a TEMPLATE-STREAM and
-   return the executable body sexp. CONTEXT-ALIST is a list of
-   (symbol . value) pairs wrapped in a LET around the body so that
-   template expressions can reference the bound variables.
+   return the inner body sexp `(progn ,@forms)` — without any
+   context-binding wrapper.
 
    Reader errors are translated into ELP-TEMPLATE-ERROR via the
    stream's POSITION-MAP — no intermediate body-string assembly,
@@ -274,9 +273,16 @@
               do (push form forms))
       ((or reader-error end-of-file) (c)
         (translate-read-error c pathname ptr size stream)))
-    (let* ((body     `(progn ,@(nreverse forms)))
-           (bindings (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist)))
-      (if bindings `(let ,bindings ,body) body))))
+    `(progn ,@(nreverse forms))))
+
+(defun build-render-form (pathname ptr size &optional context-alist)
+  "Return the executable body sexp for the template at PTR[0,SIZE).
+   CONTEXT-ALIST is a list of (symbol . value) pairs wrapped in a LET
+   around the body, with values quoted as literals, so that template
+   expressions can reference the bound variables."
+  (let* ((body     (build-template-body pathname ptr size))
+         (bindings (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist)))
+    (if bindings `(let ,bindings ,body) body)))
 
 (defun translate-read-error (condition pathname ptr size stream)
   "Translate a reader-error raised while reading STREAM into an
