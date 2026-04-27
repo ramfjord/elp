@@ -275,6 +275,36 @@
         (translate-read-error c pathname ptr size stream)))
     `(progn ,@(nreverse forms))))
 
+(defun template-free-vars (form)
+  "Return the list of symbols referenced free (in :EVAL context) inside
+   FORM, excluding keywords, NIL/T, lexically bound variables, and
+   symbols in the :ELP or :COMMON-LISP packages (codegen artifacts and
+   builtins). The result identifies template-author variables that
+   should be bound from a runtime context-alist.
+
+   Order is unspecified beyond `pushnew` deduplication."
+  (let ((free    '())
+        (elp-pkg (find-package :elp))
+        (cl-pkg  (find-package :common-lisp))
+        (kw-pkg  (find-package :keyword)))
+    (sb-walker:walk-form
+     form
+     nil
+     (lambda (subform context env)
+       (when (and (eq context :eval)
+                  (symbolp subform)
+                  subform                     ; not NIL
+                  (not (eq subform t))
+                  (let ((p (symbol-package subform)))
+                    (and p
+                         (not (eq p elp-pkg))
+                         (not (eq p cl-pkg))
+                         (not (eq p kw-pkg))))
+                  (not (sb-walker:var-lexical-p subform env)))
+         (pushnew subform free))
+       subform))
+    free))
+
 (defun build-render-form (pathname ptr size &optional context-alist)
   "Return the executable body sexp for the template at PTR[0,SIZE).
    CONTEXT-ALIST is a list of (symbol . value) pairs wrapped in a LET

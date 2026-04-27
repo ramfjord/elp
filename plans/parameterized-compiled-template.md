@@ -148,7 +148,7 @@ of `template-code` doesn't otherwise change.
    `template-code` output for a fixture template is byte-identical
    before and after.
 
-2. **Add a free-variable collector for template body sexps.** New
+2. ✅ **Add a free-variable collector for template body sexps.** New
    internal helper `template-free-vars` (or similar) that walks a
    body form and returns the set of symbols referenced free,
    ignoring `let`/`let*`/`lambda`/`flet`/`labels`/`symbol-macrolet`
@@ -159,6 +159,16 @@ of `template-code` doesn't otherwise change.
    *Verify:* unit tests on hand-built sexps covering plain
    references, shadowing inside `let`, lambda parameters, and
    nested binding constructs.
+   **Decisions:**
+   - `sb-walker:walk-form` worked first try; no hand-rolled fallback
+     needed.
+   - Filter scope: `:eval` context only, plus exclude symbols whose
+     package is `:elp` (codegen artifacts: `*template-ptr*`,
+     `*current-template-span*`, `write-output-range`), `:common-lisp`
+     (builtins), or `:keyword`. Function-position symbols are
+     naturally excluded since the walker labels them `:function`,
+     not `:eval` — matches today's semantics where templates pass
+     data in value position, not function position.
 
 3. **Add `compiled-template` funcallable-instance class.** Class
    definition with `source-pathname` and `compiled-at` slots;

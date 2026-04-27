@@ -518,6 +518,89 @@
              (elp::%mmap-close ptr size fd)))
       (cleanup-file path))))
 
+;;;; Test Group 13: Free-variable walker
+;;;; ====================================
+;;;; TEMPLATE-FREE-VARS underpins commit-once / call-many: it identifies
+;;;; which template-author symbols need to resolve against the runtime
+;;;; context-alist instead of being baked in at compile time. The tests
+;;;; pin down the boundary: lexical bindings hide outer references,
+;;;; codegen-internal symbols (in :ELP) and CL builtins are excluded,
+;;;; and bindings introduced by macros (DOLIST) are tracked through
+;;;; macroexpansion.
+
+(defun fv-set (form)
+  "Return TEMPLATE-FREE-VARS of FORM as a sorted list of symbol names,
+   for stable comparison in tests."
+  (sort (mapcar #'symbol-name (elp::template-free-vars form)) #'string<))
+
+(test free-vars-plain-references
+  "Bare references collect both symbols."
+  (is (equal '("X" "Y") (fv-set '(+ x y)))))
+
+(test free-vars-let-shadowing
+  "LET bindings hide the outer reference; outer Y stays free."
+  (is (equal '("Y") (fv-set '(let ((x 1)) (+ x y))))))
+
+(test free-vars-let-star-sequential
+  "LET* shadows progressively; only truly free vars escape."
+  (is (equal '("Z") (fv-set '(let* ((x 1) (y x)) (+ x y z))))))
+
+(test free-vars-lambda-params
+  "Lambda parameters hide references inside the body."
+  (is (equal '("C") (fv-set '(lambda (a b) (+ a b c))))))
+
+(test free-vars-flet
+  "FLET-bound function names don't leak as free vars; references inside
+   the local function body still do."
+  (is (equal '("Y") (fv-set '(flet ((f (x) (+ x y))) (f 1))))))
+
+(test free-vars-labels
+  "LABELS-bound names are likewise hidden."
+  (is (equal '("Z") (fv-set '(labels ((g (x) (+ x z))) (g 1))))))
+
+(test free-vars-symbol-macrolet
+  "SYMBOL-MACROLET expands its bound names to their expansion; the
+   expansion's free vars become the visible free set."
+  (is (equal '("CTX") (fv-set '(symbol-macrolet ((name (cdr (assoc 'k ctx))))
+                                  name)))))
+
+(test free-vars-nested-binding
+  "Binding constructs nest correctly: inner shadow doesn't leak past
+   its scope; sibling references stay free."
+  (is (equal '("OUTER")
+             (fv-set '(progn
+                        (let ((x 1)) x)
+                        (let ((y 2)) (+ y outer)))))))
+
+(test free-vars-excludes-elp-codegen-symbols
+  "ELP-package symbols injected by codegen (write-output-range,
+   *template-ptr*, *current-template-span*) are not template-author
+   vars and must not appear."
+  (is (equal '("NAME")
+             (fv-set '(progn
+                        (elp::write-output-range elp::*template-ptr* 0 3)
+                        (let ((elp::*current-template-span* '(6 12)))
+                          (format t "~A" name)))))))
+
+(test free-vars-excludes-cl-and-keywords
+  "T, NIL, keywords, and CL builtins are filtered out."
+  (is (equal '("X")
+             (fv-set '(when x (format t "~A" :hello))))))
+
+(test free-vars-dolist-binds-loop-var
+  "DOLIST is a macro; its loop variable must be tracked as bound after
+   macroexpansion. ITEMS is free; X is not."
+  (is (equal '("ITEMS")
+             (fv-set '(dolist (x items) (format t "~A" x))))))
+
+(test free-vars-multiple-value-bind
+  "MULTIPLE-VALUE-BIND introduces lexical names; symbols in :EVAL
+   position inside its value-form contribute free references, while
+   the bound names A and B do not leak."
+  (is (equal '("SOURCE")
+             (fv-set '(multiple-value-bind (a b) (values source 0)
+                        (+ a b))))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"
