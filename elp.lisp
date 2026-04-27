@@ -10,6 +10,10 @@
   (:export
    ;; Primary public API
    :render
+   :compile-template
+   :compiled-template
+   :compiled-template-source-pathname
+   :compiled-template-compiled-at
    :template-code
    ;; Error condition
    :elp-template-error
@@ -222,48 +226,35 @@
    string."))
 
 (defun template-code (pathname &optional context-alist)
-  "Return a self-contained sexp that, when EVALuated, renders the template
-   at PATHNAME to *STANDARD-OUTPUT*. The form embeds the runtime helpers
-   as LABELS, opens its own mmap, runs the body under an error handler
-   that translates host conditions into ELP-TEMPLATE-ERROR, and unmaps on
-   the way out — eval-able anywhere ELP is loaded, without depending on
-   any internal (non-exported) ELP symbol."
+  "Return a self-contained sexp that, when EVALuated, produces a
+   parameterized renderer for the template at PATHNAME.
+
+   The form is the same `(lambda (ctx &optional stream) …)` that
+   `compile-template` compiles: helpers spliced in as LABELS, the
+   mmap opened and closed per call, an error handler translating
+   host conditions into ELP-TEMPLATE-ERROR, and a top-level LET
+   that binds each free template variable to `(cdr (assoc 'sym
+   ctx))`. Eval-able anywhere ELP is loaded, without depending on
+   any non-exported ELP symbol.
+
+   CONTEXT-ALIST is preserved as a parameter for backward
+   compatibility but is no longer baked into the form — context
+   values resolve at funcall time. Pass `nil` (or omit it) to get
+   the canonical parameterized shape."
+  (declare (ignore context-alist))
   (let ((file-size (with-open-file (f pathname) (file-length f))))
     (when (zerop file-size)
-      (return-from template-code '(values))))
+      (return-from template-code
+        '(lambda (ctx &optional (stream *standard-output*))
+          (declare (ignore ctx stream))
+          (values)))))
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
-    (unwind-protect
-         (wrap-render-form pathname
-                           (build-render-form pathname ptr size context-alist))
-      (%mmap-close ptr size fd))))
-
-(defun wrap-render-form (pathname body)
-  "Wrap BODY (the body sexp produced by BUILD-RENDER-FORM) with a LABELS
-   block defining the runtime helpers and the MMAP-OPEN/CLOSE plumbing,
-   producing a self-contained, EVAL-able form."
-  (let ((helpers (mapcar (lambda (entry)
-                           (destructuring-bind (name lambda-list &rest body) entry
-                             `(,name ,lambda-list ,@body)))
-                         *helper-sources*)))
-    `(labels ,helpers
-       (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-         (let ((*template-ptr* ptr))
-           (unwind-protect
-                (handler-bind
-                    ((elp-template-error (lambda (c) (error c)))
-                     (error
-                       (lambda (c)
-                         (when *current-template-span*
-                           (let ((byte (first *current-template-span*)))
-                             (multiple-value-bind (line col)
-                                 (byte->line+column ptr size byte)
-                               (error 'elp-template-error
-                                      :file ,pathname
-                                      :line line :column col
-                                      :original c)))))))
-                  ,body)
-             (%mmap-close ptr size fd))))
-       (values))))
+    (let ((body (unwind-protect
+                     (build-template-body pathname ptr size)
+                  (%mmap-close ptr size fd))))
+      (build-compile-template-form pathname
+                                   (template-free-vars body)
+                                   body))))
 
 (defmethod render ((tmpl compiled-template) context-alist
                    &optional (stream *standard-output*))
@@ -420,15 +411,6 @@
          (pushnew subform free))
        subform))
     free))
-
-(defun build-render-form (pathname ptr size &optional context-alist)
-  "Return the executable body sexp for the template at PTR[0,SIZE).
-   CONTEXT-ALIST is a list of (symbol . value) pairs wrapped in a LET
-   around the body, with values quoted as literals, so that template
-   expressions can reference the bound variables."
-  (let* ((body     (build-template-body pathname ptr size))
-         (bindings (mapcar (lambda (b) `(,(car b) ',(cdr b))) context-alist)))
-    (if bindings `(let ,bindings ,body) body)))
 
 (defun translate-read-error (condition pathname ptr size stream)
   "Translate a reader-error raised while reading STREAM into an

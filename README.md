@@ -109,6 +109,34 @@ PathChanged=<%= path %>
                      "/etc/myapp/secrets.env"))))
 ```
 
+### Compile Once, Render Many
+
+For repeated renders of the same template (e.g. an HTTP handler that
+fills the same page on every request), compile once and reuse the
+returned `compiled-template`:
+
+```lisp
+(use-package :elp)
+
+(defparameter *page* (compile-template #p"page.elp"))
+
+(funcall *page* '((name . "Alice"))
+                 *standard-output*)
+;; or equivalently:
+(render *page* '((name . "Alice")))
+(render *page* '((name . "Bob")))
+```
+
+`compile-template` parses the template once and returns a
+funcallable instance carrying the compiled render code plus source
+metadata. Subsequent calls skip the read and codegen pass — only
+the body runs. The same instance is safe to reuse with different
+context-alists.
+
+`render` accepts either a pathname (compiles on every call) or a
+`compiled-template` (renders against the precompiled code). See
+issue #8 for the design rationale.
+
 ## Context Variables
 
 Variables are passed as an association list (alist) where keys become symbols available in the template:
@@ -132,7 +160,7 @@ Active
 
 ### Public API
 
-**`(render pathname context-alist &optional stream)`**
+**`(render input context-alist &optional stream)`**
 
 Renders a template, streaming output bytes directly to `stream`
 (defaults to `*standard-output*`). Output is produced as bytes are
@@ -141,7 +169,8 @@ generated, with no intermediate Lisp string. When `stream` is an
 binary), literal text ranges are written via a single `write(2)`
 syscall directly on the mmap'd source — zero copy through Lisp.
 
-- `pathname`: A file path (pathname object)
+- `input`: A pathname (compiled and rendered in one step) or a
+  `compiled-template` from `compile-template`
 - `context-alist`: List of `(symbol . value)` pairs
 - `stream`: Destination stream (default: `*standard-output*`)
 - Returns: no useful value; consumers care about side effects on `stream`
@@ -153,6 +182,24 @@ For callers that want the output as a string, wrap in
 (with-output-to-string (s)
   (render #p"template.elp" '((name . "Alice")) s))
 ```
+
+**`(compile-template pathname)` → `compiled-template`**
+
+Compiles the template at `pathname` once and returns a funcallable
+instance carrying the compiled render function plus source metadata.
+The instance is `funcall`-able as `(funcall tmpl ctx)` or `(funcall
+tmpl ctx stream)`, and `render` accepts it as `input`. Reusing the
+same instance across calls with different context-alists is the
+intended path for hot rendering loops.
+
+Template variables not present in the context-alist bind to `NIL`
+silently — the runtime lookup is `(cdr (assoc 'sym ctx))`. If you
+need stricter behavior, validate the context-alist in your caller.
+
+**`(compiled-template-source-pathname tmpl)` / `(compiled-template-compiled-at tmpl)`**
+
+Readers on a `compiled-template` for the originating pathname (or
+`NIL`) and the `get-universal-time` value at compile time.
 
 ### Errors
 

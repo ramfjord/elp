@@ -468,44 +468,42 @@
              (is (= 5 (elp::stream-byte-position s (+ 2 key))))))
       (funcall cleanup))))
 
-;;;; Test Group 12: Codegen — what does build-render-form actually produce?
-;;;; ======================================================================
-;;;; This test pins down the exact sexp the engine builds for a small
-;;;; mixed fixture. Reading the test source is the canonical way to see
-;;;; an example of generated code; running it catches accidental
-;;;; regressions in the wrapper format.
+;;;; Test Group 12: Codegen — what does build-template-body produce?
+;;;; ================================================================
+;;;; Reading the EXPECTED form below is the canonical example of the
+;;;; codegen output: write-output-range wrapping each literal text
+;;;; span, a let/format wrapper around each <%= %> carrying the byte
+;;;; range for runtime error reporting, and the dolist body containing
+;;;; the inner forms (the spanning-paren win — the reader appends
+;;;; them naturally because it is mid-list when the stream transitions
+;;;; through %> ... text ... <%). compile-template wraps this body in
+;;;; a (let ((free-var (cdr (assoc 'free-var ctx))) ...) ...) over the
+;;;; runtime context-alist; this test pins the body shape only.
 
-(test build-render-form-shape
-  "Generated body sexp for a fixture mixing text, an expression, a
-   dolist spanning blocks, and a context binding. Reading the EXPECTED
-   form below is the documentation: it shows write-output-range
-   wrapping each text span, a let/format wrapper around each <%= %>
-   carrying the byte range for runtime error reporting, and the dolist
-   body containing the inner forms (the spanning-paren win — the
-   reader appends them naturally because it is mid-list when the
-   stream transitions through %> ... text ... <%)."
-  (let* ((tmpl     "Hi <%= name %>!
+(test build-template-body-shape
+  "Body sexp for a fixture mixing text, an expression, and a dolist
+   spanning blocks. The free symbols (NAME, X) appear bare here;
+   compile-template parameterizes them at the lambda layer."
+  (let* ((tmpl "Hi <%= name %>!
 <% (dolist (x '(1 2 3)) %>* <%= x %>
 <% ) %>")
-         (path     (template-string-to-file tmpl))
-         (expected '(let ((name '"Alice"))
-                     (progn
-                      (elp::write-output-range elp::*template-ptr* 0 3)
-                      (let ((elp::*current-template-span* '(6 12)))
-                        (format t "~A" name))
-                      (elp::write-output-range elp::*template-ptr* 14 16)
-                      (dolist (x '(1 2 3))
-                        (elp::write-output-range elp::*template-ptr* 42 44)
-                        (let ((elp::*current-template-span* '(47 50)))
-                          (format t "~A" x))
-                        (elp::write-output-range elp::*template-ptr* 52 53))))))
+         (path (template-string-to-file tmpl))
+         (expected '(progn
+                     (elp::write-output-range elp::*template-ptr* 0 3)
+                     (let ((elp::*current-template-span* '(6 12)))
+                       (format t "~A" name))
+                     (elp::write-output-range elp::*template-ptr* 14 16)
+                     (dolist (x '(1 2 3))
+                       (elp::write-output-range elp::*template-ptr* 42 44)
+                       (let ((elp::*current-template-span* '(47 50)))
+                         (format t "~A" x))
+                       (elp::write-output-range elp::*template-ptr* 52 53)))))
     (unwind-protect
          (multiple-value-bind (ptr size fd) (elp::%mmap-open path)
            (unwind-protect
-                (let ((generated (elp::build-render-form path ptr size
-                                                         '((name . "Alice")))))
+                (let ((generated (elp::build-template-body path ptr size)))
                   (is (equal generated expected)
-                      (format nil "Generated form should match.~%Got:~%~S"
+                      (format nil "Generated body should match.~%Got:~%~S"
                               generated)))
              (elp::%mmap-close ptr size fd)))
       (cleanup-file path))))
@@ -710,6 +708,27 @@
   "An empty template compiles to a no-op renderer."
   (with-compiled-template (tmpl "")
     (is (equal "" (render-to-string tmpl nil)))))
+
+;;;; Test Group 16: Exported public surface
+;;;; ======================================
+;;;; These tests reference the API through the `elp:` qualifier only,
+;;;; verifying that `compile-template`, `compiled-template`, and the
+;;;; metadata readers are usable from a fresh REPL with `(use-package
+;;;; :elp)` (or via package qualification) — no internal-symbol leak
+;;;; required.
+
+(test public-compile-template-via-exported-symbols
+  "Render via the exported compile-template / render path."
+  (let ((path (template-string-to-file "Hi <%= name %>!")))
+    (unwind-protect
+         (let ((tmpl (elp:compile-template path)))
+           (is (typep tmpl 'elp:compiled-template))
+           (is (equal "Hi Alice!"
+                      (with-output-to-string (s)
+                        (elp:render tmpl '((name . "Alice")) s))))
+           (is (equal path (elp:compiled-template-source-pathname tmpl)))
+           (is (numberp (elp:compiled-template-compiled-at tmpl))))
+      (cleanup-file path))))
 
 ;;;; Run Tests
 (defun run-tests ()

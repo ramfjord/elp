@@ -243,7 +243,7 @@ of `template-code` doesn't otherwise change.
    - Stricter modes can be added later as opt-in (e.g. a keyword
      to `compile-template`) without re-doing the structural work.
 
-6. **Export `compile-template` + `compiled-template`; update
+6. ✅ **Export `compile-template` + `compiled-template`; update
    `template-code`; document in README.** Add the symbols to the
    `elp` package's `:export` list. Update `template-code` to emit
    the new parameterized form (keeping its docstring accurate).
@@ -253,6 +253,27 @@ of `template-code` doesn't otherwise change.
    *Verify:* `(use-package :elp) (elp:compile-template …)` works
    from a fresh REPL with no internal-symbol references; README
    example block is copy-paste-runnable.
+   **Decisions:**
+   - Exported symbols: `compile-template`, `compiled-template`,
+     `compiled-template-source-pathname`,
+     `compiled-template-compiled-at` (the metadata readers — handy
+     for callers that introspect a cache, log compile times, etc.).
+   - Removed `build-render-form` and `wrap-render-form` as dead
+     code — both were the literal-bake variant superseded by
+     `build-template-body` + `build-compile-template-form`. The
+     existing `build-render-form-shape` test was rewritten as
+     `build-template-body-shape`, pinning the body-only sexp; the
+     wrapper shape is implicitly covered by the `compile-template`
+     behavior tests.
+   - `template-code` now emits the parameterized lambda form (the
+     same one `compile-template` compiles). The optional
+     `context-alist` parameter is retained for back-compat but
+     ignored — kept out of a breaking-signature change since the
+     non-goals call `template-code` "stays as a debug-introspection
+     helper". Worth flagging: callers that previously relied on
+     `(eval (template-code …))` returning rendered output now get
+     a function back and must funcall it. CLI's `--print` flag
+     still works (it prin1's the form, doesn't eval).
 
 ## Future plans
 
