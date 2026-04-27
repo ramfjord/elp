@@ -644,6 +644,80 @@
     (is (functionp tmpl))
     (is (equal '(:stub ((a . 1))) (funcall tmpl '((a . 1)))))))
 
+;;;; Test Group 15: compile-template (compile once, render many)
+;;;; ============================================================
+;;;; The contract: `(compile-template path)` returns a funcallable
+;;;; instance whose body is parameterized over the context-alist.
+;;;; The same instance reused with different contexts must produce
+;;;; matching outputs — that's the whole point of decoupling
+;;;; compilation from binding.
+
+(defmacro with-compiled-template ((tmpl-var template-string) &body body)
+  "Compile TEMPLATE-STRING to a temp file and bind TMPL-VAR to the
+   resulting compiled-template for the dynamic extent of BODY."
+  (let ((path-var (gensym "PATH")))
+    `(let ((,path-var (template-string-to-file ,template-string)))
+       (unwind-protect
+            (let ((,tmpl-var (elp::compile-template ,path-var)))
+              ,@body)
+         (cleanup-file ,path-var)))))
+
+(defun render-to-string (tmpl ctx)
+  "FUNCALL TMPL on CTX and capture output as a string."
+  (with-output-to-string (s) (funcall tmpl ctx s)))
+
+(test compile-template-returns-compiled-template-instance
+  "compile-template returns an instance of compiled-template carrying
+   the source pathname."
+  (with-compiled-template (tmpl "literal text")
+    (is (typep tmpl 'elp::compiled-template))
+    (is (functionp tmpl))
+    (is (pathnamep (elp::compiled-template-source-pathname tmpl)))))
+
+(test compile-template-literal-only
+  "Literal text renders identically regardless of context."
+  (with-compiled-template (tmpl "Hello, World!")
+    (is (equal "Hello, World!" (render-to-string tmpl nil)))
+    (is (equal "Hello, World!" (render-to-string tmpl '((unused . 42)))))))
+
+(test compile-template-single-expression
+  "Single <%= var %> looks up against context at funcall time."
+  (with-compiled-template (tmpl "Hi <%= name %>!")
+    (is (equal "Hi Alice!" (render-to-string tmpl '((name . "Alice")))))
+    (is (equal "Hi Bob!"   (render-to-string tmpl '((name . "Bob")))))))
+
+(test compile-template-reuse-across-contexts
+  "Same compiled instance, multiple calls, different context-alists.
+   This is the win: compile once, render many."
+  (with-compiled-template (tmpl "Name: <%= name %>, Age: <%= age %>")
+    (is (equal "Name: Alice, Age: 30"
+               (render-to-string tmpl '((name . "Alice") (age . 30)))))
+    (is (equal "Name: Bob, Age: 7"
+               (render-to-string tmpl '((name . "Bob") (age . 7)))))
+    (is (equal "Name: Carol, Age: 99"
+               (render-to-string tmpl '((name . "Carol") (age . 99)))))))
+
+(test compile-template-spanning-when
+  "<% (when ...) %> block spanning multiple tags evaluates per call,
+   suppressing or emitting the inner text based on each call's
+   context value."
+  (with-compiled-template (tmpl "<% (when show %>visible<% ) %>")
+    (is (equal "visible" (render-to-string tmpl '((show . t)))))
+    (is (equal ""        (render-to-string tmpl '((show . nil)))))))
+
+(test compile-template-missing-context-key-binds-nil
+  "Template variables not present in the context-alist bind to NIL.
+   Documented design A behavior — silent default rather than an
+   unbound-variable error."
+  (with-compiled-template (tmpl "x=<%= x %>")
+    (is (equal "x=NIL" (render-to-string tmpl nil)))
+    (is (equal "x=NIL" (render-to-string tmpl '((unrelated . 1)))))))
+
+(test compile-template-empty-file
+  "An empty template compiles to a no-op renderer."
+  (with-compiled-template (tmpl "")
+    (is (equal "" (render-to-string tmpl nil)))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

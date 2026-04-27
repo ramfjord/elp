@@ -178,7 +178,7 @@ of `template-code` doesn't otherwise change.
    `#<COMPILED-TEMPLATE "x.elp">`; instance is `functionp` after
    `sb-mop:set-funcallable-instance-function` installs a stub.
 
-4. **Implement `compile-template` (pathname method).** Build the
+4. ✅ **Implement `compile-template` (pathname method).** Build the
    parameterized lambda using `build-template-body` + the
    free-variable walker (per Design notes A); compile it;
    instantiate `compiled-template` and install the compiled
@@ -190,6 +190,31 @@ of `template-code` doesn't otherwise change.
    `<%= var %>`, `<% (when …) %>` block spanning multiple tags,
    missing context key behavior (whatever A lands on — record in
    plan via `do-plan` decisions).
+   **Decisions:**
+   - Missing-context-key behavior: silent NIL via `(cdr (assoc 'sym
+     ctx))`. Trades today's "unbound variable error" for
+     "renders NIL"; favored simplicity over strictness. Easy to
+     tighten later by switching the binding form to a lookup that
+     errors when ASSOC returns NIL.
+   - Per-call mmap retained: the lambda re-mmaps PATHNAME on every
+     funcall (unchanged from today's `template-code` shape). The win
+     here is parameterization, not avoiding the mmap. Caching the
+     mmap across calls has lifecycle issues (file mtime, GC) that
+     belong to a future cache plan, not this one.
+   - Stream parameter defaulted in the lambda's lambda-list
+     (`&optional (stream *standard-output*)`), so both `(funcall
+     tmpl ctx)` and `(funcall tmpl ctx stream)` work.
+   - Empty-file shortcut: detected before mmap (mmap with size 0
+     would fail) and fulfilled with a stub lambda returning
+     `(values)` — preserves today's `template-code` empty-file
+     behavior while still returning a valid `compiled-template`
+     instance.
+   - Package matching of free-var symbols vs. context-alist keys
+     is the caller's responsibility. The walker uses the symbols as
+     read from the template (under whatever `*package*` was in
+     effect at compile time); context-alist keys must match. This
+     matches today's `build-render-form` semantics — not a new
+     constraint, but worth flagging.
 
 5. **Add `render` method on `compiled-template`; reimplement
    pathname `render` via `compile-template`.** New

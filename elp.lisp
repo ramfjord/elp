@@ -270,6 +270,82 @@
   (let ((*standard-output* stream))
     (eval (template-code pathname context-alist))))
 
+;;;; Parameterized compile
+
+(defun build-compile-template-form (pathname free-vars body)
+  "Build the parameterized lambda form for COMPILE-TEMPLATE.
+
+   The returned lambda takes (CTX &OPTIONAL STREAM) and, when called,
+   re-mmaps PATHNAME, binds each symbol in FREE-VARS to
+   `(cdr (assoc 'sym ctx))`, then evaluates BODY under the same
+   error-translation handler the legacy template-code uses. Helpers
+   from *helper-sources* are spliced in as a LABELS block so the
+   lambda is self-contained — no internal :elp symbols beyond the
+   special variables it intentionally binds."
+  (let ((helpers (mapcar (lambda (entry)
+                           (destructuring-bind (name lambda-list &rest body) entry
+                             `(,name ,lambda-list ,@body)))
+                         *helper-sources*))
+        (bindings (mapcar (lambda (sym)
+                            `(,sym (cdr (assoc ',sym ctx))))
+                          free-vars)))
+    `(lambda (ctx &optional (stream *standard-output*))
+       (declare (ignorable ctx))
+       (let ((*standard-output* stream))
+         (labels ,helpers
+           (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
+             (let ((*template-ptr* ptr))
+               (unwind-protect
+                    (handler-bind
+                        ((elp-template-error (lambda (c) (error c)))
+                         (error
+                           (lambda (c)
+                             (when *current-template-span*
+                               (let ((byte (first *current-template-span*)))
+                                 (multiple-value-bind (line col)
+                                     (byte->line+column ptr size byte)
+                                   (error 'elp-template-error
+                                          :file ,pathname
+                                          :line line :column col
+                                          :original c)))))))
+                      ,(if bindings
+                           `(let ,bindings ,body)
+                           body))
+                 (%mmap-close ptr size fd)))))
+         (values)))))
+
+(defun compile-template (pathname)
+  "Compile the template at PATHNAME into a COMPILED-TEMPLATE.
+
+   The returned instance is FUNCALL-able: `(funcall tmpl ctx)` and
+   `(funcall tmpl ctx stream)` render with CTX as the context-alist.
+   The same instance can be reused across calls with different
+   context-alists — context values are looked up at funcall time,
+   not baked in at compile time. RENDER also accepts the instance.
+
+   Free variables referenced in the template body but absent from
+   CTX bind to NIL (silent default)."
+  (let ((file-size (with-open-file (f pathname) (file-length f))))
+    (when (zerop file-size)
+      (let ((tmpl (make-instance 'compiled-template
+                                 :source-pathname pathname)))
+        (sb-mop:set-funcallable-instance-function
+         tmpl (lambda (ctx &optional (stream *standard-output*))
+                (declare (ignore ctx stream))
+                (values)))
+        (return-from compile-template tmpl))))
+  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
+    (let ((body (unwind-protect
+                     (build-template-body pathname ptr size)
+                  (%mmap-close ptr size fd))))
+      (let* ((free-vars   (template-free-vars body))
+             (lambda-form (build-compile-template-form pathname free-vars body))
+             (compiled-fn (compile nil lambda-form))
+             (tmpl        (make-instance 'compiled-template
+                                         :source-pathname pathname)))
+        (sb-mop:set-funcallable-instance-function tmpl compiled-fn)
+        tmpl))))
+
 ;;;; Internal Helper Functions
 
 (define-helper write-output-range (mmap-ptr start end &optional (stream *standard-output*))
