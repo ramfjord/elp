@@ -101,6 +101,57 @@ becomes "compile-string with a synthetic pathname" rather than
 write-temp-file + `compile-file`. The two designs should be
 reconciled rather than diverging.
 
+## Cost note from #8 simplification (2026-04-26)
+
+While shipping #8 (parameterized-compiled-template) we briefly added
+a code walker (`sb-walker:walk-form`) to identify free template
+variables, then removed it in commit `6db0910f` and replaced with
+`progv` over the context-alist. Net deletion was ~200 LoC. The
+walker wasn't actually load-bearing for #8's goal — `progv`
+covers the compile-once / render-many use case in a few lines.
+
+Direct relevance to this plan: **Layer 2's "Walk-and-tag" option
+re-introduces a code walker of comparable weight.** Tagging
+individual subforms with `.elp` source-locations means walking the
+generated body tree and attaching `sb-c::source-location` records
+(or equivalent) per form. That's the same machinery — and roughly
+the same LoC cost — we just stripped out. Worth pricing in before
+committing to Layer 2.
+
+Layer 1 ("compile-file with `*compile-file-pathname*` set to the
+`.elp`") doesn't need a walker. It gets you file-level location
+accuracy across the whole compiled lambda — backtraces, debugger
+"source" jumps, and swank's `find-source-location` all land on the
+right `.elp` file, even if the line within the file is whatever the
+compiler defaults to. For a lot of debugging that's already a big
+step up; line accuracy is a nice-to-have on top.
+
+The "Custom read-with-locations" sub-option of Layer 2 sidesteps
+the walker by capturing positions during `read`, before any walking
+is needed. That's probably the cheaper route if Layer 2 is wanted
+— the checkpoints data already gives us most of it. Worth picking
+that path explicitly over walk-and-tag unless something forces the
+walker back.
+
+Aside on warnings: with `progv` (no walker) and no `(declare
+(special …))` for free vars, SBCL emits "undefined variable"
+style-warnings at compile time for every free reference, regardless
+of whether the alist actually binds it. The current
+`compile-template` muffles these via `(handler-bind ((warning
+#'muffle-warning)) (compile …))` because they're constant noise,
+not signal — they fire identically on a working template and a
+typo'd one. If a future pass declares specials (e.g. via the
+walker), warnings become meaningful again and muffling should be
+reconsidered.
+
+Aside on swank/lisp-mcp: source-location tracking is useful for any
+client that consumes the data, not only human editor integrations.
+The `eval_swank` MCP transport surfaces conditions as text without
+location info today; with Layer 1 in place, conditions raised from
+template code would carry the `.elp` pathname and `swank:frame-
+source-location` would resolve. That's a tangible improvement for
+agentic Lisp work on `.elp` files, not just nvim/vlime usage.
+
 ## Open questions
 
 - Does SBCL preserve injected source-locations through
