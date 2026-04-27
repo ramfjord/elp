@@ -601,6 +601,49 @@
              (fv-set '(multiple-value-bind (a b) (values source 0)
                         (+ a b))))))
 
+;;;; Test Group 14: compiled-template class
+;;;; ======================================
+;;;; The class carries source metadata while still being FUNCALL-able
+;;;; via funcallable-standard-class. These tests pin down the shape
+;;;; that COMPILE-TEMPLATE (commit 4) and the RENDER method (commit 5)
+;;;; will rely on.
+
+(test compiled-template-construction
+  "MAKE-INSTANCE accepts SOURCE-PATHNAME and the readers return it."
+  (let ((tmpl (make-instance 'elp::compiled-template
+                             :source-pathname #p"x.elp")))
+    (is (equal #p"x.elp" (elp::compiled-template-source-pathname tmpl)))
+    (is (numberp (elp::compiled-template-compiled-at tmpl)))))
+
+(test compiled-template-default-pathname-nil
+  "SOURCE-PATHNAME defaults to NIL when not supplied."
+  (let ((tmpl (make-instance 'elp::compiled-template)))
+    (is (null (elp::compiled-template-source-pathname tmpl)))))
+
+(test compiled-template-print-object-with-pathname
+  "PRINT-OBJECT shows the source pathname namestring."
+  (let* ((tmpl (make-instance 'elp::compiled-template
+                              :source-pathname #p"page.elp"))
+         (out  (format nil "~A" tmpl)))
+    (is (search "COMPILED-TEMPLATE" out))
+    (is (search "\"page.elp\"" out))))
+
+(test compiled-template-print-object-without-pathname
+  "PRINT-OBJECT renders a placeholder when SOURCE-PATHNAME is NIL."
+  (let* ((tmpl (make-instance 'elp::compiled-template))
+         (out  (format nil "~A" tmpl)))
+    (is (search "COMPILED-TEMPLATE" out))
+    (is (search "no source" out))))
+
+(test compiled-template-is-funcallable
+  "After installing a function via set-funcallable-instance-function,
+   the instance is FUNCTIONP and FUNCALL invokes the installed code."
+  (let ((tmpl (make-instance 'elp::compiled-template)))
+    (sb-mop:set-funcallable-instance-function
+     tmpl (lambda (&rest args) (cons :stub args)))
+    (is (functionp tmpl))
+    (is (equal '(:stub ((a . 1))) (funcall tmpl '((a . 1)))))))
+
 ;;;; Run Tests
 (defun run-tests ()
   "Run all ELP tests"

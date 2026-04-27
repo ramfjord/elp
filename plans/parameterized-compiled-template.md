@@ -170,7 +170,7 @@ of `template-code` doesn't otherwise change.
      not `:eval` — matches today's semantics where templates pass
      data in value position, not function position.
 
-3. **Add `compiled-template` funcallable-instance class.** Class
+3. ✅ **Add `compiled-template` funcallable-instance class.** Class
    definition with `source-pathname` and `compiled-at` slots;
    readers; `print-object` method. Not yet wired to anything.
    *Verify:* `(make-instance 'compiled-template :source-pathname

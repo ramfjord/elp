@@ -165,6 +165,43 @@
          (- (cffi:pointer-address found)
             (cffi:pointer-address haystack-ptr)))))
 
+;;;; Compiled-template class
+;;;;
+;;;; A compiled template is a funcallable-instance: callers can
+;;;; FUNCALL it with a context-alist (and optional stream) to render,
+;;;; while the instance still carries source metadata (originating
+;;;; pathname, compile time) for debugging and introspection. Not
+;;;; wired to RENDER or COMPILE-TEMPLATE yet — those land in the next
+;;;; commits.
+
+(defclass compiled-template ()
+  ((source-pathname :initarg :source-pathname
+                    :reader   compiled-template-source-pathname
+                    :initform nil
+                    :documentation
+                    "Pathname the template was compiled from, or NIL for
+                     templates compiled from non-pathname inputs (string,
+                     stream, generated body).")
+   (compiled-at     :initarg :compiled-at
+                    :reader   compiled-template-compiled-at
+                    :initform (get-universal-time)
+                    :documentation
+                    "GET-UNIVERSAL-TIME at which the template was compiled.
+                     Useful for cache invalidation heuristics layered on
+                     top — the compiled-template itself does no caching."))
+  (:metaclass sb-mop:funcallable-standard-class)
+  (:documentation
+   "A compiled ELP template carrying source metadata. Funcall the
+    instance with (CONTEXT-ALIST &OPTIONAL STREAM) to render. RENDER
+    also accepts a COMPILED-TEMPLATE as INPUT."))
+
+(defmethod print-object ((tmpl compiled-template) stream)
+  (print-unreadable-object (tmpl stream :type t)
+    (let ((path (compiled-template-source-pathname tmpl)))
+      (if path
+          (format stream "~S" (namestring path))
+          (format stream "(no source)")))))
+
 ;;;; Public API
 
 (defgeneric render (input context-alist &optional stream)
