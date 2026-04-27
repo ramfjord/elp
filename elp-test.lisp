@@ -103,14 +103,22 @@
            (elp:elp-template-error (c) c))
       (cleanup-file temp-file))))
 
-(test undefined-variable-renders-as-nil
-  "Template variables not present in the context-alist bind to NIL
-   silently — design A's compile-once / call-many tradeoff. (Today's
-   behavior of raising elp-template-error on undefined vars was a
-   side-effect of literal-baked LET; with parameterized lookup, the
-   ASSOC returns NIL and the bind cell defaults the var to NIL.)"
-  (expect-render (format nil "hello~%<%= undefined-var %>~%")
-                 (format nil "hello~%NIL~%")))
+(test runtime-error-undefined-variable
+  "Runtime error signals elp-template-error pointing at the expression."
+  (let ((err (render-error (format nil "hello~%<%= undefined-var %>~%"))))
+    (is (typep err 'elp:elp-template-error))
+    (is (= 2 (elp:elp-template-error-line err)))
+    ;; Expression content starts immediately after <%= on line 2, at col 4.
+    (is (= 4 (elp:elp-template-error-column err)))))
+
+(test runtime-error-column-with-leading-whitespace
+  "Column points at the expression content region (just past <%=),
+   not at column 1 and not at the <."
+  (let ((err (render-error (format nil "line1~%    <%=    bad-var %>~%"))))
+    (is (typep err 'elp:elp-template-error))
+    (is (= 2 (elp:elp-template-error-line err)))
+    ;; Line 2 is "    <%=    bad-var %>"; <%= ends at col 7, content at col 8.
+    (is (= 8 (elp:elp-template-error-column err)))))
 
 (test readtime-error-unbalanced-paren
   "Read-time error inside embedded Lisp signals elp-template-error."
@@ -508,147 +516,22 @@
              (elp::%mmap-close ptr size fd)))
       (cleanup-file path))))
 
-;;;; Test Group 13: Free-variable walker
-;;;; ====================================
-;;;; TEMPLATE-FREE-VARS underpins commit-once / call-many: it identifies
-;;;; which template-author symbols need to resolve against the runtime
-;;;; context-alist instead of being baked in at compile time. The tests
-;;;; pin down the boundary: lexical bindings hide outer references,
-;;;; codegen-internal symbols (in :ELP) and CL builtins are excluded,
-;;;; and bindings introduced by macros (DOLIST) are tracked through
-;;;; macroexpansion.
-
-(defun fv-set (form)
-  "Return TEMPLATE-FREE-VARS of FORM as a sorted list of symbol names,
-   for stable comparison in tests."
-  (sort (mapcar #'symbol-name (elp::template-free-vars form)) #'string<))
-
-(test free-vars-plain-references
-  "Bare references collect both symbols."
-  (is (equal '("X" "Y") (fv-set '(+ x y)))))
-
-(test free-vars-let-shadowing
-  "LET bindings hide the outer reference; outer Y stays free."
-  (is (equal '("Y") (fv-set '(let ((x 1)) (+ x y))))))
-
-(test free-vars-let-star-sequential
-  "LET* shadows progressively; only truly free vars escape."
-  (is (equal '("Z") (fv-set '(let* ((x 1) (y x)) (+ x y z))))))
-
-(test free-vars-lambda-params
-  "Lambda parameters hide references inside the body."
-  (is (equal '("C") (fv-set '(lambda (a b) (+ a b c))))))
-
-(test free-vars-flet
-  "FLET-bound function names don't leak as free vars; references inside
-   the local function body still do."
-  (is (equal '("Y") (fv-set '(flet ((f (x) (+ x y))) (f 1))))))
-
-(test free-vars-labels
-  "LABELS-bound names are likewise hidden."
-  (is (equal '("Z") (fv-set '(labels ((g (x) (+ x z))) (g 1))))))
-
-(test free-vars-symbol-macrolet
-  "SYMBOL-MACROLET expands its bound names to their expansion; the
-   expansion's free vars become the visible free set."
-  (is (equal '("CTX") (fv-set '(symbol-macrolet ((name (cdr (assoc 'k ctx))))
-                                  name)))))
-
-(test free-vars-nested-binding
-  "Binding constructs nest correctly: inner shadow doesn't leak past
-   its scope; sibling references stay free."
-  (is (equal '("OUTER")
-             (fv-set '(progn
-                        (let ((x 1)) x)
-                        (let ((y 2)) (+ y outer)))))))
-
-(test free-vars-excludes-elp-codegen-symbols
-  "ELP-package symbols injected by codegen (write-output-range,
-   *template-ptr*, *current-template-span*) are not template-author
-   vars and must not appear."
-  (is (equal '("NAME")
-             (fv-set '(progn
-                        (elp::write-output-range elp::*template-ptr* 0 3)
-                        (let ((elp::*current-template-span* '(6 12)))
-                          (format t "~A" name)))))))
-
-(test free-vars-excludes-cl-and-keywords
-  "T, NIL, keywords, and CL builtins are filtered out."
-  (is (equal '("X")
-             (fv-set '(when x (format t "~A" :hello))))))
-
-(test free-vars-dolist-binds-loop-var
-  "DOLIST is a macro; its loop variable must be tracked as bound after
-   macroexpansion. ITEMS is free; X is not."
-  (is (equal '("ITEMS")
-             (fv-set '(dolist (x items) (format t "~A" x))))))
-
-(test free-vars-multiple-value-bind
-  "MULTIPLE-VALUE-BIND introduces lexical names; symbols in :EVAL
-   position inside its value-form contribute free references, while
-   the bound names A and B do not leak."
-  (is (equal '("SOURCE")
-             (fv-set '(multiple-value-bind (a b) (values source 0)
-                        (+ a b))))))
-
-;;;; Test Group 14: compiled-template class
-;;;; ======================================
-;;;; The class carries source metadata while still being FUNCALL-able
-;;;; via funcallable-standard-class. These tests pin down the shape
-;;;; that COMPILE-TEMPLATE (commit 4) and the RENDER method (commit 5)
-;;;; will rely on.
-
-(test compiled-template-construction
-  "MAKE-INSTANCE accepts SOURCE-PATHNAME and the readers return it."
-  (let ((tmpl (make-instance 'elp::compiled-template
-                             :source-pathname #p"x.elp")))
-    (is (equal #p"x.elp" (elp::compiled-template-source-pathname tmpl)))
-    (is (numberp (elp::compiled-template-compiled-at tmpl)))))
-
-(test compiled-template-default-pathname-nil
-  "SOURCE-PATHNAME defaults to NIL when not supplied."
-  (let ((tmpl (make-instance 'elp::compiled-template)))
-    (is (null (elp::compiled-template-source-pathname tmpl)))))
-
-(test compiled-template-print-object-with-pathname
-  "PRINT-OBJECT shows the source pathname namestring."
-  (let* ((tmpl (make-instance 'elp::compiled-template
-                              :source-pathname #p"page.elp"))
-         (out  (format nil "~A" tmpl)))
-    (is (search "COMPILED-TEMPLATE" out))
-    (is (search "\"page.elp\"" out))))
-
-(test compiled-template-print-object-without-pathname
-  "PRINT-OBJECT renders a placeholder when SOURCE-PATHNAME is NIL."
-  (let* ((tmpl (make-instance 'elp::compiled-template))
-         (out  (format nil "~A" tmpl)))
-    (is (search "COMPILED-TEMPLATE" out))
-    (is (search "no source" out))))
-
-(test compiled-template-is-funcallable
-  "After installing a function via set-funcallable-instance-function,
-   the instance is FUNCTIONP and FUNCALL invokes the installed code."
-  (let ((tmpl (make-instance 'elp::compiled-template)))
-    (sb-mop:set-funcallable-instance-function
-     tmpl (lambda (&rest args) (cons :stub args)))
-    (is (functionp tmpl))
-    (is (equal '(:stub ((a . 1))) (funcall tmpl '((a . 1)))))))
-
-;;;; Test Group 15: compile-template (compile once, render many)
+;;;; Test Group 13: compile-template (compile once, render many)
 ;;;; ============================================================
-;;;; The contract: `(compile-template path)` returns a funcallable
-;;;; instance whose body is parameterized over the context-alist.
-;;;; The same instance reused with different contexts must produce
-;;;; matching outputs — that's the whole point of decoupling
-;;;; compilation from binding.
+;;;; `(compile-template path)` returns a function of (CTX &OPTIONAL
+;;;; STREAM). The same function reused with different contexts must
+;;;; produce matching outputs — the win for issue #8. Missing context
+;;;; keys signal elp-template-error at the reference site (PROGV
+;;;; doesn't bind them, so the body's reference lands an unbound-
+;;;; variable error which the existing handler translates).
 
 (defmacro with-compiled-template ((tmpl-var template-string) &body body)
   "Compile TEMPLATE-STRING to a temp file and bind TMPL-VAR to the
-   resulting compiled-template for the dynamic extent of BODY."
+   compiled function for the dynamic extent of BODY."
   (let ((path-var (gensym "PATH")))
     `(let ((,path-var (template-string-to-file ,template-string)))
        (unwind-protect
-            (let ((,tmpl-var (elp::compile-template ,path-var)))
+            (let ((,tmpl-var (elp:compile-template ,path-var)))
               ,@body)
          (cleanup-file ,path-var)))))
 
@@ -656,13 +539,10 @@
   "FUNCALL TMPL on CTX and capture output as a string."
   (with-output-to-string (s) (funcall tmpl ctx s)))
 
-(test compile-template-returns-compiled-template-instance
-  "compile-template returns an instance of compiled-template carrying
-   the source pathname."
+(test compile-template-returns-function
+  "compile-template returns a callable function."
   (with-compiled-template (tmpl "literal text")
-    (is (typep tmpl 'elp::compiled-template))
-    (is (functionp tmpl))
-    (is (pathnamep (elp::compiled-template-source-pathname tmpl)))))
+    (is (functionp tmpl))))
 
 (test compile-template-literal-only
   "Literal text renders identically regardless of context."
@@ -677,7 +557,7 @@
     (is (equal "Hi Bob!"   (render-to-string tmpl '((name . "Bob")))))))
 
 (test compile-template-reuse-across-contexts
-  "Same compiled instance, multiple calls, different context-alists.
+  "Same compiled function, multiple calls, different context-alists.
    This is the win: compile once, render many."
   (with-compiled-template (tmpl "Name: <%= name %>, Age: <%= age %>")
     (is (equal "Name: Alice, Age: 30"
@@ -695,40 +575,36 @@
     (is (equal "visible" (render-to-string tmpl '((show . t)))))
     (is (equal ""        (render-to-string tmpl '((show . nil)))))))
 
-(test compile-template-missing-context-key-binds-nil
-  "Template variables not present in the context-alist bind to NIL.
-   Design A's silent-default behavior — chosen over compile-time or
-   runtime errors so that compile-once / call-many doesn't require
-   the alist's key-set to be known at compile time."
-  (with-compiled-template (tmpl "x=<%= x %>")
-    (is (equal "x=NIL" (render-to-string tmpl nil)))
-    (is (equal "x=NIL" (render-to-string tmpl '((unrelated . 1)))))))
+(test compile-template-missing-context-key-errors
+  "Template variables not present in the context-alist signal
+   elp-template-error at the reference site — PROGV doesn't bind
+   them, so the unbound-variable error fires inside the
+   *current-template-span* let, and the handler picks up the right
+   line/column. (Note: a globally-bound symbol-value would shadow
+   this; the test uses a deliberately unique symbol name.)"
+  (let ((path (template-string-to-file
+               "v=<%= deliberately-unbound-template-var %>")))
+    (unwind-protect
+         (let* ((tmpl (elp:compile-template path))
+                (err  (handler-case
+                          (progn
+                            (with-output-to-string (s) (funcall tmpl nil s))
+                            nil)
+                        (elp:elp-template-error (c) c))))
+           (is (typep err 'elp:elp-template-error)))
+      (cleanup-file path))))
 
 (test compile-template-empty-file
   "An empty template compiles to a no-op renderer."
   (with-compiled-template (tmpl "")
     (is (equal "" (render-to-string tmpl nil)))))
 
-;;;; Test Group 16: Exported public surface
-;;;; ======================================
-;;;; These tests reference the API through the `elp:` qualifier only,
-;;;; verifying that `compile-template`, `compiled-template`, and the
-;;;; metadata readers are usable from a fresh REPL with `(use-package
-;;;; :elp)` (or via package qualification) — no internal-symbol leak
-;;;; required.
-
-(test public-compile-template-via-exported-symbols
-  "Render via the exported compile-template / render path."
-  (let ((path (template-string-to-file "Hi <%= name %>!")))
-    (unwind-protect
-         (let ((tmpl (elp:compile-template path)))
-           (is (typep tmpl 'elp:compiled-template))
-           (is (equal "Hi Alice!"
-                      (with-output-to-string (s)
-                        (elp:render tmpl '((name . "Alice")) s))))
-           (is (equal path (elp:compiled-template-source-pathname tmpl)))
-           (is (numberp (elp:compiled-template-compiled-at tmpl))))
-      (cleanup-file path))))
+(test compile-template-via-render-method
+  "render specialized on functions delegates to FUNCALL."
+  (with-compiled-template (tmpl "Hi <%= name %>!")
+    (is (equal "Hi Alice!"
+               (with-output-to-string (s)
+                 (elp:render tmpl '((name . "Alice")) s))))))
 
 ;;;; Run Tests
 (defun run-tests ()

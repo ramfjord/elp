@@ -113,29 +113,26 @@ PathChanged=<%= path %>
 
 For repeated renders of the same template (e.g. an HTTP handler that
 fills the same page on every request), compile once and reuse the
-returned `compiled-template`:
+returned function:
 
 ```lisp
 (use-package :elp)
 
 (defparameter *page* (compile-template #p"page.elp"))
 
-(funcall *page* '((name . "Alice"))
-                 *standard-output*)
+(funcall *page* '((name . "Alice")) *standard-output*)
 ;; or equivalently:
 (render *page* '((name . "Alice")))
 (render *page* '((name . "Bob")))
 ```
 
-`compile-template` parses the template once and returns a
-funcallable instance carrying the compiled render code plus source
-metadata. Subsequent calls skip the read and codegen pass — only
-the body runs. The same instance is safe to reuse with different
-context-alists.
-
-`render` accepts either a pathname (compiles on every call) or a
-`compiled-template` (renders against the precompiled code). See
-issue #8 for the design rationale.
+`compile-template` parses the template once and returns a function
+of `(ctx &optional stream)`. Subsequent calls skip the read and
+codegen pass. Context-alist keys are bound as dynamic variables for
+the call's extent (via `progv`); a template reference whose key is
+absent from the alist signals `elp-template-error` at the reference
+site. `render` accepts either a pathname (compiles on every call)
+or the compiled function. See issue #8 for design rationale.
 
 ## Context Variables
 
@@ -169,8 +166,8 @@ generated, with no intermediate Lisp string. When `stream` is an
 binary), literal text ranges are written via a single `write(2)`
 syscall directly on the mmap'd source — zero copy through Lisp.
 
-- `input`: A pathname (compiled and rendered in one step) or a
-  `compiled-template` from `compile-template`
+- `input`: A pathname (compiled and rendered in one step) or the
+  compiled function returned by `compile-template`
 - `context-alist`: List of `(symbol . value)` pairs
 - `stream`: Destination stream (default: `*standard-output*`)
 - Returns: no useful value; consumers care about side effects on `stream`
@@ -183,23 +180,15 @@ For callers that want the output as a string, wrap in
   (render #p"template.elp" '((name . "Alice")) s))
 ```
 
-**`(compile-template pathname)` → `compiled-template`**
+**`(compile-template pathname)` → function**
 
-Compiles the template at `pathname` once and returns a funcallable
-instance carrying the compiled render function plus source metadata.
-The instance is `funcall`-able as `(funcall tmpl ctx)` or `(funcall
-tmpl ctx stream)`, and `render` accepts it as `input`. Reusing the
-same instance across calls with different context-alists is the
-intended path for hot rendering loops.
-
-Template variables not present in the context-alist bind to `NIL`
-silently — the runtime lookup is `(cdr (assoc 'sym ctx))`. If you
-need stricter behavior, validate the context-alist in your caller.
-
-**`(compiled-template-source-pathname tmpl)` / `(compiled-template-compiled-at tmpl)`**
-
-Readers on a `compiled-template` for the originating pathname (or
-`NIL`) and the `get-universal-time` value at compile time.
+Compiles the template at `pathname` once and returns a function of
+`(ctx &optional stream)`. The function may be reused across calls
+with different context-alists — the `progv` binding happens at
+funcall time, not compile time. A template reference whose symbol
+is absent from the context-alist (and not otherwise bound globally)
+signals `elp-template-error` at the reference site with the correct
+line/column.
 
 ### Errors
 

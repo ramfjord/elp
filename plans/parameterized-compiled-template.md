@@ -275,6 +275,47 @@ of `template-code` doesn't otherwise change.
      a function back and must funcall it. CLI's `--print` flag
      still works (it prin1's the form, doesn't eval).
 
+## Post-plan simplification (2026-04-26)
+
+Reviewing the shipped branch end-to-end, the walker (commit 2) and
+the funcallable-instance class (commit 3) added ~180 LoC of
+machinery that wasn't required for the goal — `progv` over the
+context-alist gives the same compile-once / render-many capability
+in a couple of lines. The walker was originally rationalized as
+"needed for special declarations to suppress SBCL warnings"; in
+practice `(handler-bind ((warning #'muffle-warning)) (compile …))`
+is enough.
+
+A simplification commit landed on this branch that:
+
+- Drops `template-free-vars` and its 12 walker tests.
+- Drops the `compiled-template` class, `print-object` method, and
+  metadata readers + their 5 tests.
+- Drops the public exports for the class and metadata readers.
+- Replaces the per-symbol `let` bindings in the generated lambda
+  with `progv` over the alist's keys/values. Body references that
+  miss both the alist and any global binding signal an unbound-
+  variable error at the reference site, restoring today's loud-
+  failure-on-typo semantics.
+- Wraps `(compile nil …)` in `(handler-bind ((warning
+  #'muffle-warning)) …)` so users don't see SBCL's per-free-var
+  warnings.
+- Restores the two original `runtime-error-undefined-variable` /
+  `runtime-error-column-with-leading-whitespace` tests.
+- 81 tests pass, 251 LoC net deletion.
+
+What was lost: the `compiled-template-source-pathname` /
+`compiled-template-compiled-at` metadata readers. Those were always
+forward-prep for issue #5 (source-locations); when #5 lands, the
+metadata can be added back as a thin struct or class around the
+compiled function — and at that point the reasoning will be
+concrete instead of speculative.
+
+**Planning learning**: the plan should have included an LoC
+estimate per commit and a sanity-check pass on the total before
+approval. "Six commits, ~150 LoC" would have prompted "could it be
+done in 30?" before commit 2 instead of after commit 6.
+
 ## Future plans
 
 - Cache invalidation / mtime-aware compile cache. Out of scope

@@ -11,9 +11,6 @@
    ;; Primary public API
    :render
    :compile-template
-   :compiled-template
-   :compiled-template-source-pathname
-   :compiled-template-compiled-at
    :template-code
    ;; Error condition
    :elp-template-error
@@ -71,11 +68,11 @@
 ;;;;
 ;;;; Functions tagged with DEFINE-HELPER are installed both as top-level
 ;;;; DEFUNs (for REPL / M-. ergonomics) and registered in
-;;;; *HELPER-SOURCES*, so the codegen in WRAP-RENDER-FORM can splice them
-;;;; into a LABELS block at the head of the generated render program.
-;;;; That keeps TEMPLATE-CODE output self-contained: a printed form can
-;;;; be re-EVAL'd without depending on these specific internals being
-;;;; present.
+;;;; *HELPER-SOURCES*, so the codegen in BUILD-TEMPLATE-LAMBDA can
+;;;; splice them into a LABELS block at the head of the generated
+;;;; render program. That keeps TEMPLATE-CODE output self-contained:
+;;;; a printed form can be re-EVAL'd without depending on these
+;;;; specific internals being present.
 
 (defvar *helper-sources* '()
   "List of (NAME LAMBDA-LIST . BODY) entries, in registration order, for
@@ -169,43 +166,6 @@
          (- (cffi:pointer-address found)
             (cffi:pointer-address haystack-ptr)))))
 
-;;;; Compiled-template class
-;;;;
-;;;; A compiled template is a funcallable-instance: callers can
-;;;; FUNCALL it with a context-alist (and optional stream) to render,
-;;;; while the instance still carries source metadata (originating
-;;;; pathname, compile time) for debugging and introspection. Not
-;;;; wired to RENDER or COMPILE-TEMPLATE yet — those land in the next
-;;;; commits.
-
-(defclass compiled-template ()
-  ((source-pathname :initarg :source-pathname
-                    :reader   compiled-template-source-pathname
-                    :initform nil
-                    :documentation
-                    "Pathname the template was compiled from, or NIL for
-                     templates compiled from non-pathname inputs (string,
-                     stream, generated body).")
-   (compiled-at     :initarg :compiled-at
-                    :reader   compiled-template-compiled-at
-                    :initform (get-universal-time)
-                    :documentation
-                    "GET-UNIVERSAL-TIME at which the template was compiled.
-                     Useful for cache invalidation heuristics layered on
-                     top — the compiled-template itself does no caching."))
-  (:metaclass sb-mop:funcallable-standard-class)
-  (:documentation
-   "A compiled ELP template carrying source metadata. Funcall the
-    instance with (CONTEXT-ALIST &OPTIONAL STREAM) to render. RENDER
-    also accepts a COMPILED-TEMPLATE as INPUT."))
-
-(defmethod print-object ((tmpl compiled-template) stream)
-  (print-unreadable-object (tmpl stream :type t)
-    (let ((path (compiled-template-source-pathname tmpl)))
-      (if path
-          (format stream "~S" (namestring path))
-          (format stream "(no source)")))))
-
 ;;;; Public API
 
 (defgeneric render (input context-alist &optional stream)
@@ -225,23 +185,12 @@
    STREAM. Wrap in WITH-OUTPUT-TO-STRING if you want the output as a
    string."))
 
-(defun template-code (pathname &optional context-alist)
-  "Return a self-contained sexp that, when EVALuated, produces a
-   parameterized renderer for the template at PATHNAME.
-
-   The form is the same `(lambda (ctx &optional stream) …)` that
-   `compile-template` compiles: helpers spliced in as LABELS, the
-   mmap opened and closed per call, an error handler translating
-   host conditions into ELP-TEMPLATE-ERROR, and a top-level LET
-   that binds each free template variable to `(cdr (assoc 'sym
-   ctx))`. Eval-able anywhere ELP is loaded, without depending on
-   any non-exported ELP symbol.
-
-   CONTEXT-ALIST is preserved as a parameter for backward
-   compatibility but is no longer baked into the form — context
-   values resolve at funcall time. Pass `nil` (or omit it) to get
-   the canonical parameterized shape."
-  (declare (ignore context-alist))
+(defun template-code (pathname)
+  "Return the self-contained sexp that COMPILE-TEMPLATE compiles.
+   Useful for debugging (`prin1` it) and for the CLI's `--print`
+   flag. The form is a `(lambda (ctx &optional stream) …)` whose
+   body uses PROGV to bind each context-alist key as a dynamic
+   variable for the call's extent."
   (let ((file-size (with-open-file (f pathname) (file-length f))))
     (when (zerop file-size)
       (return-from template-code
@@ -252,39 +201,19 @@
     (let ((body (unwind-protect
                      (build-template-body pathname ptr size)
                   (%mmap-close ptr size fd))))
-      (build-compile-template-form pathname
-                                   (template-free-vars body)
-                                   body))))
+      (build-template-lambda pathname body))))
 
-(defmethod render ((tmpl compiled-template) context-alist
-                   &optional (stream *standard-output*))
-  (funcall tmpl context-alist stream))
-
-(defmethod render ((pathname pathname) context-alist
-                   &optional (stream *standard-output*))
-  (render (compile-template pathname) context-alist stream))
-
-;;;; Parameterized compile
-
-(defun build-compile-template-form (pathname free-vars body)
-  "Build the parameterized lambda form for COMPILE-TEMPLATE.
-
-   The returned lambda takes (CTX &OPTIONAL STREAM) and, when called,
-   re-mmaps PATHNAME, binds each symbol in FREE-VARS to
-   `(cdr (assoc 'sym ctx))`, then evaluates BODY under the same
-   error-translation handler the legacy template-code uses. Helpers
-   from *helper-sources* are spliced in as a LABELS block so the
-   lambda is self-contained — no internal :elp symbols beyond the
-   special variables it intentionally binds."
+(defun build-template-lambda (pathname body)
+  "Wrap BODY as a `(lambda (ctx &optional stream) …)` ready for
+   COMPILE. Helpers from *HELPER-SOURCES* are spliced in as a LABELS
+   block; the body runs under PROGV so context-alist keys bind as
+   dynamic variables. Errors during render are translated to
+   ELP-TEMPLATE-ERROR via the existing handler."
   (let ((helpers (mapcar (lambda (entry)
                            (destructuring-bind (name lambda-list &rest body) entry
                              `(,name ,lambda-list ,@body)))
-                         *helper-sources*))
-        (bindings (mapcar (lambda (sym)
-                            `(,sym (cdr (assoc ',sym ctx))))
-                          free-vars)))
+                         *helper-sources*)))
     `(lambda (ctx &optional (stream *standard-output*))
-       (declare (ignorable ctx))
        (let ((*standard-output* stream))
          (labels ,helpers
            (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
@@ -302,43 +231,28 @@
                                           :file ,pathname
                                           :line line :column col
                                           :original c)))))))
-                      ,(if bindings
-                           `(let ,bindings ,body)
-                           body))
+                      (progv (mapcar #'car ctx) (mapcar #'cdr ctx)
+                        ,body))
                  (%mmap-close ptr size fd)))))
          (values)))))
 
 (defun compile-template (pathname)
-  "Compile the template at PATHNAME into a COMPILED-TEMPLATE.
+  "Compile the template at PATHNAME and return a function of
+   (CTX &OPTIONAL STREAM). The function may be reused across calls
+   with different context-alists; keys absent from CTX referenced
+   by the template signal an unbound-variable error at the
+   reference site, translated to ELP-TEMPLATE-ERROR with the
+   correct line/column."
+  (handler-bind ((warning #'muffle-warning))
+    (compile nil (template-code pathname))))
 
-   The returned instance is FUNCALL-able: `(funcall tmpl ctx)` and
-   `(funcall tmpl ctx stream)` render with CTX as the context-alist.
-   The same instance can be reused across calls with different
-   context-alists — context values are looked up at funcall time,
-   not baked in at compile time. RENDER also accepts the instance.
+(defmethod render ((fn function) context-alist
+                   &optional (stream *standard-output*))
+  (funcall fn context-alist stream))
 
-   Free variables referenced in the template body but absent from
-   CTX bind to NIL (silent default)."
-  (let ((file-size (with-open-file (f pathname) (file-length f))))
-    (when (zerop file-size)
-      (let ((tmpl (make-instance 'compiled-template
-                                 :source-pathname pathname)))
-        (sb-mop:set-funcallable-instance-function
-         tmpl (lambda (ctx &optional (stream *standard-output*))
-                (declare (ignore ctx stream))
-                (values)))
-        (return-from compile-template tmpl))))
-  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
-    (let ((body (unwind-protect
-                     (build-template-body pathname ptr size)
-                  (%mmap-close ptr size fd))))
-      (let* ((free-vars   (template-free-vars body))
-             (lambda-form (build-compile-template-form pathname free-vars body))
-             (compiled-fn (compile nil lambda-form))
-             (tmpl        (make-instance 'compiled-template
-                                         :source-pathname pathname)))
-        (sb-mop:set-funcallable-instance-function tmpl compiled-fn)
-        tmpl))))
+(defmethod render ((pathname pathname) context-alist
+                   &optional (stream *standard-output*))
+  (render (compile-template pathname) context-alist stream))
 
 ;;;; Internal Helper Functions
 
@@ -381,36 +295,6 @@
       ((or reader-error end-of-file) (c)
         (translate-read-error c pathname ptr size stream)))
     `(progn ,@(nreverse forms))))
-
-(defun template-free-vars (form)
-  "Return the list of symbols referenced free (in :EVAL context) inside
-   FORM, excluding keywords, NIL/T, lexically bound variables, and
-   symbols in the :ELP or :COMMON-LISP packages (codegen artifacts and
-   builtins). The result identifies template-author variables that
-   should be bound from a runtime context-alist.
-
-   Order is unspecified beyond `pushnew` deduplication."
-  (let ((free    '())
-        (elp-pkg (find-package :elp))
-        (cl-pkg  (find-package :common-lisp))
-        (kw-pkg  (find-package :keyword)))
-    (sb-walker:walk-form
-     form
-     nil
-     (lambda (subform context env)
-       (when (and (eq context :eval)
-                  (symbolp subform)
-                  subform                     ; not NIL
-                  (not (eq subform t))
-                  (let ((p (symbol-package subform)))
-                    (and p
-                         (not (eq p elp-pkg))
-                         (not (eq p cl-pkg))
-                         (not (eq p kw-pkg))))
-                  (not (sb-walker:var-lexical-p subform env)))
-         (pushnew subform free))
-       subform))
-    free))
 
 (defun translate-read-error (condition pathname ptr size stream)
   "Translate a reader-error raised while reading STREAM into an
