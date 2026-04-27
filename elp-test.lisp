@@ -103,22 +103,14 @@
            (elp:elp-template-error (c) c))
       (cleanup-file temp-file))))
 
-(test runtime-error-undefined-variable
-  "Runtime error signals elp-template-error pointing at the expression."
-  (let ((err (render-error (format nil "hello~%<%= undefined-var %>~%"))))
-    (is (typep err 'elp:elp-template-error))
-    (is (= 2 (elp:elp-template-error-line err)))
-    ;; Expression content starts immediately after <%= on line 2, at col 4.
-    (is (= 4 (elp:elp-template-error-column err)))))
-
-(test runtime-error-column-with-leading-whitespace
-  "Column points at the expression content region (just past <%=),
-   not at column 1 and not at the <."
-  (let ((err (render-error (format nil "line1~%    <%=    bad-var %>~%"))))
-    (is (typep err 'elp:elp-template-error))
-    (is (= 2 (elp:elp-template-error-line err)))
-    ;; Line 2 is "    <%=    bad-var %>"; <%= ends at col 7, content at col 8.
-    (is (= 8 (elp:elp-template-error-column err)))))
+(test undefined-variable-renders-as-nil
+  "Template variables not present in the context-alist bind to NIL
+   silently — design A's compile-once / call-many tradeoff. (Today's
+   behavior of raising elp-template-error on undefined vars was a
+   side-effect of literal-baked LET; with parameterized lookup, the
+   ASSOC returns NIL and the bind cell defaults the var to NIL.)"
+  (expect-render (format nil "hello~%<%= undefined-var %>~%")
+                 (format nil "hello~%NIL~%")))
 
 (test readtime-error-unbalanced-paren
   "Read-time error inside embedded Lisp signals elp-template-error."
@@ -707,8 +699,9 @@
 
 (test compile-template-missing-context-key-binds-nil
   "Template variables not present in the context-alist bind to NIL.
-   Documented design A behavior — silent default rather than an
-   unbound-variable error."
+   Design A's silent-default behavior — chosen over compile-time or
+   runtime errors so that compile-once / call-many doesn't require
+   the alist's key-set to be known at compile time."
   (with-compiled-template (tmpl "x=<%= x %>")
     (is (equal "x=NIL" (render-to-string tmpl nil)))
     (is (equal "x=NIL" (render-to-string tmpl '((unrelated . 1)))))))

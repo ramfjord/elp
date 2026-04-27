@@ -216,7 +216,7 @@ of `template-code` doesn't otherwise change.
      matches today's `build-render-form` semantics — not a new
      constraint, but worth flagging.
 
-5. **Add `render` method on `compiled-template`; reimplement
+5. ✅ **Add `render` method on `compiled-template`; reimplement
    pathname `render` via `compile-template`.** New
    `defmethod render ((tmpl compiled-template) ctx &optional
    stream)`; the pathname method becomes
@@ -225,6 +225,23 @@ of `template-code` doesn't otherwise change.
    *Verify:* full FiveAM suite passes unchanged; manual smoke of
    `(elp:render #p"…" '((…))) ` matches pre-refactor output for a
    couple of fixture templates.
+   **Decisions:**
+   - One observable behavior change: `<%= undefined-var %>` (a
+     template var with no matching context-alist key) now renders
+     `NIL` silently instead of raising `elp-template-error`. This
+     is the design A "missing key → NIL" branch from the plan's
+     Design notes. It surfaced when commit 5 routed pathname
+     `render` through the new path; the two existing typo-detection
+     tests (`runtime-error-undefined-variable` and
+     `runtime-error-column-with-leading-whitespace`) were updated to
+     a single `undefined-variable-renders-as-nil` test.
+   - Considered a stricter "error on missing key" via
+     `symbol-macrolet` expanding to a runtime check, but it broke
+     `simple-code-block-rendering` (`<% (setf x 42) %>...`) because
+     `setf` of a `let`-form is not a place. The let-bind form
+     supports both `setf` and the silent-NIL semantics, so it won.
+   - Stricter modes can be added later as opt-in (e.g. a keyword
+     to `compile-template`) without re-doing the structural work.
 
 6. **Export `compile-template` + `compiled-template`; update
    `template-code`; document in README.** Add the symbols to the

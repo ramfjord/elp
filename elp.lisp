@@ -265,10 +265,13 @@
              (%mmap-close ptr size fd))))
        (values))))
 
+(defmethod render ((tmpl compiled-template) context-alist
+                   &optional (stream *standard-output*))
+  (funcall tmpl context-alist stream))
+
 (defmethod render ((pathname pathname) context-alist
                    &optional (stream *standard-output*))
-  (let ((*standard-output* stream))
-    (eval (template-code pathname context-alist))))
+  (render (compile-template pathname) context-alist stream))
 
 ;;;; Parameterized compile
 
