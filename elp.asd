@@ -7,7 +7,7 @@
   :license "MIT"
   :homepage "https://github.com/thomasramfjord/mediaserver"
   :source-control (:git "https://github.com/thomasramfjord/mediaserver")
-  :depends-on ("alexandria" "cffi" "cl-ppcre")
+  :depends-on ("alexandria" "cffi" "cl-ppcre" "hu.dwim.walker")
   :components
   ((:file "elp")
    (:file "cli" :depends-on ("elp")))

@@ -184,11 +184,42 @@ For callers that want the output as a string, wrap in
 
 Compiles the template at `pathname` once and returns a function of
 `(ctx &optional stream)`. The function may be reused across calls
-with different context-alists — the `progv` binding happens at
-funcall time, not compile time. A template reference whose symbol
-is absent from the context-alist (and not otherwise bound globally)
-signals `elp-template-error` at the reference site with the correct
-line/column.
+with different context-alists — each free template variable is
+bound lexically from the matching alist entry at funcall time, then
+the body runs against those bindings. A reference whose symbol is
+absent from the context-alist signals `elp-template-error` with
+line/column information.
+
+### Form introspection
+
+ELP exposes the same compile-once shape as a generic primitive
+over arbitrary Lisp body sexps, useful when a caller wants to know
+what context variables a body depends on *before* running it.
+
+**`(compile-form sexp)` → `compiled-form`**
+
+Walks `sexp` for free variables (symbols not bound by any binding
+form inside `sexp` itself) and compiles a lambda that runs the
+body against an alist of bindings. Returns a `compiled-form`
+struct.
+
+**`(compiled-form-fn cf)`** — the compiled function. Call it as
+`(funcall fn alist)`. Each free var is bound lexically from the
+matching alist entry; missing keys signal `unbound-variable`.
+
+**`(compiled-form-free-vars cf)`** — the sorted list of free-var
+symbols. The contract callers can use to validate their alist or
+prompt the user for required values.
+
+**`(compiled-form-source cf)`** — the original sexp.
+
+```lisp
+(let ((cf (elp:compile-form '(when ready (format nil "~A" name)))))
+  (elp:compiled-form-free-vars cf)        ; => (NAME READY)
+  (funcall (elp:compiled-form-fn cf)
+           '((ready . t) (name . "Ada"))) ; => "Ada"
+  )
+```
 
 ### Errors
 

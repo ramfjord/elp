@@ -12,6 +12,12 @@
    :render
    :compile-template
    :template-code
+   ;; Form introspection
+   :compile-form
+   :compiled-form
+   :compiled-form-fn
+   :compiled-form-free-vars
+   :compiled-form-source
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -159,6 +165,86 @@
          (- (cffi:pointer-address found)
             (cffi:pointer-address haystack-ptr)))))
 
+;;;; Form introspection
+;;;;
+;;;; COMPILE-FORM takes an arbitrary Lisp body sexp and returns a
+;;;; COMPILED-FORM bundling (a) the set of free variables it
+;;;; references and (b) a compiled function that runs it against an
+;;;; alist of bindings for those variables. Useful as a generic
+;;;; primitive — callers can enumerate what a form depends on
+;;;; before executing it. ELP itself uses PROGV-based binding for
+;;;; templates; this helper exposes the same shape for hand-built
+;;;; sexps.
+;;;;
+;;;; The walker is HU.DWIM.WALKER, which classifies every reference
+;;;; in the AST as lexical / free / special / etc. Filtering on
+;;;; FREE-VARIABLE-REFERENCE-FORM gives exactly the symbols not
+;;;; bound by the form itself and not proclaimed special. Function-
+;;;; position symbols, keywords, T/NIL, quoted forms, and globally-
+;;;; specialed variables (DEFVAR/DEFPARAMETER) are all classified
+;;;; under other node types and so excluded for free.
+
+(defstruct compiled-form
+  "Bundles a compiled function with the free variables its source
+   form references. FN is `(lambda (ctx) …)`; calling it binds each
+   free var to the matching alist entry via PROGV. SOURCE is the
+   original sexp, retained for debugging / introspection."
+  fn free-vars source)
+
+(defun form-free-vars (form)
+  "Return the sorted list of symbols referenced free in FORM. Free
+   means: not lexically bound by FORM, not globally proclaimed
+   special, not a function-position symbol, not a keyword or
+   self-evaluating constant. Macros are expanded transparently.
+
+   Free references are *expected* at this layer (the whole point is
+   to enumerate them), so HU.DWIM.WALKER's UNDEFINED-VARIABLE-
+   REFERENCE warnings are muffled here. SBCL's own compile-time
+   warnings are unaffected."
+  (let* ((ast  (handler-bind ((hu.dwim.walker:undefined-reference
+                                #'muffle-warning))
+                 (hu.dwim.walker:walk-form form)))
+         (refs (hu.dwim.walker:collect-variable-references ast))
+         (free (remove-if-not (lambda (r)
+                                (typep r 'hu.dwim.walker:free-variable-reference-form))
+                              refs)))
+    (sort (remove-duplicates (mapcar #'hu.dwim.walker:name-of free))
+          #'string< :key #'symbol-name)))
+
+(defun compile-form (form)
+  "Walk FORM for free variables and return a COMPILED-FORM whose FN
+   takes a context-alist and runs FORM with each free variable
+   bound *lexically* to its alist value. Free vars not present in
+   the alist signal an unbound-variable error at the binding step.
+
+   Lexical binding is the right shape here for three reasons:
+   no `(declare (special …))` is needed (so warnings stay on, no
+   global symbol pollution); `(setf x …)` inside FORM modifies the
+   local binding rather than the global symbol-value cell, so a
+   COMPILED-FORM never leaks state into the host image; and the
+   walker keeps classifying free symbols as free across calls,
+   which keeps the FREE-VARS contract stable."
+  (let* ((free  (form-free-vars form))
+         ;; HU.DWIM.WALKER:WALK-FORM annotates the input cons cells
+         ;; with source-tracking info that SBCL's compiler later
+         ;; reads as "this form was an unknown reference," surfacing
+         ;; spurious warnings even when the surrounding LET clearly
+         ;; binds the symbol. Splicing a fresh copy detaches the
+         ;; final form from those annotations.
+         (body  (copy-tree form))
+         (lambda
+          `(lambda (ctx)
+             (let ,(loop for var in free collect
+                         `(,var (let ((cell (assoc ',var ctx)))
+                                  (unless cell
+                                    (error 'unbound-variable :name ',var))
+                                  (cdr cell))))
+               ,body))))
+    (make-compiled-form
+     :fn        (compile nil lambda)
+     :free-vars free
+     :source    form)))
+
 ;;;; Public API
 
 (defgeneric render (input context-alist &optional stream)
@@ -199,32 +285,61 @@
 (defun build-template-lambda (pathname body)
   "Wrap BODY as a `(lambda (ctx &optional stream) …)` ready for
    COMPILE. Helpers from *HELPER-SOURCES* are spliced in as a LABELS
-   block; the body runs under PROGV so context-alist keys bind as
-   dynamic variables. Errors during render are translated to
-   ELP-TEMPLATE-ERROR via the existing handler."
-  (let ((helpers (mapcar (lambda (entry)
-                           (destructuring-bind (name lambda-list &rest body) entry
-                             `(,name ,lambda-list ,@body)))
-                         *helper-sources*)))
+   block; each free variable in BODY is bound *lexically* from the
+   context-alist before BODY runs. Errors during render are
+   translated to ELP-TEMPLATE-ERROR via the existing handler.
+
+   Free vars are determined by walking a candidate form that mirrors
+   the wrapper's lexical scope (multiple-value-bind etc.), so
+   helper-introduced names like PTR / SIZE / FD aren't surfaced
+   as free. The walk runs *before* the LET-prologue is spliced in,
+   so the prologue is always free of itself."
+  (let* ((helpers
+          (mapcar (lambda (entry)
+                    (destructuring-bind (name lambda-list &rest body) entry
+                      `(,name ,lambda-list ,@body)))
+                  *helper-sources*))
+         (handler-clauses
+          `((elp-template-error (lambda (c) (error c)))
+            (error
+              (lambda (c)
+                (multiple-value-bind (line col)
+                    (if *current-template-span*
+                        (byte->line+column ptr size
+                                           (first *current-template-span*))
+                        (values 1 1))
+                  (error 'elp-template-error
+                         :file ,pathname
+                         :line line :column col
+                         :original c))))))
+         ;; Candidate has the wrapper's lexical scope with BODY inline
+         ;; and no LET-prologue. Walking it tells us which symbols
+         ;; are free with respect to the wrapper's own bindings.
+         (candidate
+          `(lambda (ctx &optional (stream *standard-output*))
+             (let ((*standard-output* stream))
+               (labels ,helpers
+                 (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
+                   (unwind-protect (handler-bind ,handler-clauses ,body)
+                     (%mmap-close ptr size fd))))
+               (values))))
+         (free-vars (form-free-vars candidate))
+         (bindings (loop for var in free-vars collect
+                         `(,var (let ((cell (assoc ',var ctx)))
+                                  (unless cell
+                                    (error 'unbound-variable :name ',var))
+                                  (cdr cell)))))
+         ;; See COMPILE-FORM: walking annotates BODY's cons cells in a
+         ;; way that primes SBCL's "unknown variable" warnings. Splice
+         ;; a fresh copy into the final form.
+         (body-fresh (copy-tree body)))
     `(lambda (ctx &optional (stream *standard-output*))
        (let ((*standard-output* stream))
          (labels ,helpers
            (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
              (unwind-protect
-                  (handler-bind
-                      ((elp-template-error (lambda (c) (error c)))
-                       (error
-                         (lambda (c)
-                           (when *current-template-span*
-                             (let ((byte (first *current-template-span*)))
-                               (multiple-value-bind (line col)
-                                   (byte->line+column ptr size byte)
-                                 (error 'elp-template-error
-                                        :file ,pathname
-                                        :line line :column col
-                                        :original c)))))))
-                    (progv (mapcar #'car ctx) (mapcar #'cdr ctx)
-                      ,body))
+                  (handler-bind ,handler-clauses
+                    (let ,bindings ,body-fresh))
                (%mmap-close ptr size fd))))
          (values)))))
 
@@ -235,8 +350,7 @@
    by the template signal an unbound-variable error at the
    reference site, translated to ELP-TEMPLATE-ERROR with the
    correct line/column."
-  (handler-bind ((warning #'muffle-warning))
-    (compile nil (template-code pathname))))
+  (compile nil (template-code pathname)))
 
 (defmethod render ((fn function) context-alist
                    &optional (stream *standard-output*))
