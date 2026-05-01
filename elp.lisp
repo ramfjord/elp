@@ -315,20 +315,47 @@
 ;;;; reader can walk the template directly and produce the body sexp
 ;;;; without an intermediate source-string assembly step.
 ;;;;
-;;;; Modes: :TEXT, :LISP, :EXPR-BODY. <%# comments are skipped during
-;;;; the :TEXT-mode dispatch and produce no characters. The stream
-;;;; tracks (CHARS-READ . MMAP-BYTE) checkpoints in POSITION-MAP, so
-;;;; STREAM-BYTE-POSITION can translate a reader position back to a
-;;;; source byte. RENDER-TO-STREAM consumes this stream via
-;;;; BUILD-RENDER-FORM — there is no separate tokenizer phase.
+;;;; Two layers, separated:
+;;;;
+;;;;   NEXT-UNIT — straight-line state machine. Looks at the byte at
+;;;;   CURSOR, parses the next syntactic unit (text-up-to-tag, plain
+;;;;   <% %>, expr <%= %>, comment <%# %>, or trailing text), and
+;;;;   appends its chunks to PENDING. A chunk is a cons
+;;;;     (STRING . ANCHOR-BYTE-OR-NIL)
+;;;;   where STRING is the characters to feed to the reader and
+;;;;   ANCHOR is the source byte the chunk anchors at (NIL for
+;;;;   synthesized wrappers that have no meaningful source position).
+;;;;   Bodies of <% ... %> and <%= ... %> are materialized into
+;;;;   STRING via one MMAP-SUBSTRING call — the reader sees them as
+;;;;   ordinary characters, and per-char foreign dereference goes
+;;;;   away.
+;;;;
+;;;;   STREAM-READ-CHAR — dumb. Drains CHUNK one character at a time;
+;;;;   when exhausted, pulls the next chunk from PENDING (calling
+;;;;   NEXT-UNIT to refill PENDING when empty). The only state
+;;;;   transition that happens inside read-char is "this chunk is
+;;;;   done, advance to the next" — never the tag-classification
+;;;;   machinery.
+;;;;
+;;;; POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints, pushed
+;;;; whenever a chunk with a non-nil ANCHOR becomes current — those
+;;;; are the chunks whose characters correspond to real source bytes.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr          :initarg :ptr        :reader   ts-ptr)
    (size         :initarg :size       :reader   ts-size)
-   (byte-cursor  :initform 0          :accessor ts-byte-cursor)
-   (mode         :initform :text      :accessor ts-mode)
-   (synth        :initform ""         :accessor ts-synth)
-   (synth-pos    :initform 0          :accessor ts-synth-pos)
+   (cursor       :initform 0          :accessor ts-cursor
+    :documentation "Next mmap byte NEXT-UNIT will look at.")
+   (chunk        :initform nil        :accessor ts-chunk
+    :documentation "Currently-draining chunk, or NIL when one is needed.")
+   (chunk-pos    :initform 0          :accessor ts-chunk-pos
+    :documentation "Index of next character to return from CHUNK.")
+   (pending      :initform nil        :accessor ts-pending
+    :documentation "Queue of (STRING . ANCHOR-OR-NIL) chunks parsed but
+                    not yet drained. ANCHOR is non-nil when entering this
+                    chunk should push a checkpoint at (chars-read . anchor).")
+   (eof          :initform nil        :accessor ts-eof
+    :documentation "T once NEXT-UNIT has reached SIZE.")
    (pushback     :initform nil        :accessor ts-pushback)
    (chars-read   :initform 0          :accessor ts-chars-read)
    (position-map :initform '()        :accessor ts-position-map))
@@ -341,21 +368,18 @@
     POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints, oldest
     last (push to front). A checkpoint says: at the moment the reader
     has consumed READER-POS chars, the next character will correspond
-    to MMAP-BYTE in the source template (for chars that come from the
-    mapping) or to the byte where the surrounding template construct
-    began (for synthesized wrapper chars). STREAM-BYTE-POSITION uses
-    it to translate a reader position back to a source byte."))
+    to MMAP-BYTE in the source template. STREAM-BYTE-POSITION uses it
+    to translate a reader position back to a source byte."))
 
 (defun %byte-at (ptr offset)
   (cffi:mem-aref (cffi:inc-pointer ptr offset) :unsigned-char 0))
 
-(defun ts-emit-text-form (s start end)
-  "Set the synth buffer to a (write-output-range ...) call covering
-   the byte range [START, END)."
-  (setf (ts-synth s)
-        (format nil "(elp::write-output-range elp::*template-ptr* ~D ~D) "
-                start end))
-  (setf (ts-synth-pos s) 0))
+(defun synth-text-form (start end)
+  "Source string for a (write-output-range ...) call covering the byte
+   range [START, END). Trailing space terminates the form so the next
+   chunk's content does not run into the closing paren."
+  (format nil "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+          start end))
 
 (defun ts-whitespace-only-p (s start end)
   "T iff every byte in [START, END) is ASCII whitespace."
@@ -406,18 +430,18 @@
     0))
 
 (defun ts-skip-trailing-newline (s)
-  "Advance S's byte cursor past at most one `\\r\\n` or `\\n`. Used
-   after a close-trim `-%>` to drop the trailing line break."
-  (let* ((cur  (ts-byte-cursor s))
+  "Advance S's CURSOR past at most one `\\r\\n` or `\\n`. Used after a
+   close-trim `-%>` to drop the trailing line break."
+  (let* ((cur  (ts-cursor s))
          (size (ts-size s)))
     (cond
       ((and (<= (+ cur 2) size)
             (= (%byte-at (ts-ptr s) cur) (char-code #\return))
             (= (%byte-at (ts-ptr s) (1+ cur)) (char-code #\newline)))
-       (setf (ts-byte-cursor s) (+ cur 2)))
+       (setf (ts-cursor s) (+ cur 2)))
       ((and (< cur size)
             (= (%byte-at (ts-ptr s) cur) (char-code #\newline)))
-       (setf (ts-byte-cursor s) (1+ cur))))))
+       (setf (ts-cursor s) (1+ cur))))))
 
 (defun ts-push-checkpoint (s anchor &optional (key (ts-chars-read s)))
   "Push (KEY . ANCHOR) onto S's POSITION-MAP unless it is already the
@@ -440,145 +464,149 @@
     (when best
       (+ (cdr best) (- reader-pos (car best))))))
 
+(defun mmap-substring (ptr start end)
+  "Materialize the mmap byte range [START, END) as a Lisp string,
+   one char per byte (Latin-1 mapping). Used to feed the source bytes
+   of a <% ... %> body to the standard reader without per-byte
+   foreign dereferences."
+  (cffi:foreign-string-to-lisp (cffi:inc-pointer ptr start)
+                               :count (- end start)
+                               :encoding :latin-1))
+
+(defun ts-enqueue (s string anchor)
+  "Append (STRING . ANCHOR) to the pending-chunk queue of S."
+  (setf (ts-pending s) (nconc (ts-pending s) (list (cons string anchor)))))
+
+(defun ts-parse-code-tag (s body-start)
+  "Plain `<% code %>`. BODY-START points at the first body byte.
+   Cursor advances past the closing `%>` (and one trailing newline
+   if `-%>`)."
+  (let* ((close (ts-find-close-delim s body-start))
+         (trim  (ts-close-trim-p s close))
+         (size  (ts-size s))
+         (cend  (cond ((null close) size)
+                      (trim         (1- close))
+                      (t            close))))
+    (setf (ts-cursor s) (if close (+ close 2) size))
+    (when trim (ts-skip-trailing-newline s))
+    ;; Body chunk. Always emitted (even if empty) so the checkpoint
+    ;; anchors at BODY-START — preserves reader-pos → source-byte
+    ;; lookups for the body region.
+    (ts-enqueue s (mmap-substring (ts-ptr s) body-start cend) body-start)
+    ;; Trailing space delimits this form from whatever the reader
+    ;; reads next.
+    (ts-enqueue s " " nil)))
+
+(defun ts-parse-expr-tag (s eq-pos)
+  "`<%= expr %>`. EQ-POS points at `=`; body starts at EQ-POS+1.
+   Cursor advances past the closing `%>` (and one trailing newline
+   if `-%>`). Whitespace-only bodies emit no chunks — matching the
+   engine's existing treatment of `<%= %>`."
+  (let* ((cstart (1+ eq-pos))
+         (close  (ts-find-close-delim s cstart))
+         (trim   (ts-close-trim-p s close))
+         (size   (ts-size s))
+         (cend   (cond ((null close) size)
+                       (trim         (1- close))
+                       (t            close))))
+    (setf (ts-cursor s) (if close (+ close 2) size))
+    (when trim (ts-skip-trailing-newline s))
+    (unless (ts-whitespace-only-p s cstart cend)
+      (ts-enqueue s
+                  (format nil
+                          "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                          cstart cend)
+                  nil)
+      (ts-enqueue s (mmap-substring (ts-ptr s) cstart cend) cstart)
+      (ts-enqueue s ")) " nil))))
+
+(defun ts-parse-comment-tag (s body-start)
+  "`<%# comment %>`. Emits no chunks; just advances the cursor past
+   the closing `%>` (and one trailing newline if `-%>`)."
+  (let* ((close (ts-find-close-delim s body-start))
+         (trim  (ts-close-trim-p s close)))
+    (setf (ts-cursor s) (if close (+ close 2) (ts-size s)))
+    (when trim (ts-skip-trailing-newline s))))
+
+(defun ts-parse-tag (s delim-pos)
+  "Cursor sits at `<%` (offset DELIM-POS). Classify the tag by the
+   byte after the open delimiter — skipping one extra byte for `<%-`
+   open-trim — and dispatch to the per-flavor parser."
+  (let* ((size      (ts-size s))
+         (after     (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
+         (next-byte (and (< after size) (%byte-at (ts-ptr s) after))))
+    (cond
+      ((and next-byte (= next-byte (char-code #\=)))
+       (ts-parse-expr-tag s after))
+      ((and next-byte (= next-byte (char-code #\#)))
+       (ts-parse-comment-tag s (1+ after)))
+      (t
+       (ts-parse-code-tag s after)))))
+
+(defun ts-next-unit (s)
+  "Parse one syntactic unit at (TS-CURSOR S) and append its chunks
+   to (TS-PENDING S). A unit is one of: leading text up to the next
+   `<%`, a tag (`<% %>`, `<%= %>`, `<%# %>`), or trailing text to
+   EOF. Some units emit zero chunks (a fully-trimmed text run, a
+   comment, a whitespace-only `<%= %>`); the caller must loop on
+   NEXT-UNIT until PENDING is non-empty or EOF is set."
+  (let* ((ptr  (ts-ptr s))
+         (size (ts-size s))
+         (cur  (ts-cursor s)))
+    (when (>= cur size)
+      (setf (ts-eof s) t)
+      (return-from ts-next-unit))
+    (let* ((rel       (%memmem (cffi:inc-pointer ptr cur) (- size cur) "<%"))
+           (delim-pos (and rel (+ cur rel))))
+      (cond
+        ((null delim-pos)
+         ;; Trailing literal text to EOF.
+         (when (> size cur)
+           (ts-enqueue s (synth-text-form cur size) nil))
+         (setf (ts-cursor s) size))
+        ((> delim-pos cur)
+         ;; Leading text run before a tag. The tag itself is parsed on
+         ;; the next NEXT-UNIT call (cursor lands on `<%`).
+         (let ((emit-end (if (ts-open-trim-p s delim-pos)
+                             (max cur (ts-open-trim-emit-end s delim-pos))
+                             delim-pos)))
+           (when (> emit-end cur)
+             (ts-enqueue s (synth-text-form cur emit-end) nil))
+           (setf (ts-cursor s) delim-pos)))
+        (t
+         (ts-parse-tag s delim-pos))))))
+
 (defmethod sb-gray:stream-read-char ((s template-stream))
+  ;; Pushback always wins. Re-incrementing CHARS-READ is correct
+  ;; because UNREAD-CHAR decremented it.
   (let ((pb (ts-pushback s)))
     (when pb
       (setf (ts-pushback s) nil)
       (incf (ts-chars-read s))
       (return-from sb-gray:stream-read-char pb)))
   (loop
-    ;; Drain pending synthesized characters first.
-    (let ((buf (ts-synth s))
-          (sp  (ts-synth-pos s)))
-      (when (< sp (length buf))
-        (setf (ts-synth-pos s) (1+ sp))
-        (incf (ts-chars-read s))
-        (return-from sb-gray:stream-read-char (char buf sp))))
-    ;; No synth chars: advance state machine.
-    (ecase (ts-mode s)
-      (:text
-       (let* ((cur  (ts-byte-cursor s))
-              (size (ts-size s)))
-         (when (>= cur size)
-           (return-from sb-gray:stream-read-char :eof))
-         (let* ((rem       (- size cur))
-                (rel       (%memmem (cffi:inc-pointer (ts-ptr s) cur)
-                                    rem "<%"))
-                (delim-pos (and rel (+ cur rel))))
-           (cond
-             ((and delim-pos (> delim-pos cur))
-              ;; Emit a write-output-range form for [cur, delim-pos).
-              ;; If the upcoming tag is open-trim (`<%-`), shorten the
-              ;; emit's end back over [\ \t]+ to the prior newline (or
-              ;; start of file) so leading indentation is dropped.
-              ;; Cursor stops AT the delimiter; the next read will
-              ;; re-enter :TEXT mode and dispatch by the byte after <%.
-              ;; No checkpoint here: the wrapper chars are synth, not
-              ;; mmap content, and the standard reader doesn't error
-              ;; on its own valid output. POSITION-MAP entries are
-              ;; only useful for queries that fall inside user code.
-              (let ((emit-end (if (ts-open-trim-p s delim-pos)
-                                  (max cur (ts-open-trim-emit-end s delim-pos))
-                                  delim-pos)))
-                (when (> emit-end cur)
-                  (ts-emit-text-form s cur emit-end))
-                (setf (ts-byte-cursor s) delim-pos)))
-             ((null delim-pos)
-              ;; Trailing literal text up to EOF.
-              (cond ((> size cur)
-                     (ts-emit-text-form s cur size)
-                     (setf (ts-byte-cursor s) size))
-                    (t (return-from sb-gray:stream-read-char :eof))))
-             (t
-              ;; Cursor sits at <%. Classify by the byte after the
-              ;; opening delimiter and dispatch. For `<%-`, skip the
-              ;; trim marker so the next-byte check sees `=`, `#`, or
-              ;; the first code byte exactly as in the non-trim case.
-              (let* ((after (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
-                     (next-byte (and (< after size)
-                                     (%byte-at (ts-ptr s) after))))
-                (cond
-                  ;; <%= expression block
-                  ((and next-byte (= next-byte (char-code #\=)))
-                   (let* ((cstart (1+ after))
-                          (close  (ts-find-close-delim s cstart))
-                          (trim   (ts-close-trim-p s close))
-                          (cend   (cond ((null close) size)
-                                        (trim (1- close))
-                                        (t close))))
-                     (cond
-                       ((ts-whitespace-only-p s cstart cend)
-                        ;; Empty/whitespace-only expr: skip without
-                        ;; emitting anything, matching the existing
-                        ;; engine's treatment of <%= %>.
-                        (setf (ts-byte-cursor s)
-                              (if close (+ close 2) size))
-                        (when trim (ts-skip-trailing-newline s)))
-                       (t
-                        ;; Checkpoint anchored at the first body byte
-                        ;; (CSTART), keyed at the chars-read value
-                        ;; the reader will reach AFTER draining the
-                        ;; let-prefix synth. The prefix itself is
-                        ;; valid Lisp the reader will not error on.
-                        (let ((prefix
-                                (format nil
-                                        "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                                        cstart cend)))
-                          (ts-push-checkpoint s cstart
-                                              (+ (ts-chars-read s)
-                                                 (length prefix)))
-                          (setf (ts-synth s) prefix)
-                          (setf (ts-synth-pos s) 0)
-                          (setf (ts-byte-cursor s) cstart)
-                          (setf (ts-mode s) :expr-body))))))
-                  ;; <%# comment block — skip entirely.
-                  ((and next-byte (= next-byte (char-code #\#)))
-                   (let* ((cstart (1+ after))
-                          (close  (ts-find-close-delim s cstart))
-                          (trim   (ts-close-trim-p s close)))
-                     (setf (ts-byte-cursor s)
-                           (if close (+ close 2) size))
-                     (when trim (ts-skip-trailing-newline s))))
-                  ;; Plain <% code block.
-                  (t
-                   (ts-push-checkpoint s after)
-                   (setf (ts-byte-cursor s) after)
-                   (setf (ts-mode s) :lisp)))))))))
-      ((:lisp :expr-body)
-       (let* ((cur  (ts-byte-cursor s))
-              (size (ts-size s)))
-         (cond
-           ((>= cur size)
-            ;; Unterminated <% block. Returning :EOF from inside a
-            ;; reader-driven read causes the standard reader to signal
-            ;; END-OF-FILE, which BUILD-RENDER-FORM catches and routes
-            ;; through TRANSLATE-READ-ERROR.
-            (return-from sb-gray:stream-read-char :eof))
-           ((and (<= (+ cur 3) size)
-                 (= (%byte-at (ts-ptr s) cur)       (char-code #\-))
-                 (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\%))
-                 (= (%byte-at (ts-ptr s) (+ cur 2)) (char-code #\>)))
-            ;; Close-trim `-%>`: drop the `-`, consume `%>`, and skip
-            ;; one trailing newline before re-entering :TEXT.
-            (let ((suffix (if (eq (ts-mode s) :expr-body) ")) " " ")))
-              (setf (ts-byte-cursor s) (+ cur 3))
-              (setf (ts-mode s) :text)
-              (setf (ts-synth s) suffix)
-              (setf (ts-synth-pos s) 0)
-              (ts-skip-trailing-newline s)))
-           ((and (<= (+ cur 2) size)
-                 (= (%byte-at (ts-ptr s) cur)       (char-code #\%))
-                 (= (%byte-at (ts-ptr s) (1+ cur))  (char-code #\>)))
-            (let ((suffix (if (eq (ts-mode s) :expr-body) ")) " " ")))
-              (setf (ts-byte-cursor s) (+ cur 2))
-              (setf (ts-mode s) :text)
-              (setf (ts-synth s) suffix)
-              (setf (ts-synth-pos s) 0)))
-           (t
-            (let ((b (%byte-at (ts-ptr s) cur)))
-              (setf (ts-byte-cursor s) (1+ cur))
-              (incf (ts-chars-read s))
-              (return-from sb-gray:stream-read-char (code-char b))))))))))
+    ;; Need a current chunk? Pop one from PENDING; refill via NEXT-UNIT
+    ;; until PENDING has something or we hit EOF.
+    (when (null (ts-chunk s))
+      (loop while (and (null (ts-pending s)) (not (ts-eof s)))
+            do (ts-next-unit s))
+      (when (null (ts-pending s))
+        (return-from sb-gray:stream-read-char :eof))
+      (let ((next (pop (ts-pending s))))
+        (setf (ts-chunk s)     (car next)
+              (ts-chunk-pos s) 0)
+        (when (cdr next)
+          (ts-push-checkpoint s (cdr next)))))
+    ;; Drain one char, or mark chunk exhausted and loop.
+    (let ((str (ts-chunk s))
+          (pos (ts-chunk-pos s)))
+      (cond
+        ((>= pos (length str))
+         (setf (ts-chunk s) nil))
+        (t
+         (incf (ts-chunk-pos s))
+         (incf (ts-chars-read s))
+         (return-from sb-gray:stream-read-char (char str pos)))))))
 
 (defmethod sb-gray:stream-unread-char ((s template-stream) char)
   (setf (ts-pushback s) char)
