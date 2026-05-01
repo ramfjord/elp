@@ -477,71 +477,48 @@
   "Append (STRING . ANCHOR) to the pending-chunk queue of S."
   (setf (ts-pending s) (nconc (ts-pending s) (list (cons string anchor)))))
 
-(defun ts-parse-code-tag (s body-start)
-  "Plain `<% code %>`. BODY-START points at the first body byte.
-   Cursor advances past the closing `%>` (and one trailing newline
-   if `-%>`)."
-  (let* ((close (ts-find-close-delim s body-start))
-         (trim  (ts-close-trim-p s close))
-         (size  (ts-size s))
-         (cend  (cond ((null close) size)
-                      (trim         (1- close))
-                      (t            close))))
-    (setf (ts-cursor s) (if close (+ close 2) size))
-    (when trim (ts-skip-trailing-newline s))
-    ;; Body chunk. Always emitted (even if empty) so the checkpoint
-    ;; anchors at BODY-START — preserves reader-pos → source-byte
-    ;; lookups for the body region.
-    (ts-enqueue s (mmap-substring (ts-ptr s) body-start cend) body-start)
-    ;; Trailing space delimits this form from whatever the reader
-    ;; reads next.
-    (ts-enqueue s " " nil)))
-
-(defun ts-parse-expr-tag (s eq-pos)
-  "`<%= expr %>`. EQ-POS points at `=`; body starts at EQ-POS+1.
-   Cursor advances past the closing `%>` (and one trailing newline
-   if `-%>`). Whitespace-only bodies emit no chunks — matching the
-   engine's existing treatment of `<%= %>`."
-  (let* ((cstart (1+ eq-pos))
-         (close  (ts-find-close-delim s cstart))
-         (trim   (ts-close-trim-p s close))
-         (size   (ts-size s))
-         (cend   (cond ((null close) size)
-                       (trim         (1- close))
-                       (t            close))))
-    (setf (ts-cursor s) (if close (+ close 2) size))
-    (when trim (ts-skip-trailing-newline s))
-    (unless (ts-whitespace-only-p s cstart cend)
-      (ts-enqueue s
-                  (format nil
-                          "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                          cstart cend)
-                  nil)
-      (ts-enqueue s (mmap-substring (ts-ptr s) cstart cend) cstart)
-      (ts-enqueue s ")) " nil))))
-
-(defun ts-parse-comment-tag (s body-start)
-  "`<%# comment %>`. Emits no chunks; just advances the cursor past
-   the closing `%>` (and one trailing newline if `-%>`)."
-  (let* ((close (ts-find-close-delim s body-start))
-         (trim  (ts-close-trim-p s close)))
-    (setf (ts-cursor s) (if close (+ close 2) (ts-size s)))
-    (when trim (ts-skip-trailing-newline s))))
-
 (defun ts-parse-tag (s delim-pos)
-  "Cursor sits at `<%` (offset DELIM-POS). Classify the tag by the
-   byte after the open delimiter — skipping one extra byte for `<%-`
-   open-trim — and dispatch to the per-flavor parser."
-  (let* ((size      (ts-size s))
-         (after     (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
-         (next-byte (and (< after size) (%byte-at (ts-ptr s) after))))
-    (cond
-      ((and next-byte (= next-byte (char-code #\=)))
-       (ts-parse-expr-tag s after))
-      ((and next-byte (= next-byte (char-code #\#)))
-       (ts-parse-comment-tag s (1+ after)))
-      (t
-       (ts-parse-code-tag s after)))))
+  "Parse the tag whose `<%` opens at DELIM-POS. Find the closing `%>`
+   once, classify by the first body byte (`=` expr / `#` comment /
+   anything else plain code), and enqueue the per-flavor wrapping
+   chunks. Cursor advances past the closing `%>` and (for `-%>`) one
+   trailing newline."
+  (let* ((size       (ts-size s))
+         (after-open (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
+         (close      (ts-find-close-delim s after-open))
+         (close-trim (ts-close-trim-p s close))
+         (body-end   (cond ((null close)  size)
+                           (close-trim    (1- close))
+                           (t             close)))
+         (first      (and (< after-open body-end)
+                          (%byte-at (ts-ptr s) after-open)))
+         (flavor     (cond ((eql first (char-code #\=)) :expr)
+                           ((eql first (char-code #\#)) :comment)
+                           (t                           :code)))
+         (body-start (if (eq flavor :code) after-open (1+ after-open))))
+    (setf (ts-cursor s) (if close (+ close 2) size))
+    (when close-trim (ts-skip-trailing-newline s))
+    (ecase flavor
+      (:comment)                ; nothing to enqueue
+      (:code
+       ;; Body chunk always emitted (even if empty) so the checkpoint
+       ;; anchors at BODY-START. Trailing space delimits the form
+       ;; from whatever the reader reads next.
+       (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
+                   body-start)
+       (ts-enqueue s " " nil))
+      (:expr
+       ;; Whitespace-only <%= %> emits no chunks — matches the
+       ;; engine's existing treatment.
+       (unless (ts-whitespace-only-p s body-start body-end)
+         (ts-enqueue s
+                     (format nil
+                             "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                             body-start body-end)
+                     nil)
+         (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
+                     body-start)
+         (ts-enqueue s ")) " nil))))))
 
 (defun ts-next-unit (s)
   "Parse one syntactic unit at (TS-CURSOR S) and append its chunks
