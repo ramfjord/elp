@@ -6,7 +6,7 @@
 ;;;;   <%# comment %>          - comments (removed from output)
 
 (defpackage :elp
-  (:use :cl)
+  (:use :cl :alexandria)
   (:export
    ;; Primary public API
    :render
@@ -442,6 +442,38 @@
             (= (%byte-at (ts-ptr s) cur) (char-code #\newline)))
        (setf (ts-cursor s) (1+ cur))))))
 
+(defun ts-find-code-start (s)
+  "Advance cursor to just past the next opening delimiter (`<%` or
+   `<%-`) and return the byte position where the preceding literal
+   text run ends. Open-trim (`<%-`) pulls the end back over leading
+   whitespace and the preceding newline, so a blank prefix line is
+   dropped from the literal run. Returns :EOF when no further `<%`
+   exists; in that case cursor sits at SIZE."
+  (let ((delim-start (ts-advance-cursor s "<%")))
+    (cond
+      ((null delim-start) :eof)
+      (t
+       (let ((open-trim (and (< (ts-cursor s) (ts-size s))
+                             (= (%byte-at (ts-ptr s) (ts-cursor s))
+                                (char-code #\-)))))
+         (when open-trim (incf (ts-cursor s)))
+         (if open-trim
+             (ts-open-trim-emit-end s delim-start)
+             delim-start))))))
+
+(defun ts-find-code-end (s)
+  "Advance cursor past the closing delimiter (`%>`, plus one trailing
+   newline if `-%>`) and return the byte position where the tag body
+   ends. If no closing `%>` exists, cursor goes to SIZE and SIZE is
+   returned."
+  (let ((close (ts-advance-cursor s "%>")))
+    (cond
+      ((null close) (ts-size s))
+      ((ts-close-trim-p s close)
+       (ts-skip-trailing-newline s)
+       (1- close))
+      (t close))))
+
 (defun ts-push-checkpoint (s anchor &optional (key (ts-chars-read s)))
   "Push (KEY . ANCHOR) onto S's POSITION-MAP unless it is already the
    most recent entry. Checkpoints are pushed every time the source of
@@ -452,16 +484,14 @@
 
 (defun stream-byte-position (s &optional (reader-pos (ts-chars-read s)))
   "Map READER-POS (defaulting to S's current CHARS-READ) to the
-   corresponding mmap byte. Finds the largest checkpoint with
-   key <= READER-POS and adds (READER-POS - key) to its anchor.
+   corresponding mmap byte. POSITION-MAP is pushed newest-first with
+   monotonically increasing keys, so it is sorted descending — the
+   first entry with key <= READER-POS is the largest such entry.
    Returns NIL when READER-POS precedes every checkpoint."
-  (let ((best nil))
-    (dolist (cp (ts-position-map s))
-      (when (<= (car cp) reader-pos)
-        (when (or (null best) (> (car cp) (car best)))
-          (setf best cp))))
-    (when best
-      (+ (cdr best) (- reader-pos (car best))))))
+  (when-let ((checkpoint (find-if (lambda (c) (<= (car c) reader-pos))
+                                  (ts-position-map s))))
+    (destructuring-bind (cp-reader-pos . cp-mmap-byte) checkpoint
+      (+ cp-mmap-byte (- reader-pos cp-reader-pos)))))
 
 (defun mmap-substring (ptr start end)
   "Materialize the mmap byte range [START, END) as a Lisp string,
@@ -492,13 +522,8 @@
                            (t                           :code)))
          (body-start (if (eq flavor :code) after-open (1+ after-open))))
     (setf (ts-cursor s) body-start)
-    (let* ((close      (ts-advance-cursor s "%>"))
-           (close-trim (ts-close-trim-p s close))
-           (body-end   (cond ((null close) size)
-                             (close-trim   (1- close))
-                             (t            close))))
+    (let ((body-end (ts-find-code-end s)))
       (setf (ts-inside-code s) nil)
-      (when close-trim (ts-skip-trailing-newline s))
       (ecase flavor
         (:comment nil)
         (:code
@@ -532,40 +557,28 @@
       (return :eof))
     (cond
       ((ts-inside-code s)
-       (let ((c (ts-parse-tag-chunk s)))
-         (when c (return c))))
+       (when-let ((c (ts-parse-tag-chunk s)))
+         (return c)))
       (t
-       (let* ((text-start  (ts-cursor s))
-              (delim-start (ts-advance-cursor s "<%")))
+       (let* ((text-start (ts-cursor s))
+              (text-end   (ts-find-code-start s)))
          (cond
-           ((null delim-start)
-            ;; No more tags; trailing literal text to EOF (cursor
-            ;; was already advanced to SIZE by ts-advance-cursor).
+           ((eq text-end :eof)
+            ;; No more tags; trailing literal text to EOF.
             (return (cons (synth-text-form text-start (ts-size s)) nil)))
            (t
-            ;; Cursor sits past `<%`. Detect open-trim by peeking at
-            ;; the byte at cursor; consume the `-` if present.
             (setf (ts-inside-code s) t)
-            (let ((open-trim (and (< (ts-cursor s) (ts-size s))
-                                  (= (%byte-at (ts-ptr s) (ts-cursor s))
-                                     (char-code #\-)))))
-              (when open-trim (incf (ts-cursor s)))
-              (let ((text-end (if open-trim
-                                  (max text-start
-                                       (ts-open-trim-emit-end s delim-start))
-                                  delim-start)))
-                (when (> text-end text-start)
-                  (return (cons (synth-text-form text-start text-end)
-                                nil))))))))))))
+            (when (> text-end text-start)
+              (return (cons (synth-text-form text-start text-end)
+                            nil))))))))))
 
 (defmethod sb-gray:stream-read-char ((s template-stream))
   ;; Pushback always wins. Re-incrementing CHARS-READ is correct
   ;; because UNREAD-CHAR decremented it.
-  (let ((pb (ts-pushback s)))
-    (when pb
-      (setf (ts-pushback s) nil)
-      (incf (ts-chars-read s))
-      (return-from sb-gray:stream-read-char pb)))
+  (when-let ((pb (ts-pushback s)))
+    (setf (ts-pushback s) nil)
+    (incf (ts-chars-read s))
+    (return-from sb-gray:stream-read-char pb))
   (loop
     (when (null (ts-chunk s))
       (let ((next (ts-next-chunk s)))
@@ -573,10 +586,9 @@
           (return-from sb-gray:stream-read-char :eof))
         (setf (ts-chunk s)     (car next)
               (ts-chunk-pos s) 0)
-        (let ((anchor (cdr next)))
-          (when anchor
-            (ts-push-checkpoint s (cdr anchor)
-                                (+ (ts-chars-read s) (car anchor)))))))
+        (when-let ((anchor (cdr next)))
+          (ts-push-checkpoint s (cdr anchor)
+                              (+ (ts-chars-read s) (car anchor))))))
     (let ((str (ts-chunk s))
           (pos (ts-chunk-pos s)))
       (cond
