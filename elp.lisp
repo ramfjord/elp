@@ -286,7 +286,8 @@
    Reader errors are translated into ELP-TEMPLATE-ERROR via the
    stream's POSITION-MAP — no intermediate body-string assembly,
    no checkpoints list reconstruction."
-  (let* ((stream (make-instance 'template-stream :ptr ptr :size size))
+  (let* ((stream (make-instance 'template-stream
+                                 :ptr ptr :size size :pathname pathname))
          (forms  '()))
     (handler-case
         (loop for form = (read stream nil :eof)
@@ -344,6 +345,9 @@
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr          :initarg :ptr        :reader   ts-ptr)
    (size         :initarg :size       :reader   ts-size)
+   (pathname     :initarg :pathname   :initform nil :reader ts-pathname
+    :documentation "Source pathname, used to attach :file when the
+                    parser raises ELP-TEMPLATE-ERROR.")
    (cursor       :initform 0          :accessor ts-cursor
     :documentation "Next mmap byte NEXT-UNIT will look at.")
    (chunk        :initform nil        :accessor ts-chunk
@@ -508,17 +512,25 @@
                    body-start)
        (ts-enqueue s " " nil))
       (:expr
-       ;; Whitespace-only <%= %> emits no chunks — matches the
-       ;; engine's existing treatment.
-       (unless (ts-whitespace-only-p s body-start body-end)
-         (ts-enqueue s
-                     (format nil
-                             "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                             body-start body-end)
-                     nil)
-         (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
-                     body-start)
-         (ts-enqueue s ")) " nil))))))
+       (when (ts-whitespace-only-p s body-start body-end)
+         (multiple-value-bind (line col)
+             (byte->line+column (ts-ptr s) (ts-size s) body-start)
+           (error 'elp-template-error
+                  :file     (ts-pathname s)
+                  :line     line
+                  :column   col
+                  :original (make-condition
+                             'simple-error
+                             :format-control
+                             "<%= %> requires a non-empty expression."))))
+       (ts-enqueue s
+                   (format nil
+                           "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                           body-start body-end)
+                   nil)
+       (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
+                   body-start)
+       (ts-enqueue s ")) " nil)))))
 
 (defun ts-next-unit (s)
   "Parse one syntactic unit at (TS-CURSOR S) and append its chunks

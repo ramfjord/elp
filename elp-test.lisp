@@ -79,8 +79,15 @@
 ;;;; ========================
 
 (test empty-expression
-  "<%= %> with whitespace-only body is skipped (no output, no error)."
-  (expect-render "Value: <%=   %>after" "Value: after"))
+  "<%= %> with a whitespace-only body raises ELP-TEMPLATE-ERROR
+   pointing at the empty body — silent-skip would otherwise produce a
+   render-time `format` error with no obvious connection to the empty
+   tag, so we surface it at parse time with a clear message."
+  (let ((err (render-error "Value: <%=   %>after")))
+    (is (typep err 'elp:elp-template-error))
+    (is (= 1 (elp:elp-template-error-line err)))
+    ;; "Value: <%=" — body starts at byte 10 = column 11.
+    (is (= 11 (elp:elp-template-error-column err)))))
 
 (test consecutive-delimiters
   "Multiple delimiters back-to-back"
@@ -272,10 +279,10 @@
       (format nil "~%after")))
 
 (test close-trim-on-empty-expr
-  "`<%= -%>\\n` (whitespace-only body with trim) skips block AND newline."
-  (expect-render
-      (format nil "head<%=  -%>~%tail")
-      "headtail"))
+  "`<%= -%>\\n` (whitespace-only body, even with close-trim) is still
+   an empty expression — same parse-time error as the bare case."
+  (let ((err (render-error (format nil "head<%=  -%>~%tail"))))
+    (is (typep err 'elp:elp-template-error))))
 
 ;;;; Test Group 8d: Open-trim (`<%-`)
 ;;;; =================================
