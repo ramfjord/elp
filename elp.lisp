@@ -317,45 +317,42 @@
 ;;;;
 ;;;; Two layers, separated:
 ;;;;
-;;;;   NEXT-UNIT — straight-line state machine. Looks at the byte at
-;;;;   CURSOR, parses the next syntactic unit (text-up-to-tag, plain
-;;;;   <% %>, expr <%= %>, comment <%# %>, or trailing text), and
-;;;;   appends its chunks to PENDING. A chunk is a cons
-;;;;     (STRING . ANCHOR-BYTE-OR-NIL)
-;;;;   where STRING is the characters to feed to the reader and
-;;;;   ANCHOR is the source byte the chunk anchors at (NIL for
-;;;;   synthesized wrappers that have no meaningful source position).
-;;;;   Bodies of <% ... %> and <%= ... %> are materialized into
-;;;;   STRING via one MMAP-SUBSTRING call — the reader sees them as
-;;;;   ordinary characters, and per-char foreign dereference goes
-;;;;   away.
+;;;;   NEXT-CHUNK — straight-line state machine. Looks at the byte at
+;;;;   CURSOR and produces *one* chunk for the next syntactic unit
+;;;;   (text-up-to-tag, plain <% %>, expr <%= %>, comment <%# %>, or
+;;;;   trailing text), or :EOF when CURSOR has reached SIZE. A chunk
+;;;;   is a cons
+;;;;     (STRING . ANCHOR-OR-NIL)
+;;;;   where STRING is the characters to feed to the reader. ANCHOR
+;;;;   is NIL for synthesized wrappers (no meaningful source byte);
+;;;;   otherwise it is a cons (CHAR-OFFSET . SOURCE-BYTE) saying
+;;;;   "when the reader reaches CHAR-OFFSET into this chunk's string,
+;;;;   the corresponding source byte is SOURCE-BYTE." Bodies of
+;;;;   <% ... %> and <%= ... %> are materialized once (MMAP-SUBSTRING)
+;;;;   and concatenated with their wrappers into the chunk's STRING,
+;;;;   so each tag yields exactly one chunk. Comments and
+;;;;   whitespace-only <%= %> tags yield no chunk; NEXT-CHUNK loops
+;;;;   internally to skip over them.
 ;;;;
 ;;;;   STREAM-READ-CHAR — dumb. Drains CHUNK one character at a time;
-;;;;   when exhausted, pulls the next chunk from PENDING (calling
-;;;;   NEXT-UNIT to refill PENDING when empty). The only state
-;;;;   transition that happens inside read-char is "this chunk is
-;;;;   done, advance to the next" — never the tag-classification
-;;;;   machinery.
+;;;;   when exhausted, calls NEXT-CHUNK for the next one. The only
+;;;;   state transition inside read-char is "this chunk is done,
+;;;;   ask NEXT-CHUNK for another."
 ;;;;
-;;;; POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints, pushed
-;;;; whenever a chunk with a non-nil ANCHOR becomes current — those
-;;;; are the chunks whose characters correspond to real source bytes.
+;;;; POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints. When a
+;;;; chunk with a non-nil ANCHOR becomes current, the checkpoint is
+;;;; pushed at key=chars-read+CHAR-OFFSET, anchor=SOURCE-BYTE — the
+;;;; reader-pos that *will* land on the anchored region.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr          :initarg :ptr        :reader   ts-ptr)
    (size         :initarg :size       :reader   ts-size)
    (cursor       :initform 0          :accessor ts-cursor
-    :documentation "Next mmap byte NEXT-UNIT will look at.")
+    :documentation "Next mmap byte NEXT-CHUNK will look at.")
    (chunk        :initform nil        :accessor ts-chunk
-    :documentation "Currently-draining chunk, or NIL when one is needed.")
+    :documentation "Currently-draining chunk's string, or NIL when one is needed.")
    (chunk-pos    :initform 0          :accessor ts-chunk-pos
     :documentation "Index of next character to return from CHUNK.")
-   (pending      :initform nil        :accessor ts-pending
-    :documentation "Queue of (STRING . ANCHOR-OR-NIL) chunks parsed but
-                    not yet drained. ANCHOR is non-nil when entering this
-                    chunk should push a checkpoint at (chars-read . anchor).")
-   (eof          :initform nil        :accessor ts-eof
-    :documentation "T once NEXT-UNIT has reached SIZE.")
    (pushback     :initform nil        :accessor ts-pushback)
    (chars-read   :initform 0          :accessor ts-chars-read)
    (position-map :initform '()        :accessor ts-position-map))
@@ -468,16 +465,17 @@
                                :count (- end start)
                                :encoding :latin-1))
 
-(defun ts-enqueue (s string anchor)
-  "Append (STRING . ANCHOR) to the pending-chunk queue of S."
-  (setf (ts-pending s) (nconc (ts-pending s) (list (cons string anchor)))))
-
-(defun ts-parse-tag (s delim-pos)
+(defun ts-parse-tag-chunk (s delim-pos)
   "Parse the tag whose `<%` opens at DELIM-POS. Find the closing `%>`
    once, classify by the first body byte (`=` expr / `#` comment /
-   anything else plain code), and enqueue the per-flavor wrapping
-   chunks. Cursor advances past the closing `%>` and (for `-%>`) one
-   trailing newline."
+   anything else plain code), advance the cursor past `%>` (and one
+   trailing newline if `-%>`), and return the chunk for the tag — or
+   NIL for tags that emit nothing (comment, whitespace-only expr).
+
+   The chunk is (STRING . ANCHOR), where ANCHOR is (CHAR-OFFSET .
+   SOURCE-BYTE) for tags whose STRING contains source bytes (code,
+   expr) and NIL otherwise. CHAR-OFFSET is where the source bytes
+   start within STRING (0 for code, prefix-length for expr)."
   (let* ((size       (ts-size s))
          (after-open (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
          (close      (ts-find-close-delim s after-open))
@@ -494,60 +492,57 @@
     (setf (ts-cursor s) (if close (+ close 2) size))
     (when close-trim (ts-skip-trailing-newline s))
     (ecase flavor
-      (:comment)                ; nothing to enqueue
+      (:comment nil)
       (:code
-       ;; Body chunk always emitted (even if empty) so the checkpoint
-       ;; anchors at BODY-START. Trailing space delimits the form
-       ;; from whatever the reader reads next.
-       (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
-                   body-start)
-       (ts-enqueue s " " nil))
+       ;; Body bytes followed by a delimiting space. Anchor at offset
+       ;; 0 — the first character of STRING is BODY-START in source.
+       (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
+         (cons (concatenate 'string body " ")
+               (cons 0 body-start))))
       (:expr
-       ;; Whitespace-only <%= %> emits no chunks — silent-skip the
-       ;; tag rather than letting it propagate to a runtime FORMAT
-       ;; error with no obvious link to the empty body.
+       ;; Whitespace-only <%= %> silently emits nothing — surfacing it
+       ;; would only produce a render-time FORMAT error with no
+       ;; obvious link back to the empty body.
        (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
          (unless (cl-ppcre:scan *blank-rx* body)
-           (ts-enqueue s
-                       (format nil
-                               "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                               body-start body-end)
-                       nil)
-           (ts-enqueue s body body-start)
-           (ts-enqueue s ")) " nil)))))))
+           (let ((prefix (format nil
+                                 "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                 body-start body-end)))
+             (cons (concatenate 'string prefix body ")) ")
+                   (cons (length prefix) body-start)))))))))
 
-(defun ts-next-unit (s)
-  "Parse one syntactic unit at (TS-CURSOR S) and append its chunks
-   to (TS-PENDING S). A unit is one of: leading text up to the next
-   `<%`, a tag (`<% %>`, `<%= %>`, `<%# %>`), or trailing text to
-   EOF. Some units emit zero chunks (a fully-trimmed text run, a
-   comment, a whitespace-only `<%= %>`); the caller must loop on
-   NEXT-UNIT until PENDING is non-empty or EOF is set."
-  (let* ((ptr  (ts-ptr s))
-         (size (ts-size s))
-         (cur  (ts-cursor s)))
-    (when (>= cur size)
-      (setf (ts-eof s) t)
-      (return-from ts-next-unit))
-    (let* ((rel       (%memmem (cffi:inc-pointer ptr cur) (- size cur) "<%"))
+(defun ts-next-chunk (s)
+  "Parse the next syntactic unit at (TS-CURSOR S) and return its
+   chunk, or :EOF when CURSOR has reached SIZE. Loops internally to
+   skip syntactic units that emit no chunk (comments, whitespace-only
+   <%= %>, fully-trimmed text runs)."
+  (loop
+    (when (>= (ts-cursor s) (ts-size s))
+      (return :eof))
+    (let* ((cur       (ts-cursor s))
+           (rel       (%memmem (cffi:inc-pointer (ts-ptr s) cur)
+                               (- (ts-size s) cur) "<%"))
            (delim-pos (and rel (+ cur rel))))
       (cond
         ((null delim-pos)
-         ;; Trailing literal text to EOF.
-         (when (> size cur)
-           (ts-enqueue s (synth-text-form cur size) nil))
-         (setf (ts-cursor s) size))
+         ;; Trailing literal text up to EOF.
+         (setf (ts-cursor s) (ts-size s))
+         (return (cons (synth-text-form cur (ts-size s)) nil)))
         ((> delim-pos cur)
-         ;; Leading text run before a tag. The tag itself is parsed on
-         ;; the next NEXT-UNIT call (cursor lands on `<%`).
+         ;; Leading text run; the tag itself is parsed on the next
+         ;; call. If open-trim eats the whole run, emit nothing here
+         ;; and loop to parse the tag.
          (let ((emit-end (if (ts-open-trim-p s delim-pos)
                              (max cur (ts-open-trim-emit-end s delim-pos))
                              delim-pos)))
+           (setf (ts-cursor s) delim-pos)
            (when (> emit-end cur)
-             (ts-enqueue s (synth-text-form cur emit-end) nil))
-           (setf (ts-cursor s) delim-pos)))
+             (return (cons (synth-text-form cur emit-end) nil)))))
         (t
-         (ts-parse-tag s delim-pos))))))
+         ;; Cursor at `<%`. Parse the tag; if it produces a chunk,
+         ;; return it, otherwise loop for the next unit.
+         (let ((c (ts-parse-tag-chunk s delim-pos)))
+           (when c (return c))))))))
 
 (defmethod sb-gray:stream-read-char ((s template-stream))
   ;; Pushback always wins. Re-incrementing CHARS-READ is correct
@@ -558,19 +553,16 @@
       (incf (ts-chars-read s))
       (return-from sb-gray:stream-read-char pb)))
   (loop
-    ;; Need a current chunk? Pop one from PENDING; refill via NEXT-UNIT
-    ;; until PENDING has something or we hit EOF.
     (when (null (ts-chunk s))
-      (loop while (and (null (ts-pending s)) (not (ts-eof s)))
-            do (ts-next-unit s))
-      (when (null (ts-pending s))
-        (return-from sb-gray:stream-read-char :eof))
-      (let ((next (pop (ts-pending s))))
+      (let ((next (ts-next-chunk s)))
+        (when (eq next :eof)
+          (return-from sb-gray:stream-read-char :eof))
         (setf (ts-chunk s)     (car next)
               (ts-chunk-pos s) 0)
-        (when (cdr next)
-          (ts-push-checkpoint s (cdr next)))))
-    ;; Drain one char, or mark chunk exhausted and loop.
+        (let ((anchor (cdr next)))
+          (when anchor
+            (ts-push-checkpoint s (cdr anchor)
+                                (+ (ts-chars-read s) (car anchor)))))))
     (let ((str (ts-chunk s))
           (pos (ts-chunk-pos s)))
       (cond
