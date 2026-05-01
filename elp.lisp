@@ -57,13 +57,6 @@
   "When non-nil, a list (file-byte-start file-byte-end) identifying the
    byte range in the source template currently being evaluated.")
 
-(defvar *template-ptr* nil
-  "When the file-path renderer is active, bound to the foreign pointer
-   for the mmap'd template. The generated render sexp references this
-   symbol when emitting WRITE-OUTPUT-RANGE calls, so the sexp itself
-   stays free of free lexical variables and can be EVAL'd in the null
-   lexical environment.")
-
 ;;;; Runtime helpers
 ;;;;
 ;;;; Functions tagged with DEFINE-HELPER are installed both as top-level
@@ -217,23 +210,22 @@
        (let ((*standard-output* stream))
          (labels ,helpers
            (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-             (let ((*template-ptr* ptr))
-               (unwind-protect
-                    (handler-bind
-                        ((elp-template-error (lambda (c) (error c)))
-                         (error
-                           (lambda (c)
-                             (when *current-template-span*
-                               (let ((byte (first *current-template-span*)))
-                                 (multiple-value-bind (line col)
-                                     (byte->line+column ptr size byte)
-                                   (error 'elp-template-error
-                                          :file ,pathname
-                                          :line line :column col
-                                          :original c)))))))
-                      (progv (mapcar #'car ctx) (mapcar #'cdr ctx)
-                        ,body))
-                 (%mmap-close ptr size fd)))))
+             (unwind-protect
+                  (handler-bind
+                      ((elp-template-error (lambda (c) (error c)))
+                       (error
+                         (lambda (c)
+                           (when *current-template-span*
+                             (let ((byte (first *current-template-span*)))
+                               (multiple-value-bind (line col)
+                                   (byte->line+column ptr size byte)
+                                 (error 'elp-template-error
+                                        :file ,pathname
+                                        :line line :column col
+                                        :original c)))))))
+                    (progv (mapcar #'car ctx) (mapcar #'cdr ctx)
+                      ,body))
+               (%mmap-close ptr size fd))))
          (values)))))
 
 (defun compile-template (pathname)
@@ -378,7 +370,7 @@
   "Source string for a (write-output-range ...) call covering the byte
    range [START, END). Trailing space terminates the form so the next
    chunk's content does not run into the closing paren."
-  (format nil "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+  (format nil "(elp::write-output-range elp::ptr ~D ~D) "
           start end))
 
 (defparameter *blank-rx* (cl-ppcre:create-scanner "^\\s*$")

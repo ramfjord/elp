@@ -362,7 +362,7 @@
 (test stream-read-on-text-only
   "(READ stream) on a text-only template returns the wrapper form."
   (let ((form (stream-read-form "Hi")))
-    (is (equal form '(elp::write-output-range elp::*template-ptr* 0 2)))))
+    (is (equal form '(elp::write-output-range elp::ptr 0 2)))))
 
 (test stream-read-on-code-block
   "(READ stream) on a <% ... %> block returns the embedded form,
@@ -383,7 +383,7 @@
   "(READ stream) skips a leading <%# ... %> and returns the trailing
    text wrapper as the first form."
   (let ((form (stream-read-form "<%# x %>tail")))
-    (is (equal form '(elp::write-output-range elp::*template-ptr* 8 12)))))
+    (is (equal form '(elp::write-output-range elp::ptr 8 12)))))
 
 ;;;; Test Group 11: template-stream position-map (commit 3)
 ;;;; =====================================================
@@ -420,7 +420,7 @@
   ;; "ab<% (foo) %>cd" — wrapper for [0,2) is 50 chars; body at byte 4.
   (let ((expected-key
           (length (format nil
-                          "(elp::write-output-range elp::*template-ptr* ~D ~D) "
+                          "(elp::write-output-range elp::ptr ~D ~D) "
                           0 2))))
     (is (equal `((,expected-key . 4))
                (stream-position-map-after-drain "ab<% (foo) %>cd")))))
@@ -497,15 +497,15 @@
 <% ) %>")
          (path (template-string-to-file tmpl))
          (expected '(progn
-                     (elp::write-output-range elp::*template-ptr* 0 3)
+                     (elp::write-output-range elp::ptr 0 3)
                      (let ((elp::*current-template-span* '(6 12)))
                        (format t "~A" name))
-                     (elp::write-output-range elp::*template-ptr* 14 16)
+                     (elp::write-output-range elp::ptr 14 16)
                      (dolist (x '(1 2 3))
-                       (elp::write-output-range elp::*template-ptr* 42 44)
+                       (elp::write-output-range elp::ptr 42 44)
                        (let ((elp::*current-template-span* '(47 50)))
                          (format t "~A" x))
-                       (elp::write-output-range elp::*template-ptr* 52 53)))))
+                       (elp::write-output-range elp::ptr 52 53)))))
     (unwind-protect
          (multiple-value-bind (ptr size fd) (elp::%mmap-open path)
            (unwind-protect
