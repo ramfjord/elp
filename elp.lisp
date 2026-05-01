@@ -479,7 +479,9 @@
    most recent entry. Checkpoints are pushed every time the source of
    the next characters changes (text wrapper, code body, expr body)."
   (let ((top (car (ts-position-map s))))
-    (unless (and top (= (car top) key) (= (cdr top) anchor))
+    (unless (and top
+                 (destructuring-bind (top-key . top-anchor) top
+                   (and (= top-key key) (= top-anchor anchor))))
       (push (cons key anchor) (ts-position-map s)))))
 
 (defun stream-byte-position (s &optional (reader-pos (ts-chars-read s)))

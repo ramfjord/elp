@@ -316,6 +316,110 @@ estimate per commit and a sanity-check pass on the total before
 approval. "Six commits, ~150 LoC" would have prompted "could it be
 done in 30?" before commit 2 instead of after commit 6.
 
+## Follow-up: reintroduce the free-vars walker
+
+The simplification above dropped `template-free-vars` because nothing
+in ELP itself needed it — `progv` covers runtime binding without
+walking. That calculus changes when a **caller** of ELP needs to
+enumerate the variables a template references *before* rendering, to
+validate a context-alist, prompt the user for missing values, or
+surface "this template needs X, Y, Z" upstream.
+
+Concrete motivation: a separate project that consumes ELP wants
+template introspection — given a compiled template, return the set
+of context keys it depends on. `progv` does not expose this; a
+walker over the body sexp does.
+
+### Honest cost from the prior pass
+
+Commit 2's walker used `sb-walker:walk-form`. It worked, but the
+code was opaque to anyone who hadn't read SBCL internals. The
+callback signature `(subform context env)` is semi-public, but
+`context` takes undocumented values (`:eval`, `:set`, `:quote`, and
+others) and the recursion contract — when the walker descends on
+its own vs. expects the caller to return a replacement form — lives
+in `sb-walker.lisp` source comments, not in published docs.
+
+What we have from the diff in 2c93c8d is the *shape* of two calls
+(`walk-form`, `var-lexical-p`) and commit 2's filter rules. We do
+not have a working understanding of the contract; recovering one
+means re-reading SBCL source. The previous "we know how it works"
+was an over-claim.
+
+### What to do differently
+
+1. **Evaluate `agnostic-lizard` first.** Public, documented code
+   walker with a similar visitor + lexical-env shape. Portable
+   across implementations; not that ELP cares today, but it removes
+   a dependency on undocumented SBCL-internal symbols. If it covers
+   our cases, prefer it. Fall back to `sb-walker` only if it is
+   missing something we need.
+
+2. **Document the walker contract at the call site.** Whichever
+   library wins, write a comment block stating: which callback
+   values trigger inclusion, what return value means "do not
+   descend", which packages we exclude. Preserve commit 2's rules:
+   `:eval` context only; exclude `:elp`, `:common-lisp`, `:keyword`
+   packages; function-position symbols are filtered out by the
+   `:eval` constraint already. This is the documentation the prior
+   pass should have left behind.
+
+3. **Expose via a public API on the template value.** The walker
+   alone is not useful externally; callers need a stable way to ask
+   "what does this template need?". Today `compile-template`
+   returns a bare function — bare functions have no slot to hang
+   metadata on. Two candidate shapes:
+   - **Struct wrapper.** `(defstruct compiled-template fn free-vars)`
+     plus a thin `render` method and an `elp:template-free-vars`
+     accessor. Cheapest. Callers go through `render` / accessor;
+     no funcall ergonomics on the struct itself.
+   - **Slim funcallable-instance class.** The shape commit 3
+     introduced, but with only a `free-vars` slot — no
+     `compiled-at`, no `source-pathname` until #5 actually needs
+     them. More machinery; pays off only if direct `funcall` on
+     the template value matters to callers.
+
+   Lead candidate: **struct**, unless #5 lands concurrently and
+   wants the funcallable-instance back for its own reasons.
+
+### Out of scope here
+
+- Re-adding `compiled-at` / `source-pathname` metadata. That is
+  #5's territory; let that plan choose its attachment shape and
+  reuse this struct if it is already there.
+- Extending the walker beyond free-vars enumeration (binding-
+  strategy changes, codegen rewrites, etc.). Single purpose.
+
+### Commits (draft, not yet started)
+
+1. **Spike `agnostic-lizard` against representative template
+   bodies.** Build a small REPL fixture covering: plain refs,
+   `let` shadowing, `lambda` params, nested binders, refs inside
+   `<%= %>` expr forms. Compare against `sb-walker` output for the
+   same fixtures. *Decision artifact:* a comment block recording
+   which library we picked and why, plus the contract notes called
+   for above.
+
+2. **Reintroduce `template-free-vars` using the chosen walker.**
+   Internal helper only. Same filter rules as commit 2. Unit tests
+   on hand-built sexps.
+
+3. **Wrap the compiled function in a struct (or slim class) with a
+   `free-vars` slot.** Public reader `elp:template-free-vars`. Update
+   `render` to dispatch on the new value type. Update CLI / README
+   if the change is observable to existing callers.
+
+4. **Export `template-free-vars` and the type. Document in README
+   under a new "Introspection" subsection** with a copy-paste-runnable
+   example. Reference the consuming project's use case.
+
+### Sequencing
+
+Strict prerequisite: the consuming project should produce a concrete
+API request ("here is the call I want to make") before commit 3
+locks the value-shape decision. Drafting earlier risks the same
+over-design loop the post-plan simplification corrected.
+
 ## Future plans
 
 - Cache invalidation / mtime-aware compile cache. Out of scope
