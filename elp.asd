@@ -7,7 +7,7 @@
   :license "MIT"
   :homepage "https://github.com/thomasramfjord/mediaserver"
   :source-control (:git "https://github.com/thomasramfjord/mediaserver")
-  :depends-on ("cffi")
+  :depends-on ("cffi" "cl-ppcre")
   :components
   ((:file "elp")
    (:file "cli" :depends-on ("elp")))

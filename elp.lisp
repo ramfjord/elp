@@ -286,8 +286,7 @@
    Reader errors are translated into ELP-TEMPLATE-ERROR via the
    stream's POSITION-MAP — no intermediate body-string assembly,
    no checkpoints list reconstruction."
-  (let* ((stream (make-instance 'template-stream
-                                 :ptr ptr :size size :pathname pathname))
+  (let* ((stream (make-instance 'template-stream :ptr ptr :size size))
          (forms  '()))
     (handler-case
         (loop for form = (read stream nil :eof)
@@ -345,9 +344,6 @@
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
   ((ptr          :initarg :ptr        :reader   ts-ptr)
    (size         :initarg :size       :reader   ts-size)
-   (pathname     :initarg :pathname   :initform nil :reader ts-pathname
-    :documentation "Source pathname, used to attach :file when the
-                    parser raises ELP-TEMPLATE-ERROR.")
    (cursor       :initform 0          :accessor ts-cursor
     :documentation "Next mmap byte NEXT-UNIT will look at.")
    (chunk        :initform nil        :accessor ts-chunk
@@ -385,14 +381,9 @@
   (format nil "(elp::write-output-range elp::*template-ptr* ~D ~D) "
           start end))
 
-(defun ts-whitespace-only-p (s start end)
-  "T iff every byte in [START, END) is ASCII whitespace."
-  (loop for i from start below end
-        always (let ((b (%byte-at (ts-ptr s) i)))
-                 (or (= b (char-code #\space))
-                     (= b (char-code #\tab))
-                     (= b (char-code #\newline))
-                     (= b (char-code #\return))))))
+(defparameter *blank-rx* (cl-ppcre:create-scanner "^\\s*$")
+  "Pre-compiled scanner for blank-or-whitespace-only strings; matches
+   <%= %> bodies that should be silently skipped.")
 
 (defun ts-find-close-delim (s from)
   "Return the byte offset of the next %> at or after FROM, or NIL."
@@ -512,25 +503,18 @@
                    body-start)
        (ts-enqueue s " " nil))
       (:expr
-       (when (ts-whitespace-only-p s body-start body-end)
-         (multiple-value-bind (line col)
-             (byte->line+column (ts-ptr s) (ts-size s) body-start)
-           (error 'elp-template-error
-                  :file     (ts-pathname s)
-                  :line     line
-                  :column   col
-                  :original (make-condition
-                             'simple-error
-                             :format-control
-                             "<%= %> requires a non-empty expression."))))
-       (ts-enqueue s
-                   (format nil
-                           "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                           body-start body-end)
-                   nil)
-       (ts-enqueue s (mmap-substring (ts-ptr s) body-start body-end)
-                   body-start)
-       (ts-enqueue s ")) " nil)))))
+       ;; Whitespace-only <%= %> emits no chunks — silent-skip the
+       ;; tag rather than letting it propagate to a runtime FORMAT
+       ;; error with no obvious link to the empty body.
+       (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
+         (unless (cl-ppcre:scan *blank-rx* body)
+           (ts-enqueue s
+                       (format nil
+                               "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                               body-start body-end)
+                       nil)
+           (ts-enqueue s body body-start)
+           (ts-enqueue s ")) " nil)))))))
 
 (defun ts-next-unit (s)
   "Parse one syntactic unit at (TS-CURSOR S) and append its chunks
