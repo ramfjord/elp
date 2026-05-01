@@ -349,6 +349,9 @@
    (size         :initarg :size       :reader   ts-size)
    (cursor       :initform 0          :accessor ts-cursor
     :documentation "Next mmap byte NEXT-CHUNK will look at.")
+   (inside-code  :initform nil        :accessor ts-inside-code
+    :documentation "T iff CURSOR sits past `<%` and the next NEXT-CHUNK
+                    call should parse a tag rather than scan for one.")
    (chunk        :initform nil        :accessor ts-chunk
     :documentation "Currently-draining chunk's string, or NIL when one is needed.")
    (chunk-pos    :initform 0          :accessor ts-chunk-pos
@@ -382,13 +385,24 @@
   "Pre-compiled scanner for blank-or-whitespace-only strings; matches
    <%= %> bodies that should be silently skipped.")
 
-(defun ts-find-close-delim (s from)
-  "Return the byte offset of the next %> at or after FROM, or NIL."
-  (let* ((size (ts-size s)))
-    (when (<= from size)
-      (let ((rel (%memmem (cffi:inc-pointer (ts-ptr s) from)
-                          (- size from) "%>")))
-        (and rel (+ from rel))))))
+(defun ts-advance-cursor (s needle)
+  "Search for NEEDLE in the mmap starting at (TS-CURSOR S). On hit,
+   advance CURSOR to the byte immediately past NEEDLE and return the
+   match's start byte. On miss, advance CURSOR to SIZE and return
+   NIL. After the call CURSOR sits at the boundary the caller would
+   want to resume from."
+  (let* ((cur  (ts-cursor s))
+         (size (ts-size s))
+         (rel  (%memmem (cffi:inc-pointer (ts-ptr s) cur)
+                        (- size cur) needle)))
+    (cond
+      (rel
+       (let ((match-start (+ cur rel)))
+         (setf (ts-cursor s) (+ match-start (length needle)))
+         match-start))
+      (t
+       (setf (ts-cursor s) size)
+       nil))))
 
 (defun ts-close-trim-p (s close)
   "T when the byte immediately before CLOSE (the offset of `%>`) is
@@ -396,13 +410,6 @@
   (and close
        (>= close 1)
        (= (%byte-at (ts-ptr s) (1- close)) (char-code #\-))))
-
-(defun ts-open-trim-p (s delim-pos)
-  "T when the byte immediately after `<%` at DELIM-POS is `-`,
-   i.e. the opening delimiter is `<%-`."
-  (let ((after (+ delim-pos 2)))
-    (and (< after (ts-size s))
-         (= (%byte-at (ts-ptr s) after) (char-code #\-)))))
 
 (defun ts-open-trim-emit-end (s delim-pos)
   "Walk backward from DELIM-POS over ASCII space/tab bytes. If the walk
@@ -465,84 +472,91 @@
                                :count (- end start)
                                :encoding :latin-1))
 
-(defun ts-parse-tag-chunk (s delim-pos)
-  "Parse the tag whose `<%` opens at DELIM-POS. Find the closing `%>`
-   once, classify by the first body byte (`=` expr / `#` comment /
-   anything else plain code), advance the cursor past `%>` (and one
-   trailing newline if `-%>`), and return the chunk for the tag — or
-   NIL for tags that emit nothing (comment, whitespace-only expr).
+(defun ts-parse-tag-chunk (s)
+  "Cursor sits just past the open delimiter (`<%` or `<%-`). Classify
+   by the byte at cursor (`=` expr / `#` comment / anything else
+   plain code), advance cursor past the closing `%>` (and one
+   trailing newline if `-%>`), clear INSIDE-CODE, and return the
+   chunk — or NIL for tags that emit nothing.
 
    The chunk is (STRING . ANCHOR), where ANCHOR is (CHAR-OFFSET .
    SOURCE-BYTE) for tags whose STRING contains source bytes (code,
    expr) and NIL otherwise. CHAR-OFFSET is where the source bytes
    start within STRING (0 for code, prefix-length for expr)."
   (let* ((size       (ts-size s))
-         (after-open (+ delim-pos (if (ts-open-trim-p s delim-pos) 3 2)))
-         (close      (ts-find-close-delim s after-open))
-         (close-trim (ts-close-trim-p s close))
-         (body-end   (cond ((null close)  size)
-                           (close-trim    (1- close))
-                           (t             close)))
-         (first      (and (< after-open body-end)
+         (after-open (ts-cursor s))
+         (first      (and (< after-open size)
                           (%byte-at (ts-ptr s) after-open)))
          (flavor     (cond ((eql first (char-code #\=)) :expr)
                            ((eql first (char-code #\#)) :comment)
                            (t                           :code)))
          (body-start (if (eq flavor :code) after-open (1+ after-open))))
-    (setf (ts-cursor s) (if close (+ close 2) size))
-    (when close-trim (ts-skip-trailing-newline s))
-    (ecase flavor
-      (:comment nil)
-      (:code
-       ;; Body bytes followed by a delimiting space. Anchor at offset
-       ;; 0 — the first character of STRING is BODY-START in source.
-       (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
-         (cons (concatenate 'string body " ")
-               (cons 0 body-start))))
-      (:expr
-       ;; Whitespace-only <%= %> silently emits nothing — surfacing it
-       ;; would only produce a render-time FORMAT error with no
-       ;; obvious link back to the empty body.
-       (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
-         (unless (cl-ppcre:scan *blank-rx* body)
-           (let ((prefix (format nil
-                                 "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                                 body-start body-end)))
-             (cons (concatenate 'string prefix body ")) ")
-                   (cons (length prefix) body-start)))))))))
+    (setf (ts-cursor s) body-start)
+    (let* ((close      (ts-advance-cursor s "%>"))
+           (close-trim (ts-close-trim-p s close))
+           (body-end   (cond ((null close) size)
+                             (close-trim   (1- close))
+                             (t            close))))
+      (setf (ts-inside-code s) nil)
+      (when close-trim (ts-skip-trailing-newline s))
+      (ecase flavor
+        (:comment nil)
+        (:code
+         ;; Body bytes followed by a delimiting space. Anchor at
+         ;; offset 0 — STRING's first char is BODY-START in source.
+         (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
+           (cons (concatenate 'string body " ")
+                 (cons 0 body-start))))
+        (:expr
+         ;; Whitespace-only <%= %> silently emits nothing — surfacing
+         ;; it would only produce a render-time FORMAT error with no
+         ;; obvious link back to the empty body.
+         (let ((body (mmap-substring (ts-ptr s) body-start body-end)))
+           (unless (cl-ppcre:scan *blank-rx* body)
+             (let ((prefix (format nil
+                                   "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                   body-start body-end)))
+               (cons (concatenate 'string prefix body ")) ")
+                     (cons (length prefix) body-start))))))))))
 
 (defun ts-next-chunk (s)
   "Parse the next syntactic unit at (TS-CURSOR S) and return its
-   chunk, or :EOF when CURSOR has reached SIZE. Loops internally to
-   skip syntactic units that emit no chunk (comments, whitespace-only
-   <%= %>, fully-trimmed text runs)."
+   chunk, or :EOF when CURSOR has reached SIZE. Dispatches on
+   INSIDE-CODE: T means cursor sits past `<%` and the next unit is a
+   tag; NIL means scan forward for the next tag, emitting any
+   leading text run as a chunk. Loops internally to skip units that
+   emit no chunk (comments, whitespace-only <%= %>, fully-trimmed
+   text runs)."
   (loop
     (when (>= (ts-cursor s) (ts-size s))
       (return :eof))
-    (let* ((cur       (ts-cursor s))
-           (rel       (%memmem (cffi:inc-pointer (ts-ptr s) cur)
-                               (- (ts-size s) cur) "<%"))
-           (delim-pos (and rel (+ cur rel))))
-      (cond
-        ((null delim-pos)
-         ;; Trailing literal text up to EOF.
-         (setf (ts-cursor s) (ts-size s))
-         (return (cons (synth-text-form cur (ts-size s)) nil)))
-        ((> delim-pos cur)
-         ;; Leading text run; the tag itself is parsed on the next
-         ;; call. If open-trim eats the whole run, emit nothing here
-         ;; and loop to parse the tag.
-         (let ((emit-end (if (ts-open-trim-p s delim-pos)
-                             (max cur (ts-open-trim-emit-end s delim-pos))
-                             delim-pos)))
-           (setf (ts-cursor s) delim-pos)
-           (when (> emit-end cur)
-             (return (cons (synth-text-form cur emit-end) nil)))))
-        (t
-         ;; Cursor at `<%`. Parse the tag; if it produces a chunk,
-         ;; return it, otherwise loop for the next unit.
-         (let ((c (ts-parse-tag-chunk s delim-pos)))
-           (when c (return c))))))))
+    (cond
+      ((ts-inside-code s)
+       (let ((c (ts-parse-tag-chunk s)))
+         (when c (return c))))
+      (t
+       (let* ((text-start  (ts-cursor s))
+              (delim-start (ts-advance-cursor s "<%")))
+         (cond
+           ((null delim-start)
+            ;; No more tags; trailing literal text to EOF (cursor
+            ;; was already advanced to SIZE by ts-advance-cursor).
+            (return (cons (synth-text-form text-start (ts-size s)) nil)))
+           (t
+            ;; Cursor sits past `<%`. Detect open-trim by peeking at
+            ;; the byte at cursor; consume the `-` if present.
+            (setf (ts-inside-code s) t)
+            (let ((open-trim (and (< (ts-cursor s) (ts-size s))
+                                  (= (%byte-at (ts-ptr s) (ts-cursor s))
+                                     (char-code #\-)))))
+              (when open-trim (incf (ts-cursor s)))
+              (let ((text-end (if open-trim
+                                  (max text-start
+                                       (ts-open-trim-emit-end s delim-start))
+                                  delim-start)))
+                (when (> text-end text-start)
+                  (return (cons (synth-text-form text-start text-end)
+                                nil))))))))))))
 
 (defmethod sb-gray:stream-read-char ((s template-stream))
   ;; Pushback always wins. Re-incrementing CHARS-READ is correct
