@@ -1,0 +1,48 @@
+==================
+plain content
+==================
+
+hello world
+---
+(template
+  (content))
+
+==================
+code directive
+==================
+<% (let ((x 1)) x) %>
+---
+(template
+  (directive
+    (code)))
+
+==================
+output directive
+==================
+<%= (+ 1 2) %>
+---
+(template
+  (output_directive
+    (code)))
+
+==================
+comment
+==================
+<%# this is a comment %>
+---
+(template
+  (comment_directive
+    (comment)))
+
+==================
+trim variants
+==================
+<%- (foo) -%><%-= (bar) -%><%-# note -%>
+---
+(template
+  (directive
+    (code))
+  (output_directive
+    (code))
+  (comment_directive
+    (comment)))
