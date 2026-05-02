@@ -1,9 +1,10 @@
 # ELP editor support
 
-Two parallel paths for editing `.elp` files in Neovim, with the same
-subtype-detection model: tree-sitter (better — gives injections, text
-objects, runs vlime cleanly inside `<% %>`) and a vim regex syntax
-fallback (works without `tree-sitter-cli` or any parser build).
+Two parallel paths for editing `.elp` files in Neovim, sharing the
+same filename-based subtype detection: tree-sitter (better — gives
+injections, text objects, runs vlime cleanly inside `<% %>`) and a
+vim regex syntax fallback (works without `tree-sitter-cli` or any
+parser build).
 
 The fallback is loaded unconditionally; tree-sitter takes precedence
 when its `elp` parser is installed.
@@ -11,13 +12,19 @@ when its `elp` parser is installed.
 ```
 editor/
 ├── nvim/
-│   ├── ftdetect/elp.vim    `*.elp` → filetype `elp`
-│   └── syntax/elp.vim      regex syntax + subtype dispatch
+│   ├── ftdetect/elp.vim       `*.elp` → filetype `elp`
+│   ├── ftplugin/elp.lua       sets vim.b.elp_host from filename
+│   ├── plugin/elp.lua         registers `#elp-host!` query directive
+│   ├── syntax/elp.vim         regex syntax + subtype dispatch
+│   ├── lua/elp/init.lua       filename → tree-sitter-parser map
+│   └── queries/elp/
+│       ├── highlights.scm     delimiter highlights
+│       └── injections.scm     `(code) → commonlisp`,
+│                              `(content) → vim.b.elp_host`
 └── tree-sitter-elp/
-    ├── grammar.js          minimal ERB-subset grammar
+    ├── grammar.js             minimal ERB-subset grammar
     └── queries/
-        ├── highlights.scm  delimiter highlights
-        └── injections.scm  injects commonlisp into `(code)`
+        └── highlights.scm     parser-level highlights
 ```
 
 ## Subtype detection
@@ -34,12 +41,16 @@ Both paths use the filename to decide what host language to highlight
 | `foo.service.elp`       | systemd/ini |
 
 Anything where the extension already matches the syntax/parser name
-(`json`, `yaml`, `toml`, `xml`, `lua`, `sh`, …) resolves directly. Add
-to the alias map for `name → vim-syntax-name` (regex path) or `name →
-tree-sitter-parser-name` (tree-sitter path). The two maps differ
-because parser names sometimes diverge from vim runtime names (e.g.
-`caddy` vs `caddyfile`, no tree-sitter `systemd` parser → `ini` is the
-passable approximation).
+(`json`, `yaml`, `toml`, `xml`, `lua`, `sh`, …) resolves directly. The
+two alias maps differ — `editor/nvim/syntax/elp.vim` maps to vim
+syntax names (`caddyfile`, `systemd`), `editor/nvim/lua/elp/init.lua`
+maps to tree-sitter parser names (`caddy`, `ini`) — because the names
+sometimes diverge and there's no tree-sitter equivalent for some
+syntaxes.
+
+To extend the tree-sitter map without forking, call
+`require("elp").register_host("tf", "terraform")` in your config
+before opening any `.elp` file.
 
 Lisp inside `<% %>` / `<%= %>` always works regardless of subtype;
 `<%# %>` is treated as a comment.
@@ -53,18 +64,16 @@ plugin managers and the legacy `master` branch of nvim-treesitter use
 different APIs and aren't documented here.
 
 Drop a plugin spec like this into your config (e.g.
-`~/.config/nvim/lua/plugins/elp.lua`). It clones this repo so both
-the vim runtime files (ftdetect/syntax) and the tree-sitter grammar
-live under the same plugin dir.
+`~/.config/nvim/lua/plugins/elp.lua`):
 
 ```lua
 return {
-  -- vim regex syntax + ftdetect — works without tree-sitter.
-  -- `lazy = false` so the runtimepath/filetype registration happens
-  -- before nvim processes command-line file args; otherwise opening
-  -- a `.elp` file directly from the shell finishes BufRead before
-  -- the plugin loads, and the buffer comes up without highlighting
-  -- until you `:e!`.
+  -- ELP runtime files: ftdetect, syntax, ftplugin, plugin, queries,
+  -- lua module. `lazy = false` so the runtimepath registration
+  -- happens before nvim processes command-line file args; otherwise
+  -- opening a `.elp` file directly from the shell finishes BufRead
+  -- before the plugin loads, and the buffer comes up without
+  -- highlighting until you `:e!`.
   {
     "ramfjord/elp",
     name = "elp-editor",
@@ -75,27 +84,26 @@ return {
     end,
   },
 
-  -- tree-sitter parser registration (optional but recommended)
-  -- Requires `tree-sitter` CLI on PATH (`npm i -g tree-sitter-cli` or
-  -- `pacman -S tree-sitter-cli`).
+  -- tree-sitter parser registration. Requires `tree-sitter` CLI on
+  -- PATH (`npm i -g tree-sitter-cli` or `pacman -S tree-sitter-cli`).
   {
     "nvim-treesitter/nvim-treesitter",
-    branch = "main", -- assumes nvim-treesitter v1 (`main` branch)
+    branch = "main",
     opts = function(_, opts)
       local elp_dir = require("lazy.core.config").plugins["elp-editor"].dir
       local grammar = elp_dir .. "/editor/tree-sitter-elp"
 
       -- nvim-treesitter wipes and re-requires the parsers module on
-      -- every install/update (see install.lua's reload_parsers), so a
-      -- one-shot mutation here gets flushed before the lookup runs.
-      -- The reload fires `User TSUpdate` afterward — register on that
+      -- every install/update (see install.lua's reload_parsers), so
+      -- one-shot mutation gets flushed before the lookup runs. The
+      -- reload fires `User TSUpdate` afterward — register on that
       -- and once eagerly to cover both startup and reloads.
       local function register()
         require("nvim-treesitter.parsers").elp = {
           install_info = {
             path = grammar,
             generate = true,
-            generate_from_json = false, -- repo ships grammar.js, not src/grammar.json
+            generate_from_json = false,
             queries = "queries",
           },
           tier = 3,
@@ -120,72 +128,36 @@ After restart, LazyVim's treesitter config picks up `elp` in
 - `:set ft?` on a `.elp` buffer reports `elp`
 - `:InspectTree` shows `directive` / `output_directive` / `comment_directive` nodes
 - `:Inspect` inside `<% %>` shows `commonlisp` injection captures
+- `:Inspect` outside the tags shows the host-language injection
+  (e.g. `caddy` in `Caddyfile.elp`)
 - `:checkhealth nvim-treesitter` lists `elp` as installed
-
-For the host-language injection in `(content)` regions, the static
-`injections.scm` only covers `(code) → commonlisp` — the host language
-is per-buffer, so set it dynamically:
-
-```lua
-local subtype_aliases = {
-  yml = "yaml", rb = "ruby", js = "javascript", ts = "typescript",
-  md = "markdown", htm = "html",
-  Makefile = "make", Dockerfile = "dockerfile", Caddyfile = "caddy",
-  service = "ini", timer = "ini", socket = "ini",
-  mount = "ini", path = "ini", target = "ini",
-}
-
-local function detect_subtype(filename)
-  local ext = filename:match("%.(%w+)%.elp$")
-              or filename:match("^(%w+)%.elp$")
-  if not ext then return nil end
-  return subtype_aliases[ext] or ext:lower()
-end
-
--- Pattern semantics differ between events: FileType matches the
--- filetype name ("elp"), BufEnter matches the filename ("*.elp").
--- A single pattern can't satisfy both, and FileType has to fire
--- before nvim-treesitter constructs the parser — otherwise the
--- parser caches an injection query without the host-language entry,
--- and you have to `:e!` to recreate it.
-local function set_injections(buf)
-  if vim.bo[buf].filetype ~= "elp" then return end
-  local name = vim.api.nvim_buf_get_name(buf)
-  local subtype = detect_subtype(vim.fn.fnamemodify(name, ":t"))
-  local q = [[
-((code) @injection.content
- (#set! injection.language "commonlisp")
- (#set! injection.combined))
-]]
-  if subtype then
-    q = q .. string.format([[
-((content) @injection.content
- (#set! injection.language %q)
- (#set! injection.combined))
-]], subtype)
-  end
-  pcall(vim.treesitter.query.set, "elp", "injections", q)
-end
-
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "elp",
-  callback = function(ev) set_injections(ev.buf) end,
-})
-
-vim.api.nvim_create_autocmd("BufEnter", {
-  pattern = "*.elp",
-  callback = function(ev) set_injections(ev.buf) end,
-})
-```
-
-Caveat: `vim.treesitter.query.set` is global. With one `.elp` file
-open at a time this is fine; with two open of different subtypes, the
-most-recently-entered one wins for both buffers until you switch back.
-Acceptable trade-off for now; nvim doesn't expose per-buffer injection
-queries cleanly.
 
 For any host language whose tree-sitter parser isn't installed yet
 (`caddy`, `make`, `ini`, etc.), `:TSInstall <parser>` once.
+
+## How the host-language injection works
+
+`<% %>` regions are easy: a static query in
+`queries/elp/injections.scm` injects `commonlisp` unconditionally.
+
+The outer text is harder — the host language is determined per file
+(`Caddyfile.elp` → caddy, `Makefile.elp` → make), and tree-sitter
+injection queries are static. The plugin solves this with a custom
+query directive:
+
+1. `ftplugin/elp.lua` runs once per buffer, computes the host from
+   the filename via `lua/elp/init.lua`, and stashes it in
+   `vim.b.elp_host`.
+2. `plugin/elp.lua` registers a custom directive `#elp-host!` that
+   reads `vim.b.elp_host` at query time and sets the injection
+   language.
+3. `queries/elp/injections.scm` uses the directive on `(content)`
+   captures.
+
+This is the tree-sitter equivalent of the `b:elp_subtype` +
+`:syntax include` mechanism that `syntax/elp.vim` has used all
+along. ftplugin runs before tree-sitter constructs the parser, so
+highlighting attaches correctly on first open — no `:e!` needed.
 
 ## Status of the plan
 
