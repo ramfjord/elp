@@ -37,16 +37,21 @@
 
 ;;;; Helpers
 
+(defmacro with-template-file ((path-var content) &body body)
+  "Write CONTENT to a fresh .elp file in the system temp directory,
+   bind PATH-VAR to its pathname for BODY, and delete the file on
+   exit (normal or non-local)."
+  `(uiop:with-temporary-file (:pathname ,path-var :type "elp")
+     (with-open-file (f ,path-var :direction :output :if-exists :supersede)
+       (write-string ,content f))
+     ,@body))
+
 (defun render-string (template &rest kwargs)
   "Write TEMPLATE to a temp file, render it with KWARGS as the
    keyword bindings, return the rendered output as a string."
-  (let ((path (make-pathname :name "elp-test-temp" :type "elp")))
-    (with-open-file (f path :direction :output :if-exists :supersede)
-      (write-string template f))
-    (unwind-protect
-         (with-output-to-string (s)
-           (apply #'elp:render path s kwargs))
-      (when (probe-file path) (delete-file path)))))
+  (with-template-file (path template)
+    (with-output-to-string (s)
+      (apply #'elp:render path s kwargs))))
 
 (defun render-error (template &rest kwargs)
   "Render TEMPLATE; return the elp-template-error if one was signaled,
@@ -154,6 +159,29 @@
     (is (typep err 'elp:elp-template-error))
     (is (typep (elp:elp-template-error-original err)
                'unbound-variable))))
+
+;;;; ============================================================
+;;;; Codegen size scales with code, not with text
+;;;; ============================================================
+
+(test codegen-size-independent-of-text-size
+  "Generated code scales with the embedded code, not with the
+   volume of literal text around it. Two templates with the same
+   single tag — one wrapped in tiny text, the other in a very
+   large body of text — produce nearly the same printed-form
+   length (the only delta is the digit count of the byte offsets
+   stored in WRITE-OUTPUT-RANGE)."
+  (with-template-file (tiny " <%= 1 %> ")
+    (with-template-file (huge (concatenate 'string
+                                           (make-string 50000 :initial-element #\a)
+                                           "<%= 1 %>"
+                                           (make-string 50000 :initial-element #\b)))
+      (flet ((codegen-length (path)
+               (let ((*print-pretty* nil))
+                 (length (prin1-to-string (elp::%template-lambda-form path)))))
+             (within-1% (a b)
+               (< (abs (- a b)) (* 0.01 (min a b)))))
+        (is (within-1% (codegen-length tiny) (codegen-length huge)))))))
 
 ;;;; ============================================================
 ;;;; Error position reporting
