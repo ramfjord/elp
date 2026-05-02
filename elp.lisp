@@ -267,14 +267,16 @@
 (defun template-code (pathname)
   "Return the self-contained sexp that COMPILE-TEMPLATE compiles.
    Useful for debugging (`prin1` it) and for the CLI's `--print`
-   flag. The form is a `(lambda (ctx &optional stream) …)` whose
-   body uses PROGV to bind each context-alist key as a dynamic
-   variable for the call's extent."
+   flag. The form is a `(lambda (&optional stream) &key …)` whose
+   keyword parameters are exactly the template's free variables
+   (one per `<%= var %>`-style reference); each defaults to
+   `(error 'unbound-variable :name 'var)` so missing keys raise at
+   call time."
   (let ((file-size (with-open-file (f pathname) (file-length f))))
     (when (zerop file-size)
       (return-from template-code
-        '(lambda (ctx &optional (stream *standard-output*))
-          (declare (ignore ctx stream))
+        '(lambda (stream &key &allow-other-keys)
+          (declare (ignore stream))
           (values)))))
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
     (let ((body (unwind-protect
@@ -283,17 +285,26 @@
       (build-template-lambda pathname body))))
 
 (defun build-template-lambda (pathname body)
-  "Wrap BODY as a `(lambda (ctx &optional stream) …)` ready for
-   COMPILE. Helpers from *HELPER-SOURCES* are spliced in as a LABELS
-   block; each free variable in BODY is bound *lexically* from the
-   context-alist before BODY runs. Errors during render are
-   translated to ELP-TEMPLATE-ERROR via the existing handler.
+  "Wrap BODY as a `(lambda (&optional stream) &key …)` ready for
+   COMPILE. Each free variable in BODY becomes a keyword parameter
+   that errors with UNBOUND-VARIABLE when its key is absent at call
+   time, replacing the older CTX-alist + LET-prologue shape. Two
+   warning-quality wins: (1) no CTX parameter to flag as unused when
+   a template has zero free vars; (2) every &key var is by
+   construction one the body uses, so SBCL's unused-variable analysis
+   has no spurious targets. Helpers from *HELPER-SOURCES* are spliced
+   in as a LABELS block (so a printed TEMPLATE-CODE form is
+   self-contained); a top-level (DECLARE (IGNORABLE …)) silences
+   per-template notes for helpers a given body doesn't reach.
 
    Free vars are determined by walking a candidate form that mirrors
    the wrapper's lexical scope (multiple-value-bind etc.), so
-   helper-introduced names like PTR / SIZE / FD aren't surfaced
-   as free. The walk runs *before* the LET-prologue is spliced in,
-   so the prologue is always free of itself."
+   helper-introduced names like PTR / SIZE / FD aren't surfaced as
+   free. The walk runs against a lambda with no &key params, so the
+   keyword list is always free of itself.
+
+   COMPILE-TEMPLATE wraps the returned lambda to preserve the public
+   `(ctx &optional stream)` contract — the &key shape is internal."
   (let* ((helpers
           (mapcar (lambda (entry)
                     (destructuring-bind (name lambda-list &rest body) entry
@@ -313,10 +324,10 @@
                          :line line :column col
                          :original c))))))
          ;; Candidate has the wrapper's lexical scope with BODY inline
-         ;; and no LET-prologue. Walking it tells us which symbols
-         ;; are free with respect to the wrapper's own bindings.
+         ;; and no &key params. Walking it tells us which symbols are
+         ;; free with respect to the wrapper's own bindings.
          (candidate
-          `(lambda (ctx &optional (stream *standard-output*))
+          `(lambda (&optional (stream *standard-output*))
              (let ((*standard-output* stream))
                (labels ,helpers
                  (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
@@ -324,22 +335,44 @@
                      (%mmap-close ptr size fd))))
                (values))))
          (free-vars (form-free-vars candidate))
-         (bindings (loop for var in free-vars collect
-                         `(,var (let ((cell (assoc ',var ctx)))
-                                  (unless cell
-                                    (error 'unbound-variable :name ',var))
-                                  (cdr cell)))))
+         (sups (loop repeat (length free-vars) collect (gensym "SUP")))
+         (key-params
+          (loop for var in free-vars
+                for sup in sups
+                collect `((,(intern (symbol-name var) :keyword) ,var)
+                          nil
+                          ,sup)))
+         ;; Check missing keys *inside* handler-bind so the
+         ;; unbound-variable signal becomes an elp-template-error
+         ;; with line/column rather than an unwrapped runtime error.
+         ;; If we used `(error 'unbound-variable …)` as a &key default
+         ;; the signal would fire outside handler-bind and escape.
+         (key-checks
+          (loop for var in free-vars
+                for sup in sups
+                collect `(unless ,sup
+                           (error 'unbound-variable :name ',var))))
          ;; See COMPILE-FORM: walking annotates BODY's cons cells in a
          ;; way that primes SBCL's "unknown variable" warnings. Splice
          ;; a fresh copy into the final form.
          (body-fresh (copy-tree body)))
-    `(lambda (ctx &optional (stream *standard-output*))
+    `(lambda (stream &key ,@key-params &allow-other-keys)
        (let ((*standard-output* stream))
          (labels ,helpers
+           ;; Only WRITE-OUTPUT-RANGE is conditionally reached (a
+           ;; template with no text chunks never calls it). The other
+           ;; helpers are always called by the wrapper code generated
+           ;; just below — %MMAP-OPEN/CLOSE in the multiple-value-bind
+           ;; and unwind-protect, BYTE->LINE+COLUMN (and via it %MEMCHR)
+           ;; from the error-translating handler. If any of those go
+           ;; "unused," that's a real codegen regression, so we don't
+           ;; mask the warning here.
+           (declare (ignorable #'write-output-range))
            (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
              (unwind-protect
                   (handler-bind ,handler-clauses
-                    (let ,bindings ,body-fresh))
+                    ,@key-checks
+                    ,body-fresh)
                (%mmap-close ptr size fd))))
          (values)))))
 
@@ -349,8 +382,18 @@
    with different context-alists; keys absent from CTX referenced
    by the template signal an unbound-variable error at the
    reference site, translated to ELP-TEMPLATE-ERROR with the
-   correct line/column."
-  (compile nil (template-code pathname)))
+   correct line/column.
+
+   The compiled inner lambda takes &key-flavored params (one per
+   free var, see BUILD-TEMPLATE-LAMBDA); this wrapper adapts the
+   alist-style public contract by translating each entry's symbol
+   key to the matching keyword argument."
+  (let ((inner (compile nil (template-code pathname))))
+    (lambda (ctx &optional (stream *standard-output*))
+      (apply inner stream
+             (loop for (k . v) in ctx
+                   collect (intern (symbol-name k) :keyword)
+                   collect v)))))
 
 (defmethod render ((fn function) context-alist
                    &optional (stream *standard-output*))

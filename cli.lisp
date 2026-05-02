@@ -60,19 +60,20 @@
           (uiop:quit 1))
 
         (let ((template-file (car (reverse positional))))
-          ;; Load context if provided
+          ;; Load context if provided. Forms are read as data — no EVAL —
+          ;; so a literal alist `((name . "Alice") (age . 30))` works
+          ;; without quoting, and an unwrapped `((foo))` doesn't get
+          ;; misread as a function call. Each form may be either a full
+          ;; alist (`((k . v) ...)`) or a single binding (`(k . v)`); the
+          ;; shape decides whether to replace or push.
           (let ((context '()))
             (when context-file
               (with-open-file (f context-file)
                 (loop for form = (read f nil nil)
                       while form do
-                      (let ((val (eval form)))
-                        ;; If it's a list of bindings, use it as context
-                        (if (and (listp val) (listp (car val)))
-                            (setf context val)
-                            ;; Otherwise, it should be a single binding
-                            (when val
-                              (push val context)))))))
+                      (if (and (consp form) (consp (car form)))
+                          (setf context form)
+                          (push form context)))))
 
             (if print-form
                 ;; Print the sexp that RENDER would EVAL. Binding *package*
@@ -83,7 +84,7 @@
                 (let ((*print-pretty* t)
                       (*print-readably* nil)
                       (*package* (find-package :elp)))
-                  (prin1 (template-code (pathname template-file) context))
+                  (prin1 (template-code (pathname template-file)))
                   (terpri))
                 ;; Render the template, streaming output through *standard-output*.
                 ;; In a saved binary, *standard-output* is an sb-sys:fd-stream, so
