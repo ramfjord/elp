@@ -1,0 +1,18 @@
+<%- (loopservices (services :where (and use_vpn port)) -%>
+:<%= port %> {
+  reverse_proxy wireguard:<%= port %>
+}
+<%- ) -%>
+
+# Vaultwarden reverse proxy with HTTPS
+fatlaptop.hippogriff-stonecat.ts.net:8000 {
+  tls /etc/caddy/certs/fatlaptop.hippogriff-stonecat.ts.net.crt /etc/caddy/certs/fatlaptop.hippogriff-stonecat.ts.net.key
+
+  # Main API and web vault
+  reverse_proxy vaultwarden:80 {
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-For {remote_host}
+    header_up X-Forwarded-Proto https
+    header_up X-Forwarded-Host {host}
+  }
+}

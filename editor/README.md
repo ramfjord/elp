@@ -59,10 +59,16 @@ live under the same plugin dir.
 
 ```lua
 return {
-  -- vim regex syntax + ftdetect — works without tree-sitter
+  -- vim regex syntax + ftdetect — works without tree-sitter.
+  -- `lazy = false` so the runtimepath/filetype registration happens
+  -- before nvim processes command-line file args; otherwise opening
+  -- a `.elp` file directly from the shell finishes BufRead before
+  -- the plugin loads, and the buffer comes up without highlighting
+  -- until you `:e!`.
   {
     "ramfjord/elp",
     name = "elp-editor",
+    lazy = false,
     config = function(plugin)
       vim.opt.runtimepath:append(plugin.dir .. "/editor/nvim")
       vim.filetype.add({ extension = { elp = "elp" } })
@@ -136,25 +142,39 @@ local function detect_subtype(filename)
   return subtype_aliases[ext] or ext:lower()
 end
 
-vim.api.nvim_create_autocmd({ "FileType", "BufEnter" }, {
-  pattern = "*.elp",
-  callback = function(ev)
-    if vim.bo[ev.buf].filetype ~= "elp" then return end
-    local subtype = detect_subtype(vim.fn.fnamemodify(ev.file, ":t"))
-    local q = [[
+-- Pattern semantics differ between events: FileType matches the
+-- filetype name ("elp"), BufEnter matches the filename ("*.elp").
+-- A single pattern can't satisfy both, and FileType has to fire
+-- before nvim-treesitter constructs the parser — otherwise the
+-- parser caches an injection query without the host-language entry,
+-- and you have to `:e!` to recreate it.
+local function set_injections(buf)
+  if vim.bo[buf].filetype ~= "elp" then return end
+  local name = vim.api.nvim_buf_get_name(buf)
+  local subtype = detect_subtype(vim.fn.fnamemodify(name, ":t"))
+  local q = [[
 ((code) @injection.content
  (#set! injection.language "commonlisp")
  (#set! injection.combined))
 ]]
-    if subtype then
-      q = q .. string.format([[
+  if subtype then
+    q = q .. string.format([[
 ((content) @injection.content
  (#set! injection.language %q)
  (#set! injection.combined))
 ]], subtype)
-    end
-    pcall(vim.treesitter.query.set, "elp", "injections", q)
-  end,
+  end
+  pcall(vim.treesitter.query.set, "elp", "injections", q)
+end
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "elp",
+  callback = function(ev) set_injections(ev.buf) end,
+})
+
+vim.api.nvim_create_autocmd("BufEnter", {
+  pattern = "*.elp",
+  callback = function(ev) set_injections(ev.buf) end,
 })
 ```
 
