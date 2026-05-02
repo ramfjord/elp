@@ -57,85 +57,32 @@ Lisp inside `<% %>` / `<%= %>` always works regardless of subtype;
 
 ## Install
 
-The instructions below assume Neovim with **lazy.nvim** (LazyVim
-distribution) and **nvim-treesitter on its `main` branch (v1.x)**.
-That's the only configuration this has been verified against — other
-plugin managers and the legacy `master` branch of nvim-treesitter use
-different APIs and aren't documented here.
+Tested only on **LazyVim**, which bundles **lazy.nvim** and
+**nvim-treesitter on its `main` branch (v1.x)**. Other plugin managers
+and the legacy `master` branch of nvim-treesitter aren't documented
+here. Also requires `tree-sitter` CLI on PATH (`npm i -g
+tree-sitter-cli` or `pacman -S tree-sitter-cli`) for the parser build.
 
-Drop a plugin spec like this into your config (e.g.
-`~/.config/nvim/lua/plugins/elp.lua`):
+Drop into `~/.config/nvim/lua/plugins/elp.lua`:
 
 ```lua
 return {
-  -- ELP runtime files: ftdetect, syntax, ftplugin, plugin, queries,
-  -- lua module. `lazy = false` so the runtimepath registration
-  -- happens before nvim processes command-line file args; otherwise
-  -- opening a `.elp` file directly from the shell finishes BufRead
-  -- before the plugin loads, and the buffer comes up without
-  -- highlighting until you `:e!`.
-  {
-    "ramfjord/elp",
-    name = "elp-editor",
-    lazy = false,
-    config = function(plugin)
-      vim.opt.runtimepath:append(plugin.dir .. "/editor/nvim")
-      vim.filetype.add({ extension = { elp = "elp" } })
-    end,
-  },
-
-  -- tree-sitter parser registration. Pattern from nvim-treesitter's
-  -- README under "Adding custom languages":
-  --   https://github.com/nvim-treesitter/nvim-treesitter#adding-custom-languages
-  -- Requires `tree-sitter` CLI on PATH (`npm i -g tree-sitter-cli` or
-  -- `pacman -S tree-sitter-cli`).
-  {
-    "nvim-treesitter/nvim-treesitter",
-    branch = "main",
-    opts = function(_, opts)
-      -- nvim-treesitter wipes and re-requires the parsers module on
-      -- every install/update (see install.lua's reload_parsers), so
-      -- one-shot mutation gets flushed. The reload fires `User
-      -- TSUpdate` afterward — register on that and once eagerly to
-      -- cover both startup and reloads.
-      local function register()
-        require("nvim-treesitter.parsers").elp = {
-          install_info = {
-            url = "https://github.com/ramfjord/elp",
-            -- Grammar lives in a subdirectory of the monorepo.
-            location = "editor/tree-sitter-elp",
-            -- grammar.js doesn't ship a pre-generated src/parser.c,
-            -- so nvim-treesitter has to run `tree-sitter generate`.
-            generate = true,
-            generate_from_json = false,
-            queries = "queries",
-          },
-          tier = 3,
-        }
-      end
-      register()
-      vim.api.nvim_create_autocmd("User", {
-        pattern = "TSUpdate",
-        callback = register,
-      })
-
-      opts.ensure_installed = opts.ensure_installed or {}
-      vim.list_extend(opts.ensure_installed, { "elp", "commonlisp" })
-    end,
-  },
+  { "ramfjord/elp", lazy = false },
 }
 ```
 
-The grammar is fetched from github separately from lazy's clone of
-the repo — slight storage duplication, but it sidesteps a class of
-ordering bugs (the parser registration would otherwise depend on
-`lazy.core.config.plugins["elp-editor"].dir` being populated before
-nvim-treesitter reads it). If you're hacking on `grammar.js` locally,
-swap `url=` for `path = "~/projects/elp/editor/tree-sitter-elp"` so
-`:TSUpdate elp` rebuilds from your working tree.
+`lazy = false` so the plugin's runtimepath registration finishes
+before nvim processes command-line file args — otherwise opening a
+`.elp` file directly from the shell finishes BufRead before the
+plugin loads, and the buffer comes up without highlighting until you
+`:e!`.
 
-After restart, LazyVim's treesitter config picks up `elp` in
-`ensure_installed` and runs `tree-sitter generate` + build. Verify:
+Then add `"elp"` (and any host-language parsers you'll use, e.g.
+`"caddy"`, `"make"`) to your nvim-treesitter `ensure_installed` list.
+The plugin registers the parser source itself; you only opt in to
+having it installed.
+
+Verify:
 
 - `:set ft?` on a `.elp` buffer reports `elp`
 - `:InspectTree` shows `directive` / `output_directive` / `comment_directive` nodes
