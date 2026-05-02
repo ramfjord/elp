@@ -8,15 +8,11 @@
 ;;;; *different elp-specific feature* rather than a different input
 ;;;; to the same feature.
 ;;;;
-;;;; COMPILE-FORM is the underlying primitive that COMPILE-TEMPLATE's
-;;;; codegen mirrors. It's exported and documented, so it gets one
-;;;; bare-bones test pinning the public API contract (free-vars
-;;;; introspection + funcallable call + source round-trip). The
-;;;; behaviors that *do* surface through render — walker-based
-;;;; kwarg classification, lexical isolation of SETF — are tested
-;;;; under "render" against that interface, since that's how callers
-;;;; actually encounter them. We do NOT test CL semantics per se —
-;;;; let, let*, dolist, lambda etc. are CL's contract, not ours.
+;;;; The walker-driven kwarg classification and the lexical
+;;;; isolation of SETF in template bodies are tested through render,
+;;;; since render is the only interface callers use. We do NOT test
+;;;; CL semantics per se — let, let*, dolist, lambda etc. are CL's
+;;;; contract, not ours.
 ;;;;
 ;;;; What we DON'T test separately, intentionally:
 ;;;;   - tokenizer internals (memmem/memchr, byte->line+column,
@@ -234,26 +230,6 @@
                       (with-output-to-string (s)
                         (elp:render tmpl s :name "Bob")))))
       (when (probe-file path) (delete-file path)))))
-
-;;;; ============================================================
-;;;; compile-form — the exported primitive
-;;;; ============================================================
-;;;;
-;;;; One test, pinning the public API shape. The walker's
-;;;; classification of CL binding forms and the lexical-isolation
-;;;; of SETF are tested via render above, since that's the
-;;;; interface callers actually use.
-
-(test compile-form-public-contract
-  "COMPILE-FORM returns a funcallable instance carrying its
-   free-var list and original source. The instance itself is the
-   callable — `(funcall cf :x 2 :y 3)`, no accessor wrapper —
-   and the same object answers FREE-VARS and SOURCE queries."
-  (let* ((form '(+ x y))
-         (cf (elp:compile-form form)))
-    (is (equal '(x y) (elp:compiled-fn-free-vars cf)))
-    (is (= 5 (funcall cf :x 2 :y 3)))
-    (is (equal form (elp:compiled-fn-source cf)))))
 
 ;;;; ============================================================
 

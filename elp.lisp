@@ -11,11 +11,6 @@
    ;; Primary public API
    :render
    :compile-template
-   ;; Form introspection
-   :compile-form
-   :compiled-fn
-   :compiled-fn-free-vars
-   :compiled-fn-source
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -163,53 +158,15 @@
          (- (cffi:pointer-address found)
             (cffi:pointer-address haystack-ptr)))))
 
-;;;; Form introspection
+;;;; Free-variable analysis
 ;;;;
-;;;; COMPILE-FORM takes an arbitrary Lisp body sexp and returns a
-;;;; COMPILED-FN funcallable instance: it carries (a) the set of
-;;;; free variables the form references and (b) a compiled function
-;;;; that runs the body with those values bound from keyword
-;;;; arguments. The instance itself is the callable — `(funcall cf
-;;;; :name 1 :ready t)` rather than `(funcall (some-accessor cf)
-;;;; …)`. Useful as a generic primitive: callers can enumerate
-;;;; what a form depends on before executing it, and the same
-;;;; keyword-argument shape is what BUILD-TEMPLATE-LAMBDA emits for
-;;;; templates, so the two paths share a calling convention.
-;;;;
-;;;; The walker is HU.DWIM.WALKER, which classifies every reference
-;;;; in the AST as lexical / free / special / etc. Filtering on
-;;;; FREE-VARIABLE-REFERENCE-FORM gives exactly the symbols not
-;;;; bound by the form itself and not proclaimed special. Function-
-;;;; position symbols, keywords, T/NIL, quoted forms, and globally-
-;;;; specialed variables (DEFVAR/DEFPARAMETER) are all classified
-;;;; under other node types and so excluded for free.
-
-(defclass compiled-fn ()
-  ((free-vars :initarg :free-vars :reader compiled-fn-free-vars
-              :documentation
-              "Sorted list of symbols the source form references free.
-               These are exactly the keyword parameters the funcallable
-               instance accepts (modulo the &allow-other-keys passthrough,
-               which silently drops anything not listed).")
-   (source    :initarg :source    :reader compiled-fn-source
-              :documentation
-              "The original sexp passed to COMPILE-FORM, retained for
-               debugging and introspection."))
-  (:metaclass sb-mop:funcallable-standard-class)
-  (:documentation
-   "Funcallable instance returned by COMPILE-FORM. Call it directly
-    with `(funcall cf :var-1 v1 :var-2 v2 …)` — no accessor wrapper
-    needed; the instance IS the function. Inspect FREE-VARS to learn
-    which keywords it accepts; SOURCE for the original sexp."))
-
-(defun %make-compiled-fn (fn free-vars source)
-  "Build a COMPILED-FN funcallable instance whose call dispatches to FN.
-   Internal: callers should use COMPILE-FORM."
-  (let ((cf (make-instance 'compiled-fn
-                           :free-vars free-vars
-                           :source    source)))
-    (sb-mop:set-funcallable-instance-function cf fn)
-    cf))
+;;;; HU.DWIM.WALKER classifies every reference in a form's AST as
+;;;; lexical / free / special / etc. Filtering on FREE-VARIABLE-
+;;;; REFERENCE-FORM gives exactly the symbols not bound by the form
+;;;; itself and not proclaimed special. Function-position symbols,
+;;;; keywords, T/NIL, quoted forms, and globally-specialed
+;;;; variables (DEFVAR/DEFPARAMETER) are all classified under other
+;;;; node types and so excluded.
 
 (defun form-free-vars (form)
   "Return the sorted list of symbols referenced free in FORM. Free
@@ -230,46 +187,6 @@
                               refs)))
     (sort (remove-duplicates (mapcar #'hu.dwim.walker:name-of free))
           #'string< :key #'symbol-name)))
-
-(defun compile-form (form)
-  "Walk FORM for free variables and return a COMPILED-FN funcallable
-   instance taking each free var as a keyword argument and running
-   FORM with those values lexically bound. Missing keys signal
-   UNBOUND-VARIABLE; extra keys are tolerated (`&allow-other-keys`)
-   so callers can pass a comprehensive bag of bindings and let the
-   compiled function pick out the ones it needs.
-
-   The returned object is itself the callable — `(funcall cf :name 1
-   :ready t)` rather than `(funcall (some-accessor cf) :name 1 …)`.
-   COMPILED-FN-FREE-VARS lists exactly which keywords the function
-   accepts (modulo extras via `&allow-other-keys`)."
-  (let* ((free (form-free-vars form))
-         (sups (loop repeat (length free) collect (gensym "SUP")))
-         (key-params
-          (loop for var in free
-                for sup in sups
-                collect `((,(intern (symbol-name var) :keyword) ,var)
-                          nil
-                          ,sup)))
-         (key-checks
-          (loop for var in free
-                for sup in sups
-                collect `(unless ,sup
-                           (error 'unbound-variable :name ',var))))
-         ;; HU.DWIM.WALKER:WALK-FORM annotates the input cons cells
-         ;; with source-tracking info that SBCL's compiler later
-         ;; reads as "this form was an unknown reference," surfacing
-         ;; spurious warnings even when the surrounding lambda list
-         ;; clearly binds the symbol. Splicing a fresh copy detaches
-         ;; the final form from those annotations.
-         (body (copy-tree form)))
-    (%make-compiled-fn
-     (compile nil
-              `(lambda (&key ,@key-params &allow-other-keys)
-                 ,@key-checks
-                 ,body))
-     free
-     form)))
 
 ;;;; Public API
 

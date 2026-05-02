@@ -192,36 +192,6 @@ arguments pass through `&allow-other-keys` and are dropped — useful
 for splicing a comprehensive set of bindings into every render call
 and letting each template pick what it references.
 
-### Form introspection
-
-ELP exposes the same compile-once shape as a generic primitive
-over arbitrary Lisp body sexps, useful when a caller wants to know
-what context variables a body depends on *before* running it.
-
-**`(compile-form sexp)` → `compiled-fn`**
-
-Walks `sexp` for free variables (symbols not bound by any binding
-form inside `sexp` itself) and compiles a function whose keyword
-parameters are exactly those free variables. Returns a
-`compiled-fn` — a funcallable instance, so the returned object
-*is* the callable; no accessor needed to invoke it.
-
-**`(funcall cf :var-1 v1 :var-2 v2 …)`** — call the compiled
-function directly. Missing keys signal `unbound-variable`; extra
-keys are tolerated via `&allow-other-keys`.
-
-**`(compiled-fn-free-vars cf)`** — the sorted list of free-var
-symbols. The contract callers can use to validate their bindings
-or prompt the user for required values.
-
-**`(compiled-fn-source cf)`** — the original sexp.
-
-```lisp
-(let ((cf (elp:compile-form '(when ready (format nil "~A" name)))))
-  (elp:compiled-fn-free-vars cf)              ; => (NAME READY)
-  (funcall cf :ready t :name "Ada"))          ; => "Ada"
-```
-
 ### Errors
 
 **`elp-template-error`**
