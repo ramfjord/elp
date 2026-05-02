@@ -14,10 +14,9 @@
    :template-code
    ;; Form introspection
    :compile-form
-   :compiled-form
-   :compiled-form-fn
-   :compiled-form-free-vars
-   :compiled-form-source
+   :compiled-fn
+   :compiled-fn-free-vars
+   :compiled-fn-source
    ;; Error condition
    :elp-template-error
    :elp-template-error-file
@@ -168,13 +167,15 @@
 ;;;; Form introspection
 ;;;;
 ;;;; COMPILE-FORM takes an arbitrary Lisp body sexp and returns a
-;;;; COMPILED-FORM bundling (a) the set of free variables it
-;;;; references and (b) a compiled function that runs it against an
-;;;; alist of bindings for those variables. Useful as a generic
-;;;; primitive — callers can enumerate what a form depends on
-;;;; before executing it. ELP itself uses PROGV-based binding for
-;;;; templates; this helper exposes the same shape for hand-built
-;;;; sexps.
+;;;; COMPILED-FN funcallable instance: it carries (a) the set of
+;;;; free variables the form references and (b) a compiled function
+;;;; that runs the body with those values bound from keyword
+;;;; arguments. The instance itself is the callable — `(funcall cf
+;;;; :name 1 :ready t)` rather than `(funcall (some-accessor cf)
+;;;; …)`. Useful as a generic primitive: callers can enumerate
+;;;; what a form depends on before executing it, and the same
+;;;; keyword-argument shape is what BUILD-TEMPLATE-LAMBDA emits for
+;;;; templates, so the two paths share a calling convention.
 ;;;;
 ;;;; The walker is HU.DWIM.WALKER, which classifies every reference
 ;;;; in the AST as lexical / free / special / etc. Filtering on
@@ -184,12 +185,32 @@
 ;;;; specialed variables (DEFVAR/DEFPARAMETER) are all classified
 ;;;; under other node types and so excluded for free.
 
-(defstruct compiled-form
-  "Bundles a compiled function with the free variables its source
-   form references. FN is `(lambda (ctx) …)`; calling it binds each
-   free var to the matching alist entry via PROGV. SOURCE is the
-   original sexp, retained for debugging / introspection."
-  fn free-vars source)
+(defclass compiled-fn ()
+  ((free-vars :initarg :free-vars :reader compiled-fn-free-vars
+              :documentation
+              "Sorted list of symbols the source form references free.
+               These are exactly the keyword parameters the funcallable
+               instance accepts (modulo the &allow-other-keys passthrough,
+               which silently drops anything not listed).")
+   (source    :initarg :source    :reader compiled-fn-source
+              :documentation
+              "The original sexp passed to COMPILE-FORM, retained for
+               debugging and introspection."))
+  (:metaclass sb-mop:funcallable-standard-class)
+  (:documentation
+   "Funcallable instance returned by COMPILE-FORM. Call it directly
+    with `(funcall cf :var-1 v1 :var-2 v2 …)` — no accessor wrapper
+    needed; the instance IS the function. Inspect FREE-VARS to learn
+    which keywords it accepts; SOURCE for the original sexp."))
+
+(defun %make-compiled-fn (fn free-vars source)
+  "Build a COMPILED-FN funcallable instance whose call dispatches to FN.
+   Internal: callers should use COMPILE-FORM."
+  (let ((cf (make-instance 'compiled-fn
+                           :free-vars free-vars
+                           :source    source)))
+    (sb-mop:set-funcallable-instance-function cf fn)
+    cf))
 
 (defun form-free-vars (form)
   "Return the sorted list of symbols referenced free in FORM. Free
@@ -212,38 +233,44 @@
           #'string< :key #'symbol-name)))
 
 (defun compile-form (form)
-  "Walk FORM for free variables and return a COMPILED-FORM whose FN
-   takes a context-alist and runs FORM with each free variable
-   bound *lexically* to its alist value. Free vars not present in
-   the alist signal an unbound-variable error at the binding step.
+  "Walk FORM for free variables and return a COMPILED-FN funcallable
+   instance taking each free var as a keyword argument and running
+   FORM with those values lexically bound. Missing keys signal
+   UNBOUND-VARIABLE; extra keys are tolerated (`&allow-other-keys`)
+   so callers can pass a comprehensive bag of bindings and let the
+   compiled function pick out the ones it needs.
 
-   Lexical binding is the right shape here for three reasons:
-   no `(declare (special …))` is needed (so warnings stay on, no
-   global symbol pollution); `(setf x …)` inside FORM modifies the
-   local binding rather than the global symbol-value cell, so a
-   COMPILED-FORM never leaks state into the host image; and the
-   walker keeps classifying free symbols as free across calls,
-   which keeps the FREE-VARS contract stable."
-  (let* ((free  (form-free-vars form))
+   The returned object is itself the callable — `(funcall cf :name 1
+   :ready t)` rather than `(funcall (some-accessor cf) :name 1 …)`.
+   COMPILED-FN-FREE-VARS lists exactly which keywords the function
+   accepts (modulo extras via `&allow-other-keys`)."
+  (let* ((free (form-free-vars form))
+         (sups (loop repeat (length free) collect (gensym "SUP")))
+         (key-params
+          (loop for var in free
+                for sup in sups
+                collect `((,(intern (symbol-name var) :keyword) ,var)
+                          nil
+                          ,sup)))
+         (key-checks
+          (loop for var in free
+                for sup in sups
+                collect `(unless ,sup
+                           (error 'unbound-variable :name ',var))))
          ;; HU.DWIM.WALKER:WALK-FORM annotates the input cons cells
          ;; with source-tracking info that SBCL's compiler later
          ;; reads as "this form was an unknown reference," surfacing
-         ;; spurious warnings even when the surrounding LET clearly
-         ;; binds the symbol. Splicing a fresh copy detaches the
-         ;; final form from those annotations.
-         (body  (copy-tree form))
-         (lambda
-          `(lambda (ctx)
-             (let ,(loop for var in free collect
-                         `(,var (let ((cell (assoc ',var ctx)))
-                                  (unless cell
-                                    (error 'unbound-variable :name ',var))
-                                  (cdr cell))))
-               ,body))))
-    (make-compiled-form
-     :fn        (compile nil lambda)
-     :free-vars free
-     :source    form)))
+         ;; spurious warnings even when the surrounding lambda list
+         ;; clearly binds the symbol. Splicing a fresh copy detaches
+         ;; the final form from those annotations.
+         (body (copy-tree form)))
+    (%make-compiled-fn
+     (compile nil
+              `(lambda (&key ,@key-params &allow-other-keys)
+                 ,@key-checks
+                 ,body))
+     free
+     form)))
 
 ;;;; Public API
 
@@ -378,26 +405,28 @@
 
 (defun compile-template (pathname)
   "Compile the template at PATHNAME and return a function of
-   (CTX &OPTIONAL STREAM). The function may be reused across calls
-   with different context-alists; keys absent from CTX referenced
-   by the template signal an unbound-variable error at the
-   reference site, translated to ELP-TEMPLATE-ERROR with the
-   correct line/column.
-
-   The compiled inner lambda takes &key-flavored params (one per
-   free var, see BUILD-TEMPLATE-LAMBDA); this wrapper adapts the
-   alist-style public contract by translating each entry's symbol
-   key to the matching keyword argument."
-  (let ((inner (compile nil (template-code pathname))))
-    (lambda (ctx &optional (stream *standard-output*))
-      (apply inner stream
-             (loop for (k . v) in ctx
-                   collect (intern (symbol-name k) :keyword)
-                   collect v)))))
+   (STREAM &KEY var-1 var-2 … &ALLOW-OTHER-KEYS). The function may
+   be reused across calls with different keyword arguments; keys
+   absent from a call but referenced by the template signal an
+   unbound-variable error at call time, translated to
+   ELP-TEMPLATE-ERROR with the correct line/column. Extra keyword
+   arguments are silently ignored, so callers can pass a
+   comprehensive bag of bindings and let each template pick the
+   subset it needs."
+  (compile nil (template-code pathname)))
 
 (defmethod render ((fn function) context-alist
                    &optional (stream *standard-output*))
-  (funcall fn context-alist stream))
+  ;; The public render contract is alist-based for ergonomics
+  ;; (callers passing a single context dictionary). The compiled
+  ;; function itself is &key-flavored — see COMPILE-TEMPLATE — so
+  ;; this method is the single adapter from alist to plist. Every
+  ;; alist entry becomes one (keyword value) pair; extras pass
+  ;; through and get dropped at the function's &allow-other-keys.
+  (apply fn stream
+         (loop for (k . v) in context-alist
+               collect (intern (symbol-name k) :keyword)
+               collect v)))
 
 (defmethod render ((pathname pathname) context-alist
                    &optional (stream *standard-output*))

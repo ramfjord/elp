@@ -120,19 +120,21 @@ returned function:
 
 (defparameter *page* (compile-template #p"page.elp"))
 
-(funcall *page* '((name . "Alice")) *standard-output*)
-;; or equivalently:
+(funcall *page* *standard-output* :name "Alice")
+;; or via the alist-flavored render entry point:
 (render *page* '((name . "Alice")))
 (render *page* '((name . "Bob")))
 ```
 
 `compile-template` parses the template once and returns a function
-of `(ctx &optional stream)`. Subsequent calls skip the read and
-codegen pass. Context-alist keys are bound as dynamic variables for
-the call's extent (via `progv`); a template reference whose key is
-absent from the alist signals `elp-template-error` at the reference
-site. `render` accepts either a pathname (compiles on every call)
-or the compiled function. See issue #8 for design rationale.
+of `(stream &key var-1 var-2 … &allow-other-keys)`. Each free
+template variable is one keyword parameter; missing keys signal
+`elp-template-error` at the reference site. Extra keyword arguments
+are silently ignored, so callers can pass a comprehensive bag of
+bindings and let each template pick the subset it needs. `render`
+accepts either a pathname (compiles on every call) or the compiled
+function; for ergonomics it takes an alist publicly and adapts it
+to the keyword-argument convention internally.
 
 ## Context Variables
 
@@ -183,12 +185,12 @@ For callers that want the output as a string, wrap in
 **`(compile-template pathname)` → function**
 
 Compiles the template at `pathname` once and returns a function of
-`(ctx &optional stream)`. The function may be reused across calls
-with different context-alists — each free template variable is
-bound lexically from the matching alist entry at funcall time, then
-the body runs against those bindings. A reference whose symbol is
-absent from the context-alist signals `elp-template-error` with
-line/column information.
+`(stream &key var-1 var-2 … &allow-other-keys)`. Each free template
+variable is one keyword parameter; missing keys signal
+`elp-template-error` with line/column information. Extra keyword
+arguments pass through `&allow-other-keys` and are dropped — useful
+for splicing a comprehensive set of bindings into every render call
+and letting each template pick what it references.
 
 ### Form introspection
 
@@ -196,29 +198,28 @@ ELP exposes the same compile-once shape as a generic primitive
 over arbitrary Lisp body sexps, useful when a caller wants to know
 what context variables a body depends on *before* running it.
 
-**`(compile-form sexp)` → `compiled-form`**
+**`(compile-form sexp)` → `compiled-fn`**
 
 Walks `sexp` for free variables (symbols not bound by any binding
-form inside `sexp` itself) and compiles a lambda that runs the
-body against an alist of bindings. Returns a `compiled-form`
-struct.
+form inside `sexp` itself) and compiles a function whose keyword
+parameters are exactly those free variables. Returns a
+`compiled-fn` — a funcallable instance, so the returned object
+*is* the callable; no accessor needed to invoke it.
 
-**`(compiled-form-fn cf)`** — the compiled function. Call it as
-`(funcall fn alist)`. Each free var is bound lexically from the
-matching alist entry; missing keys signal `unbound-variable`.
+**`(funcall cf :var-1 v1 :var-2 v2 …)`** — call the compiled
+function directly. Missing keys signal `unbound-variable`; extra
+keys are tolerated via `&allow-other-keys`.
 
-**`(compiled-form-free-vars cf)`** — the sorted list of free-var
-symbols. The contract callers can use to validate their alist or
-prompt the user for required values.
+**`(compiled-fn-free-vars cf)`** — the sorted list of free-var
+symbols. The contract callers can use to validate their bindings
+or prompt the user for required values.
 
-**`(compiled-form-source cf)`** — the original sexp.
+**`(compiled-fn-source cf)`** — the original sexp.
 
 ```lisp
 (let ((cf (elp:compile-form '(when ready (format nil "~A" name)))))
-  (elp:compiled-form-free-vars cf)        ; => (NAME READY)
-  (funcall (elp:compiled-form-fn cf)
-           '((ready . t) (name . "Ada"))) ; => "Ada"
-  )
+  (elp:compiled-fn-free-vars cf)              ; => (NAME READY)
+  (funcall cf :ready t :name "Ada"))          ; => "Ada"
 ```
 
 ### Errors

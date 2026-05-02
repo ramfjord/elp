@@ -127,8 +127,8 @@
     (is (= 8 (elp:elp-template-error-column err)))))
 
 (test runtime-error-missing-context-key
-  "A free variable not present in the context-alist signals
-   elp-template-error from the binding prologue."
+  "A free variable that's referenced but not passed in the render
+   call signals elp-template-error from the supplied-p check."
   (let ((err (render-error "v=<%= deliberately-unbound-template-var %>"
                            '())))
     (is (typep err 'elp:elp-template-error))))
@@ -504,9 +504,9 @@
 ;;;; range for runtime error reporting, and the dolist body containing
 ;;;; the inner forms (the spanning-paren win — the reader appends
 ;;;; them naturally because it is mid-list when the stream transitions
-;;;; through %> ... text ... <%). compile-template wraps this body in
-;;;; a (let ((free-var (cdr (assoc 'free-var ctx))) ...) ...) over the
-;;;; runtime context-alist; this test pins the body shape only.
+;;;; through %> ... text ... <%). compile-template wraps this body
+;;;; in (lambda (stream &key var-1 var-2 ... &allow-other-keys) ...)
+;;;; — see BUILD-TEMPLATE-LAMBDA. This test pins the body shape only.
 
 (test build-template-body-shape
   "Body sexp for a fixture mixing text, an expression, and a dolist
@@ -538,12 +538,15 @@
 
 ;;;; Test Group 13: compile-template (compile once, render many)
 ;;;; ============================================================
-;;;; `(compile-template path)` returns a function of (CTX &OPTIONAL
-;;;; STREAM). The same function reused with different contexts must
-;;;; produce matching outputs — the win for issue #8. Missing context
-;;;; keys signal elp-template-error at the reference site (PROGV
-;;;; doesn't bind them, so the body's reference lands an unbound-
-;;;; variable error which the existing handler translates).
+;;;; `(compile-template path)` returns a function of
+;;;; (STREAM &KEY var-1 var-2 ... &ALLOW-OTHER-KEYS). The same
+;;;; function reused across calls with different keyword args must
+;;;; produce matching outputs — the win for issue #8. Keyword args
+;;;; absent from a call but referenced by the template signal
+;;;; elp-template-error: the supplied-p check inside the wrapper's
+;;;; handler-bind raises unbound-variable, which the handler
+;;;; translates with the right line/column. Extra keyword args
+;;;; pass through &allow-other-keys silently.
 
 (defmacro with-compiled-template ((tmpl-var template-string) &body body)
   "Compile TEMPLATE-STRING to a temp file and bind TMPL-VAR to the
@@ -556,8 +559,14 @@
          (cleanup-file ,path-var)))))
 
 (defun render-to-string (tmpl ctx)
-  "FUNCALL TMPL on CTX and capture output as a string."
-  (with-output-to-string (s) (funcall tmpl ctx s)))
+  "Call TMPL with CTX (an alist) and capture output as a string.
+   Adapts the alist used in tests to the kwargs convention
+   COMPILE-TEMPLATE's returned function expects."
+  (with-output-to-string (s)
+    (apply tmpl s
+           (loop for (k . v) in ctx
+                 collect (intern (symbol-name k) :keyword)
+                 collect v))))
 
 (test compile-template-returns-function
   "compile-template returns a callable function."
@@ -577,7 +586,7 @@
     (is (equal "Hi Bob!"   (render-to-string tmpl '((name . "Bob")))))))
 
 (test compile-template-reuse-across-contexts
-  "Same compiled function, multiple calls, different context-alists.
+  "Same compiled function, multiple calls, different keyword args.
    This is the win: compile once, render many."
   (with-compiled-template (tmpl "Name: <%= name %>, Age: <%= age %>")
     (is (equal "Name: Alice, Age: 30"
@@ -596,19 +605,17 @@
     (is (equal ""        (render-to-string tmpl '((show . nil)))))))
 
 (test compile-template-missing-context-key-errors
-  "Template variables not present in the context-alist signal
-   elp-template-error at the reference site — PROGV doesn't bind
-   them, so the unbound-variable error fires inside the
-   *current-template-span* let, and the handler picks up the right
-   line/column. (Note: a globally-bound symbol-value would shadow
-   this; the test uses a deliberately unique symbol name.)"
+  "A template variable that's referenced but not passed as a keyword
+   arg signals elp-template-error. The supplied-p check inside the
+   wrapper's handler-bind raises unbound-variable, which the handler
+   translates with the right line/column."
   (let ((path (template-string-to-file
                "v=<%= deliberately-unbound-template-var %>")))
     (unwind-protect
          (let* ((tmpl (elp:compile-template path))
                 (err  (handler-case
                           (progn
-                            (with-output-to-string (s) (funcall tmpl nil s))
+                            (with-output-to-string (s) (funcall tmpl s))
                             nil)
                         (elp:elp-template-error (c) c))))
            (is (typep err 'elp:elp-template-error)))
@@ -626,98 +633,96 @@
                (with-output-to-string (s)
                  (elp:render tmpl '((name . "Alice")) s))))))
 
-;;;; compile-form / compiled-form
+;;;; compile-form / compiled-fn
 
 (test compile-form-plain-reference
   "A bare symbol is a single free variable."
-  (let ((cf (elp:compile-form 'x)))
-    (is (equal '(x) (elp:compiled-form-free-vars cf)))
-    (is (= 7 (funcall (elp:compiled-form-fn cf) '((x . 7)))))))
+  (let ((compiled-fn (elp:compile-form 'x)))
+    (is (equal '(x) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 7 (funcall compiled-fn :x 7)))))
 
 (test compile-form-let-shadowing
   "Lexical bindings inside the form are not free."
-  (let ((cf (elp:compile-form '(let ((x 1)) (+ x y)))))
-    (is (equal '(y) (elp:compiled-form-free-vars cf)))
-    (is (= 11 (funcall (elp:compiled-form-fn cf) '((y . 10)))))))
+  (let ((compiled-fn (elp:compile-form '(let ((x 1)) (+ x y)))))
+    (is (equal '(y) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 11 (funcall compiled-fn :y 10)))))
 
 (test compile-form-let*-sequential
   "LET* binds left-to-right; refs inside the bindings see earlier names."
-  (let ((cf (elp:compile-form '(let* ((x 1) (y x)) (+ x y z)))))
-    (is (equal '(z) (elp:compiled-form-free-vars cf)))
-    (is (= 5 (funcall (elp:compiled-form-fn cf) '((z . 3)))))))
+  (let ((compiled-fn (elp:compile-form '(let* ((x 1) (y x)) (+ x y z)))))
+    (is (equal '(z) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 5 (funcall compiled-fn :z 3)))))
 
 (test compile-form-lambda-params
   "Lambda parameters shadow outer free vars within the lambda body."
-  (let ((cf (elp:compile-form '(funcall (lambda (a) (+ a b)) 1))))
-    (is (equal '(b) (elp:compiled-form-free-vars cf)))
-    (is (= 4 (funcall (elp:compiled-form-fn cf) '((b . 3)))))))
+  (let ((compiled-fn (elp:compile-form '(funcall (lambda (a) (+ a b)) 1))))
+    (is (equal '(b) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 4 (funcall compiled-fn :b 3)))))
 
 (test compile-form-flet-binds-and-leaks
   "FLET binds the function name; the body's free vars still escape."
-  (let ((cf (elp:compile-form '(flet ((f (x) (+ x y))) (f z)))))
-    (is (equal '(y z) (elp:compiled-form-free-vars cf)))
-    (is (= 12 (funcall (elp:compiled-form-fn cf) '((y . 5) (z . 7)))))))
+  (let ((compiled-fn (elp:compile-form '(flet ((f (x) (+ x y))) (f z)))))
+    (is (equal '(y z) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 12 (funcall compiled-fn :y 5 :z 7)))))
 
 (test compile-form-dolist-binding
   "DOLIST binds its iteration variable; surrounding refs are free."
-  (let ((cf (elp:compile-form '(let ((acc 0))
+  (let ((compiled-fn (elp:compile-form '(let ((acc 0))
                                  (dolist (i items acc)
                                    (incf acc (* i factor)))))))
-    (is (equal '(factor items) (elp:compiled-form-free-vars cf)))
-    (is (= 12 (funcall (elp:compiled-form-fn cf)
-                       '((items . (1 2 3)) (factor . 2)))))))
+    (is (equal '(factor items) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 12 (funcall compiled-fn :items '(1 2 3) :factor 2)))))
 
 (test compile-form-quoted-symbols-not-free
   "Symbols inside QUOTE forms are data, not references."
-  (let ((cf (elp:compile-form '(list 'a 'b c))))
-    (is (equal '(c) (elp:compiled-form-free-vars cf)))
-    (is (equal '(a b 9) (funcall (elp:compiled-form-fn cf) '((c . 9)))))))
+  (let ((compiled-fn (elp:compile-form '(list 'a 'b c))))
+    (is (equal '(c) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (equal '(a b 9) (funcall compiled-fn :c 9)))))
 
 (test compile-form-shadowing-eliminates-free-var
   "An outer let that supplies the only ref means no free vars escape."
-  (let ((cf (elp:compile-form '(let ((x 1)) (let ((x 2)) x)))))
-    (is (null (elp:compiled-form-free-vars cf)))
-    (is (= 2 (funcall (elp:compiled-form-fn cf) nil)))))
+  (let ((compiled-fn (elp:compile-form '(let ((x 1)) (let ((x 2)) x)))))
+    (is (null (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 2 (funcall compiled-fn)))))
 
 (test compile-form-function-position-not-free
   "Function names in operator position are not variable references."
-  (let ((cf (elp:compile-form '(+ 1 2))))
-    (is (null (elp:compiled-form-free-vars cf)))
-    (is (= 3 (funcall (elp:compiled-form-fn cf) nil)))))
+  (let ((compiled-fn (elp:compile-form '(+ 1 2))))
+    (is (null (elp:compiled-fn-free-vars compiled-fn)))
+    (is (= 3 (funcall compiled-fn)))))
 
 (test compile-form-keywords-not-free
   "Keywords are self-evaluating constants, not references."
-  (let ((cf (elp:compile-form '(list :tag x))))
-    (is (equal '(x) (elp:compiled-form-free-vars cf)))
-    (is (equal '(:tag 42) (funcall (elp:compiled-form-fn cf) '((x . 42)))))))
+  (let ((compiled-fn (elp:compile-form '(list :tag x))))
+    (is (equal '(x) (elp:compiled-fn-free-vars compiled-fn)))
+    (is (equal '(:tag 42) (funcall compiled-fn :x 42)))))
 
 (test compile-form-loop-binds-iteration-var
   "LOOP's FOR clause binds; the source list and accumulator vars are free."
-  (let ((cf (elp:compile-form '(loop for x in xs collect (+ x y)))))
-    (is (equal '(xs y) (elp:compiled-form-free-vars cf)))
+  (let ((compiled-fn (elp:compile-form '(loop for x in xs collect (+ x y)))))
+    (is (equal '(xs y) (elp:compiled-fn-free-vars compiled-fn)))
     (is (equal '(11 12 13)
-               (funcall (elp:compiled-form-fn cf)
-                        '((xs . (1 2 3)) (y . 10)))))))
+               (funcall compiled-fn :xs '(1 2 3) :y 10)))))
 
 (test compile-form-source-retained
   "SOURCE round-trips the original form verbatim."
   (let ((form '(if ready (process item) :skipped)))
-    (is (equal form (elp:compiled-form-source (elp:compile-form form))))))
+    (is (equal form (elp:compiled-fn-source (elp:compile-form form))))))
 
 (test compile-form-missing-context-key-signals
-  "Free vars not present in the alist signal an unbound-variable error."
-  (let ((cf (elp:compile-form '(+ x y))))
+  "Free vars not passed as keyword args signal an unbound-variable
+   error."
+  (let ((compiled-fn (elp:compile-form '(+ x y))))
     (signals unbound-variable
-      (funcall (elp:compiled-form-fn cf) '((x . 1))))))
+      (funcall compiled-fn :x 1))))
 
 (test compile-form-setf-is-lexical
   "SETF inside the form modifies the local lexical binding only;
    the host image's symbol-value cell is untouched."
   (makunbound 'lexical-setf-target)
-  (let ((cf (elp:compile-form '(progn (setf lexical-setf-target 99)
+  (let ((compiled-fn (elp:compile-form '(progn (setf lexical-setf-target 99)
                                       lexical-setf-target))))
-    (is (= 99 (funcall (elp:compiled-form-fn cf)
-                       '((lexical-setf-target . nil)))))
+    (is (= 99 (funcall compiled-fn :lexical-setf-target nil)))
     (is (not (boundp 'lexical-setf-target)))))
 
 ;;;; Run Tests
