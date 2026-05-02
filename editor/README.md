@@ -84,24 +84,28 @@ return {
     end,
   },
 
-  -- tree-sitter parser registration. Requires `tree-sitter` CLI on
-  -- PATH (`npm i -g tree-sitter-cli` or `pacman -S tree-sitter-cli`).
+  -- tree-sitter parser registration. Pattern from nvim-treesitter's
+  -- README under "Adding custom languages":
+  --   https://github.com/nvim-treesitter/nvim-treesitter#adding-custom-languages
+  -- Requires `tree-sitter` CLI on PATH (`npm i -g tree-sitter-cli` or
+  -- `pacman -S tree-sitter-cli`).
   {
     "nvim-treesitter/nvim-treesitter",
     branch = "main",
     opts = function(_, opts)
-      local elp_dir = require("lazy.core.config").plugins["elp-editor"].dir
-      local grammar = elp_dir .. "/editor/tree-sitter-elp"
-
       -- nvim-treesitter wipes and re-requires the parsers module on
       -- every install/update (see install.lua's reload_parsers), so
-      -- one-shot mutation gets flushed before the lookup runs. The
-      -- reload fires `User TSUpdate` afterward — register on that
-      -- and once eagerly to cover both startup and reloads.
+      -- one-shot mutation gets flushed. The reload fires `User
+      -- TSUpdate` afterward — register on that and once eagerly to
+      -- cover both startup and reloads.
       local function register()
         require("nvim-treesitter.parsers").elp = {
           install_info = {
-            path = grammar,
+            url = "https://github.com/ramfjord/elp",
+            -- Grammar lives in a subdirectory of the monorepo.
+            location = "editor/tree-sitter-elp",
+            -- grammar.js doesn't ship a pre-generated src/parser.c,
+            -- so nvim-treesitter has to run `tree-sitter generate`.
             generate = true,
             generate_from_json = false,
             queries = "queries",
@@ -121,6 +125,14 @@ return {
   },
 }
 ```
+
+The grammar is fetched from github separately from lazy's clone of
+the repo — slight storage duplication, but it sidesteps a class of
+ordering bugs (the parser registration would otherwise depend on
+`lazy.core.config.plugins["elp-editor"].dir` being populated before
+nvim-treesitter reads it). If you're hacking on `grammar.js` locally,
+swap `url=` for `path = "~/projects/elp/editor/tree-sitter-elp"` so
+`:TSUpdate elp` rebuilds from your working tree.
 
 After restart, LazyVim's treesitter config picks up `elp` in
 `ensure_installed` and runs `tree-sitter generate` + build. Verify:
