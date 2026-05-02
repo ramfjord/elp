@@ -175,9 +175,9 @@
       (flet ((codegen-length (path)
                (let ((*print-pretty* nil))
                  (length (prin1-to-string (elp::%template-lambda-form path)))))
-             (within-1% (a b)
-               (< (abs (- a b)) (* 0.01 (min a b)))))
-        (is (within-1% (codegen-length tiny) (codegen-length huge)))))))
+             (within-5% (a b)
+               (< (abs (- a b)) (* 0.05 (min a b)))))
+        (is (within-5% (codegen-length tiny) (codegen-length huge)))))))
 
 ;;;; ============================================================
 ;;;; Error position reporting

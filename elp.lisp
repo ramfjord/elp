@@ -58,29 +58,16 @@
 
 ;;;; Runtime helpers
 ;;;;
-;;;; Functions tagged with DEFINE-HELPER are installed both as top-level
-;;;; DEFUNs (for REPL / M-. ergonomics) and registered in
-;;;; *HELPER-SOURCES*, so the codegen in BUILD-TEMPLATE-LAMBDA can
-;;;; splice them into a LABELS block at the head of the generated
-;;;; render program. That keeps the lambda recovered via FUNCTION-
-;;;; LAMBDA-EXPRESSION self-contained: a printed form can be re-
-;;;; EVAL'd without depending on these specific internals being
-;;;; present.
+;;;; Plain package-internal DEFUNs. The generated render lambda
+;;;; references them by package-qualified name (`elp::%mmap-open`,
+;;;; `elp::byte->line+column`, etc.), so the lambda depends on the
+;;;; :elp package being loaded — same as it depends on `elp::
+;;;; *current-template-span*` and the ELP-TEMPLATE-ERROR condition
+;;;; class. We don't try to make the printed lambda re-evaluable in
+;;;; isolation; that would also require splicing the condition
+;;;; class definition and the special variable, which we don't.
 
-(defvar *helper-sources* '()
-  "List of (NAME LAMBDA-LIST . BODY) entries, in registration order, for
-   helpers that should be embedded as LABELS in generated render code.")
-
-(defmacro define-helper (name lambda-list &body body)
-  "Like DEFUN, but also records the source under *HELPER-SOURCES* so the
-   codegen can embed the helper as a LABELS clause."
-  `(progn
-     (setf *helper-sources*
-           (append (remove ',name *helper-sources* :key #'car)
-                   (list '(,name ,lambda-list ,@body))))
-     (defun ,name ,lambda-list ,@body)))
-
-(define-helper byte->line+column (ptr size byte-offset)
+(defun byte->line+column (ptr size byte-offset)
   "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in the
    mmap'd region PTR[0,SIZE). ASCII column semantics. Counts newlines
    in the prefix [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the
@@ -106,7 +93,7 @@
 (defconstant +map-private+ #x2)
 (defconstant +o-rdonly+    0)
 
-(define-helper %mmap-open (pathname)
+(defun %mmap-open (pathname)
   "Open PATHNAME read-only and mmap it. Returns (values mmap-pointer file-size fd)."
   (let* ((namestr (namestring pathname))
          (fd (cffi:foreign-funcall "open" :string namestr :int #.+o-rdonly+ :int))
@@ -126,7 +113,7 @@
         (error "mmap(2) failed for ~A" pathname))
       (values ptr size fd))))
 
-(define-helper %mmap-close (ptr size fd)
+(defun %mmap-close (ptr size fd)
   "Unmap PTR (of SIZE bytes) and close FD."
   (cffi:foreign-funcall "munmap" :pointer ptr :size size :int)
   (cffi:foreign-funcall "close"  :int fd :int))
@@ -147,7 +134,7 @@
            (- (cffi:pointer-address found)
               (cffi:pointer-address haystack-ptr))))))
 
-(define-helper %memchr (haystack-ptr haystack-len byte)
+(defun %memchr (haystack-ptr haystack-len byte)
   "Return the byte offset of BYTE (an integer 0–255) in HAYSTACK-PTR[0,HAYSTACK-LEN),
    or NIL if not present. Wraps libc's vectorized memchr(3)."
   (let ((found (cffi:foreign-funcall "memchr"
@@ -229,23 +216,14 @@
 (defun build-template-lambda (pathname body)
   "Wrap BODY as a `(lambda (stream &key …))` ready for COMPILE. Each
    free variable in BODY becomes a keyword parameter that errors with
-   UNBOUND-VARIABLE when its key is absent at call time. Helpers from
-   *HELPER-SOURCES* are spliced in as a LABELS block (so the lambda
-   recovered via FUNCTION-LAMBDA-EXPRESSION is self-contained); a
-   top-level (DECLARE (IGNORABLE …)) silences per-template notes for
-   helpers a given body doesn't reach.
+   UNBOUND-VARIABLE when its key is absent at call time.
 
    Free vars are determined by walking a candidate form that mirrors
-   the wrapper's lexical scope (multiple-value-bind etc.), so
-   helper-introduced names like PTR / SIZE / FD aren't surfaced as
-   free. The walk runs against a lambda with no &key params, so the
-   keyword list is always free of itself."
-  (let* ((helpers
-          (mapcar (lambda (entry)
-                    (destructuring-bind (name lambda-list &rest body) entry
-                      `(,name ,lambda-list ,@body)))
-                  *helper-sources*))
-         (handler-clauses
+   the wrapper's lexical scope (multiple-value-bind etc.), so wrapper-
+   introduced names like PTR / SIZE / FD aren't surfaced as free. The
+   walk runs against a lambda with no &key params, so the keyword
+   list is always free of itself."
+  (let* ((handler-clauses
           `((elp-template-error (lambda (c) (error c)))
             (error
               (lambda (c)
@@ -264,52 +242,44 @@
          (candidate
           `(lambda (&optional (stream *standard-output*))
              (let ((*standard-output* stream))
-               (labels ,helpers
-                 (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-                   (unwind-protect (handler-bind ,handler-clauses ,body)
-                     (%mmap-close ptr size fd))))
+               (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
+                 (unwind-protect (handler-bind ,handler-clauses ,body)
+                   (%mmap-close ptr size fd)))
                (values))))
          (free-vars (form-free-vars candidate))
-         (sups (loop repeat (length free-vars) collect (gensym "SUP")))
+         (supplied-p-vars
+          (mapcar (lambda (var)
+                    (gensym (format nil "~A-SUPPLIED-P-" var)))
+                  free-vars))
          (key-params
-          (loop for var in free-vars
-                for sup in sups
-                collect `((,(intern (symbol-name var) :keyword) ,var)
-                          nil
-                          ,sup)))
+          (mapcar (lambda (var supplied-p)
+                    `((,(intern (symbol-name var) :keyword) ,var)
+                      nil
+                      ,supplied-p))
+                  free-vars supplied-p-vars))
          ;; Check missing keys *inside* handler-bind so the
          ;; unbound-variable signal becomes an elp-template-error
          ;; with line/column rather than an unwrapped runtime error.
          ;; If we used `(error 'unbound-variable …)` as a &key default
          ;; the signal would fire outside handler-bind and escape.
          (key-checks
-          (loop for var in free-vars
-                for sup in sups
-                collect `(unless ,sup
-                           (error 'unbound-variable :name ',var))))
-         ;; See COMPILE-FORM: walking annotates BODY's cons cells in a
+          (mapcar (lambda (var supplied-p)
+                    `(unless ,supplied-p
+                       (error 'unbound-variable :name ',var)))
+                  free-vars supplied-p-vars))
+         ;; HU.DWIM.WALKER:WALK-FORM annotates BODY's cons cells in a
          ;; way that primes SBCL's "unknown variable" warnings. Splice
          ;; a fresh copy into the final form.
          (body-fresh (copy-tree body)))
     `(lambda (stream &key ,@key-params &allow-other-keys)
        (let ((*standard-output* stream))
-         (labels ,helpers
-           ;; Only WRITE-OUTPUT-RANGE is conditionally reached (a
-           ;; template with no text chunks never calls it). The other
-           ;; helpers are always called by the wrapper code generated
-           ;; just below — %MMAP-OPEN/CLOSE in the multiple-value-bind
-           ;; and unwind-protect, BYTE->LINE+COLUMN (and via it %MEMCHR)
-           ;; from the error-translating handler. If any of those go
-           ;; "unused," that's a real codegen regression, so we don't
-           ;; mask the warning here.
-           (declare (ignorable #'write-output-range))
-           (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-             (unwind-protect
-                  (handler-bind ,handler-clauses
-                    ,@key-checks
-                    ,body-fresh)
-               (%mmap-close ptr size fd))))
-         (values)))))
+         (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
+           (unwind-protect
+                (handler-bind ,handler-clauses
+                  ,@key-checks
+                  ,body-fresh)
+             (%mmap-close ptr size fd))))
+       (values))))
 
 (defun compile-template (pathname)
   "Compile the template at PATHNAME and return a function of
@@ -331,7 +301,7 @@
 
 ;;;; Internal Helper Functions
 
-(define-helper write-output-range (mmap-ptr start end &optional (stream *standard-output*))
+(defun write-output-range (mmap-ptr start end &optional (stream *standard-output*))
   "Write bytes [START, END) from MMAP-PTR to STREAM.
 
    When STREAM is an SBCL fd-stream (e.g. stdout), flushes any buffered output
