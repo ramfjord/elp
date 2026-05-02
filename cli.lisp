@@ -84,7 +84,8 @@
                 (let ((*print-pretty* t)
                       (*print-readably* nil)
                       (*package* (find-package :elp)))
-                  (prin1 (template-code (pathname template-file)))
+                  (prin1 (function-lambda-expression
+                          (compile-template (pathname template-file))))
                   (terpri))
                 ;; Render the template, streaming output through *standard-output*.
                 ;; In a saved binary, *standard-output* is an sb-sys:fd-stream, so

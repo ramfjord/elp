@@ -11,7 +11,6 @@
    ;; Primary public API
    :render
    :compile-template
-   :template-code
    ;; Form introspection
    :compile-form
    :compiled-fn
@@ -68,9 +67,10 @@
 ;;;; DEFUNs (for REPL / M-. ergonomics) and registered in
 ;;;; *HELPER-SOURCES*, so the codegen in BUILD-TEMPLATE-LAMBDA can
 ;;;; splice them into a LABELS block at the head of the generated
-;;;; render program. That keeps TEMPLATE-CODE output self-contained:
-;;;; a printed form can be re-EVAL'd without depending on these
-;;;; specific internals being present.
+;;;; render program. That keeps the lambda recovered via FUNCTION-
+;;;; LAMBDA-EXPRESSION self-contained: a printed form can be re-
+;;;; EVAL'd without depending on these specific internals being
+;;;; present.
 
 (defvar *helper-sources* '()
   "List of (NAME LAMBDA-LIST . BODY) entries, in registration order, for
@@ -87,10 +87,9 @@
 
 (define-helper byte->line+column (ptr size byte-offset)
   "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in the
-   mmap'd region PTR[0,SIZE). Counts newlines in the prefix
-   [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the per-line cost
-   is one foreign call rather than one read-char per byte. ASCII column
-   semantics, same as the previous implementation."
+   mmap'd region PTR[0,SIZE). ASCII column semantics. Counts newlines
+   in the prefix [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the
+   per-line cost is one foreign call rather than one read-char per byte."
   (let* ((target (min byte-offset size))
          (line 1)
          (line-start 0)
@@ -274,9 +273,9 @@
 
 ;;;; Public API
 
-(defgeneric render (input context-alist &optional stream)
-  (:documentation "Render a template from INPUT with CONTEXT-ALIST, writing
-   directly to STREAM (defaults to *STANDARD-OUTPUT*).
+(defgeneric render (input stream &rest kwargs)
+  (:documentation "Render a template from INPUT to STREAM, passing
+   KWARGS through as the template's free-variable bindings.
 
    Output bytes go to STREAM as they are produced, with no intermediate
    Lisp string. When STREAM is an SB-SYS:FD-STREAM (e.g. the CLI's
@@ -284,24 +283,23 @@
    single WRITE(2) syscall directly on the mmap'd source — zero copy
    through Lisp.
 
-   INPUT is a pathname; the file is mmap'd once, walked by the standard
-   Lisp reader through a TEMPLATE-STREAM (via BUILD-RENDER-FORM), and
-   the resulting body sexp is evaluated against the same mapping.
+   INPUT is either a pathname (compiled and rendered in one step) or a
+   function previously returned by COMPILE-TEMPLATE. KWARGS is the
+   plist of `:name value :port value …` entries the template's free
+   variables consume; missing required keys signal ELP-TEMPLATE-ERROR
+   with line/column information, extras pass through &allow-other-keys
+   and are silently dropped.
+
    Returns no useful value; consumers care about side effects on
    STREAM. Wrap in WITH-OUTPUT-TO-STRING if you want the output as a
    string."))
 
-(defun template-code (pathname)
-  "Return the self-contained sexp that COMPILE-TEMPLATE compiles.
-   Useful for debugging (`prin1` it) and for the CLI's `--print`
-   flag. The form is a `(lambda (&optional stream) &key …)` whose
-   keyword parameters are exactly the template's free variables
-   (one per `<%= var %>`-style reference); each defaults to
-   `(error 'unbound-variable :name 'var)` so missing keys raise at
-   call time."
+(defun %template-lambda-form (pathname)
+  "Return the (lambda (stream &key …)) sexp that COMPILE-TEMPLATE
+   compiles."
   (let ((file-size (with-open-file (f pathname) (file-length f))))
     (when (zerop file-size)
-      (return-from template-code
+      (return-from %template-lambda-form
         '(lambda (stream &key &allow-other-keys)
           (declare (ignore stream))
           (values)))))
@@ -312,26 +310,19 @@
       (build-template-lambda pathname body))))
 
 (defun build-template-lambda (pathname body)
-  "Wrap BODY as a `(lambda (&optional stream) &key …)` ready for
-   COMPILE. Each free variable in BODY becomes a keyword parameter
-   that errors with UNBOUND-VARIABLE when its key is absent at call
-   time, replacing the older CTX-alist + LET-prologue shape. Two
-   warning-quality wins: (1) no CTX parameter to flag as unused when
-   a template has zero free vars; (2) every &key var is by
-   construction one the body uses, so SBCL's unused-variable analysis
-   has no spurious targets. Helpers from *HELPER-SOURCES* are spliced
-   in as a LABELS block (so a printed TEMPLATE-CODE form is
-   self-contained); a top-level (DECLARE (IGNORABLE …)) silences
-   per-template notes for helpers a given body doesn't reach.
+  "Wrap BODY as a `(lambda (stream &key …))` ready for COMPILE. Each
+   free variable in BODY becomes a keyword parameter that errors with
+   UNBOUND-VARIABLE when its key is absent at call time. Helpers from
+   *HELPER-SOURCES* are spliced in as a LABELS block (so the lambda
+   recovered via FUNCTION-LAMBDA-EXPRESSION is self-contained); a
+   top-level (DECLARE (IGNORABLE …)) silences per-template notes for
+   helpers a given body doesn't reach.
 
    Free vars are determined by walking a candidate form that mirrors
    the wrapper's lexical scope (multiple-value-bind etc.), so
    helper-introduced names like PTR / SIZE / FD aren't surfaced as
    free. The walk runs against a lambda with no &key params, so the
-   keyword list is always free of itself.
-
-   COMPILE-TEMPLATE wraps the returned lambda to preserve the public
-   `(ctx &optional stream)` contract — the &key shape is internal."
+   keyword list is always free of itself."
   (let* ((helpers
           (mapcar (lambda (entry)
                     (destructuring-bind (name lambda-list &rest body) entry
@@ -413,24 +404,13 @@
    arguments are silently ignored, so callers can pass a
    comprehensive bag of bindings and let each template pick the
    subset it needs."
-  (compile nil (template-code pathname)))
+  (compile nil (%template-lambda-form pathname)))
 
-(defmethod render ((fn function) context-alist
-                   &optional (stream *standard-output*))
-  ;; The public render contract is alist-based for ergonomics
-  ;; (callers passing a single context dictionary). The compiled
-  ;; function itself is &key-flavored — see COMPILE-TEMPLATE — so
-  ;; this method is the single adapter from alist to plist. Every
-  ;; alist entry becomes one (keyword value) pair; extras pass
-  ;; through and get dropped at the function's &allow-other-keys.
-  (apply fn stream
-         (loop for (k . v) in context-alist
-               collect (intern (symbol-name k) :keyword)
-               collect v)))
+(defmethod render ((fn function) stream &rest kwargs)
+  (apply fn stream kwargs))
 
-(defmethod render ((pathname pathname) context-alist
-                   &optional (stream *standard-output*))
-  (render (compile-template pathname) context-alist stream))
+(defmethod render ((pathname pathname) stream &rest kwargs)
+  (apply (compile-template pathname) stream kwargs))
 
 ;;;; Internal Helper Functions
 
@@ -458,12 +438,8 @@
 
 (defun build-template-body (pathname ptr size)
   "Read the template at PTR[0,SIZE) through a TEMPLATE-STREAM and
-   return the inner body sexp `(progn ,@forms)` — without any
-   context-binding wrapper.
-
-   Reader errors are translated into ELP-TEMPLATE-ERROR via the
-   stream's POSITION-MAP — no intermediate body-string assembly,
-   no checkpoints list reconstruction."
+   return the inner body sexp `(progn ,@forms)`. Reader errors are
+   translated into ELP-TEMPLATE-ERROR via the stream's POSITION-MAP."
   (let* ((stream (make-instance 'template-stream :ptr ptr :size size))
          (forms  '()))
     (handler-case
