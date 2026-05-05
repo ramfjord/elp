@@ -100,4 +100,69 @@ function M.cursor_in_code(bufnr)
   return M.position_in_code(bufnr, pos[1] - 1, pos[2])
 end
 
+--- Return BUFNR's text with non-code regions blanked to whitespace.
+---
+--- Used by host-language LSP clients (e.g. swank-lsp.nvim) to feed an
+--- ELP buffer through a server that only understands the host
+--- language. The transform preserves byte offsets and newlines, so
+--- positions in the original buffer map 1:1 to positions in the
+--- output — no translation needed on responses.
+---
+--- Specifically:
+---   - Bytes inside `code` nodes whose parent is `directive` or
+---     `output_directive` are kept verbatim.
+---   - Everything else (literal content, tag delimiters `<%`/`%>`,
+---     trim markers, comment directives) is replaced with spaces,
+---     except newlines, which are preserved.
+---
+--- Requires the tree-sitter `elp` parser. Returns nil if it isn't
+--- available — callers should fall back to sending the original text
+--- untransformed (or skip the LSP feature) rather than guessing.
+function M.extract_code_text(bufnr)
+  bufnr = bufnr or 0
+
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, "elp")
+  if not (ok and parser) then return nil end
+  local tree = (parser:parse() or {})[1]
+  if not tree then return nil end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  if #lines == 0 then return "" end
+
+  -- Start with every line blanked out; we'll splice keep-ranges back in.
+  local out = {}
+  for i, line in ipairs(lines) do
+    out[i] = string.rep(" ", #line)
+  end
+
+  -- Replace the blanked text in OUT[start_row..end_row] with the
+  -- original bytes from LINES, only within the given column range.
+  -- Operates in-place on OUT. All coords are 0-indexed.
+  local function splice_keep(start_row, start_col, end_row, end_col)
+    for row = start_row, end_row do
+      local original_line = lines[row + 1] or ""
+      local keep_from_col = (row == start_row) and start_col or 0
+      local keep_to_col   = (row == end_row) and end_col or #original_line
+      local blanked = out[row + 1] or ""
+      out[row + 1] = blanked:sub(1, keep_from_col)
+                  .. original_line:sub(keep_from_col + 1, keep_to_col)
+                  .. blanked:sub(keep_to_col + 1)
+    end
+  end
+
+  local function visit(node)
+    if node:type() == "code" then
+      local parent = node:parent()
+      local pt = parent and parent:type()
+      if pt == "directive" or pt == "output_directive" then
+        splice_keep(node:range())
+      end
+    end
+    for child in node:iter_children() do visit(child) end
+  end
+  visit(tree:root())
+
+  return table.concat(out, "\n")
+end
+
 return M

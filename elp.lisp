@@ -16,7 +16,10 @@
    :elp-template-error-file
    :elp-template-error-line
    :elp-template-error-column
-   :elp-template-error-original))
+   :elp-template-error-original
+   ;; Embedded-language helpers — for tools that want only the code
+   :code-byte-ranges
+   :extract-code-text))
 
 
 (in-package :elp)
@@ -646,4 +649,68 @@
   (setf (ts-pushback s) char)
   (decf (ts-chars-read s))
   nil)
+
+;;;; Embedded-language helpers.
+;;;;
+;;;; ELP files mix template text with embedded Lisp code. Tooling that
+;;;; wants to operate on just the Lisp parts (Lisp-LSPs that don't know
+;;;; ELP, formatters, linters) can use these to identify and extract
+;;;; the code regions. Byte offsets are preserved end-to-end so editor
+;;;; positions round-trip without translation.
+
+(defun code-byte-ranges (text)
+  "Return a list of (START . END) source-byte ranges that are code
+   (`<% ... %>`) or expression (`<%= ... %>`) regions in TEXT.
+   Comments are excluded.
+
+   Bytes are interpreted as Latin-1 (1 byte = 1 character), matching
+   ELP's existing model. UTF-8 multibyte content inside template text
+   still tokenizes correctly (delimiters are ASCII), but non-ASCII
+   inside a code region may not match an editor's UTF-8 / UTF-16
+   position expectations."
+  (let* ((size (length text))
+         (ptr  (cffi:foreign-string-alloc text :encoding :latin-1))
+         (ranges '()))
+    (unwind-protect
+         (let ((stream (make-instance 'template-stream :ptr ptr :size size)))
+           (loop
+             (when (>= (ts-cursor stream) size) (return))
+             (let ((after-text-end (ts-find-code-start stream)))
+               (when (eq after-text-end :eof) (return))
+               ;; Cursor sits past `<%` or `<%-`. Classify the body
+               ;; flavor by the byte at cursor — same logic as
+               ;; TS-PARSE-TAG-CHUNK, but emitting source ranges
+               ;; instead of reader-ready chunks.
+               (let* ((after-open (ts-cursor stream))
+                      (first-byte (and (< after-open size)
+                                       (%byte-at ptr after-open)))
+                      (flavor (cond ((eql first-byte (char-code #\=)) :expr)
+                                    ((eql first-byte (char-code #\#)) :comment)
+                                    (t                                :code)))
+                      (body-start (if (eq flavor :code)
+                                      after-open
+                                      (1+ after-open))))
+                 (setf (ts-cursor stream) body-start)
+                 (let ((body-end (ts-find-code-end stream)))
+                   (unless (eq flavor :comment)
+                     (push (cons body-start body-end) ranges)))))))
+      (cffi:foreign-string-free ptr))
+    (nreverse ranges)))
+
+(defun extract-code-text (text)
+  "Return TEXT with non-code regions blanked to whitespace, newlines
+   preserved. Byte offsets and line/column positions in the result
+   match TEXT exactly — useful for feeding through a Lisp-only parser
+   while keeping editor coordinates round-trippable.
+
+   Uses CHAR (not SCHAR) when reading from TEXT since LSP-provided
+   strings can be non-simple."
+  (let ((canvas (make-string (length text) :initial-element #\Space)))
+    (loop for i from 0 below (length text)
+          when (char= (char text i) #\Newline)
+            do (setf (schar canvas i) #\Newline))
+    (dolist (range (code-byte-ranges text))
+      (loop for i from (car range) below (cdr range)
+            do (setf (schar canvas i) (char text i))))
+    canvas))
 

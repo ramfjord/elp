@@ -253,8 +253,8 @@
    diffs."
   (let ((path (merge-pathnames "tests/fixtures/large.elp"
                                (or *load-pathname* *default-pathname-defaults*))))
-    (unless (probe-file path)
-      (skip "fixture missing — run `make test-fixtures` to generate ~A" path))
+    (if (not (probe-file path))
+        (skip "fixture missing — run `make test-fixtures` to generate ~A" path)
     (let* ((file-size (with-open-file (f path) (file-length f)))
            (buf (make-array 65536 :element-type '(unsigned-byte 8))))
       (is (> file-size (* 10 1024 1024))
@@ -278,7 +278,67 @@
                   (/ file-size 1024.0 1024.0) baseline-ms read-ms ratio)
           (is (< ratio 8.0)
               "read step should stay within 8x of a raw file read; got ~,2Fx (~,0F ms vs ~,0F ms)"
-              ratio read-ms baseline-ms))))))
+              ratio read-ms baseline-ms)))))))
+
+;;;; ============================================================
+;;;; Embedded-language helpers — code-byte-ranges + extract-code-text.
+
+(test code-byte-ranges-basic-tags
+  "<%, <%=, <%# classified correctly; comment ranges excluded."
+  (let ((text "<%- (foo) -%>literal<%= bar %><%# secret %>tail"))
+    ;; <%- (foo) -%>:  body bytes 3..10 (" (foo) ")
+    ;; <%= bar %>:     body bytes 23..28 (" bar ")
+    ;; <%# secret %>:  comment, excluded
+    (is (equal '((3 . 10) (23 . 28))
+               (elp:code-byte-ranges text)))))
+
+(test code-byte-ranges-no-tags-returns-empty
+  "Plain text with no <% has no code regions."
+  (is (null (elp:code-byte-ranges "hello world")))
+  (is (null (elp:code-byte-ranges ""))))
+
+(test code-byte-ranges-multiline
+  "Tags spanning newlines: range covers all body bytes including \\n."
+  (let* ((text "before
+<%- (a)
+    (b) -%>
+after")
+         (ranges (elp:code-byte-ranges text)))
+    (is (= 1 (length ranges)))
+    (let* ((start (car (first ranges)))
+           (end   (cdr (first ranges)))
+           (body  (subseq text start end)))
+      (is (search "(a)" body))
+      (is (search "(b)" body)))))
+
+(test code-byte-ranges-trim-modifiers
+  "<%- and -%> trim markers aren't part of the body range."
+  (let* ((text "<%- (foo) -%>")
+         (ranges (elp:code-byte-ranges text))
+         (body  (subseq text (car (first ranges)) (cdr (first ranges)))))
+    (is (search "(foo)" body))
+    (is (not (search "-" body)))))
+
+(test extract-code-text-byte-equivalence
+  "Output is the same length as input; non-code bytes blanked to space."
+  (let* ((text "hello<%= bar %>world")
+         (out  (elp:extract-code-text text)))
+    (is (= (length text) (length out)))
+    (is (string= "     " (subseq out 0 5)))      ;; "hello"
+    (is (string= "     " (subseq out 15 20)))    ;; "world"
+    (is (string= "    bar  " (subseq out 5 14))) ;; <%= bar %> body kept
+    ))
+
+(test extract-code-text-preserves-newlines
+  "Newlines in the source survive blanking — line numbers don't shift."
+  (let* ((text "line1
+line2
+<%= bar %>")
+         (out  (elp:extract-code-text text)))
+    (is (char= #\Newline (char out 5)))
+    (is (char= #\Newline (char out 11)))
+    (is (string= "     " (subseq out 0 5)))    ;; pre-tag blanked
+    (is (string= "     " (subseq out 6 11)))))
 
 ;;;; ============================================================
 
