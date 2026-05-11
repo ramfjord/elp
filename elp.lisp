@@ -667,9 +667,19 @@
    ELP's existing model. UTF-8 multibyte content inside template text
    still tokenizes correctly (delimiters are ASCII), but non-ASCII
    inside a code region may not match an editor's UTF-8 / UTF-16
-   position expectations."
+   position expectations.
+
+   Characters outside the latin-1 range (em-dash, smart-quotes, arrow
+   glyphs in template text, etc.) get substituted with #\\? in the
+   foreign buffer used for delimiter scanning — they're invisible to
+   the ASCII-only tag tokenizer either way, and the output canvas is
+   built from the original Lisp string, not from this buffer, so the
+   substitution doesn't affect what extract-code-text returns."
   (let* ((size (length text))
-         (ptr  (cffi:foreign-string-alloc text :encoding :latin-1))
+         (sanitized (map 'string
+                         (lambda (c) (if (< (char-code c) 256) c #\?))
+                         text))
+         (ptr  (cffi:foreign-string-alloc sanitized :encoding :latin-1))
          (ranges '()))
     (unwind-protect
          (let ((stream (make-instance 'template-stream :ptr ptr :size size)))
