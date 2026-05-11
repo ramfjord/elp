@@ -4,29 +4,12 @@
 ;;;;   <%= lisp-expression %>  - outputs the result
 ;;;;   <% lisp-code %>         - executes code without output
 ;;;;   <%# comment %>          - comments (removed from output)
-
-(defpackage :elp
-  (:use :cl :alexandria)
-  (:export
-   ;; Primary public API
-   :render
-   :compile-template
-   ;; Error condition
-   :elp-template-error
-   :elp-template-error-file
-   :elp-template-error-line
-   :elp-template-error-column
-   :elp-template-error-original
-   ;; Embedded-language helpers — for tools that want only the code
-   :code-byte-ranges
-   :extract-code-text
-   ;; Stream interface — full lambda-form character stream with
-   ;; source-byte round-trip for the body bytes
-   :open-template-stream
-   :stream-byte-position
-   :template-stream
-   :wrapped-template-stream))
-
+;;;;
+;;;; Package definition is in src/package.lisp; SOURCE protocol +
+;;;; backends (MMAP-SOURCE / STRING-SOURCE) are in src/source.lisp.
+;;;; This file holds the template engine itself: free-vars walker,
+;;;; render API, gray-stream parser, codegen, and public stream entry
+;;;; points.
 
 (in-package :elp)
 
@@ -64,95 +47,6 @@
 (defvar *current-template-span* nil
   "When non-nil, a list (file-byte-start file-byte-end) identifying the
    byte range in the source template currently being evaluated.")
-
-;;;; Runtime helpers
-;;;;
-;;;; Plain package-internal DEFUNs. The generated render lambda
-;;;; references them by package-qualified name (`elp::%mmap-open`,
-;;;; `elp::byte->line+column`, etc.), so the lambda depends on the
-;;;; :elp package being loaded — same as it depends on `elp::
-;;;; *current-template-span*` and the ELP-TEMPLATE-ERROR condition
-;;;; class. We don't try to make the printed lambda re-evaluable in
-;;;; isolation; that would also require splicing the condition
-;;;; class definition and the special variable, which we don't.
-
-(defun byte->line+column (ptr size byte-offset)
-  "Return (values LINE COLUMN) — both 1-based — for BYTE-OFFSET in the
-   mmap'd region PTR[0,SIZE). ASCII column semantics. Counts newlines
-   in the prefix [0, MIN(BYTE-OFFSET, SIZE)) using libc memchr, so the
-   per-line cost is one foreign call rather than one read-char per byte."
-  (let* ((target (min byte-offset size))
-         (line 1)
-         (line-start 0)
-         (cursor 0))
-    (loop while (< cursor target) do
-      (let ((rel (%memchr (cffi:inc-pointer ptr cursor)
-                          (- target cursor)
-                          (char-code #\newline))))
-        (cond
-          ((null rel) (return))
-          (t (incf line)
-             (setf line-start (+ cursor rel 1))
-             (setf cursor line-start)))))
-    (values line (1+ (- target line-start)))))
-
-;;;; mmap support
-
-(defconstant +prot-read+   #x1)
-(defconstant +map-private+ #x2)
-(defconstant +o-rdonly+    0)
-
-(defun %mmap-open (pathname)
-  "Open PATHNAME read-only and mmap it. Returns (values mmap-pointer file-size fd)."
-  (let* ((namestr (namestring pathname))
-         (fd (cffi:foreign-funcall "open" :string namestr :int #.+o-rdonly+ :int))
-         (size (with-open-file (f pathname) (file-length f))))
-    (when (< fd 0)
-      (error "open(2) failed for ~A" pathname))
-    (let ((ptr (cffi:foreign-funcall "mmap"
-                                     :pointer (cffi:null-pointer)
-                                     :size    size
-                                     :int     #.+prot-read+
-                                     :int     #.+map-private+
-                                     :int     fd
-                                     :size    0
-                                     :pointer)))
-      (when (cffi:pointer-eq ptr (cffi:make-pointer (1- (expt 2 64))))
-        (cffi:foreign-funcall "close" :int fd :int)
-        (error "mmap(2) failed for ~A" pathname))
-      (values ptr size fd))))
-
-(defun %mmap-close (ptr size fd)
-  "Unmap PTR (of SIZE bytes) and close FD."
-  (cffi:foreign-funcall "munmap" :pointer ptr :size size :int)
-  (cffi:foreign-funcall "close"  :int fd :int))
-
-;;;; Vectorized byte search (libc memmem / memchr)
-
-(defun %memmem (haystack-ptr haystack-len needle)
-  "Return the byte offset of NEEDLE (an ASCII string) in HAYSTACK-PTR[0,HAYSTACK-LEN),
-   or NIL if not present. Wraps glibc's vectorized memmem(3)."
-  (cffi:with-foreign-string ((nptr nbytes) needle
-                             :encoding :ascii
-                             :null-terminated-p nil)
-    (let ((found (cffi:foreign-funcall "memmem"
-                                       :pointer haystack-ptr :size haystack-len
-                                       :pointer nptr         :size nbytes
-                                       :pointer)))
-      (and (not (cffi:null-pointer-p found))
-           (- (cffi:pointer-address found)
-              (cffi:pointer-address haystack-ptr))))))
-
-(defun %memchr (haystack-ptr haystack-len byte)
-  "Return the byte offset of BYTE (an integer 0–255) in HAYSTACK-PTR[0,HAYSTACK-LEN),
-   or NIL if not present. Wraps libc's vectorized memchr(3)."
-  (let ((found (cffi:foreign-funcall "memchr"
-                                     :pointer haystack-ptr :int byte
-                                     :size    haystack-len
-                                     :pointer)))
-    (and (not (cffi:null-pointer-p found))
-         (- (cffi:pointer-address found)
-            (cffi:pointer-address haystack-ptr)))))
 
 ;;;; Free-variable analysis
 ;;;;
@@ -216,44 +110,47 @@
         '(lambda (stream &key &allow-other-keys)
           (declare (ignore stream))
           (values)))))
-  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
-    (let ((body (unwind-protect
-                     (build-template-body pathname ptr size)
-                  (%mmap-close ptr size fd))))
-      (build-template-lambda pathname body))))
+  (let ((source (open-mmap-source pathname)))
+    (let ((body (unwind-protect (build-template-body source)
+                  (close-mmap-source source))))
+      (build-template-lambda source body))))
 
-(defun build-template-lambda (pathname body)
+(defun build-template-lambda (source body)
   "Wrap BODY as a `(lambda (stream &key …))` ready for COMPILE. Each
    free variable in BODY becomes a keyword parameter that errors with
    UNBOUND-VARIABLE when its key is absent at call time.
 
+   The source-specific outer wrapper (mmap mvb + unwind-protect for
+   mmap-source; identity for string-source) comes from
+   SOURCE-WRAP-LAMBDA-BODY. That wrap binds a fresh runtime SOURCE
+   lexical (named ELP::SOURCE) so the handler-bind here can call
+   SOURCE-LINE+COLUMN / SOURCE-NAME generically.
+
    Free vars are determined by walking a candidate form that mirrors
-   the wrapper's lexical scope (multiple-value-bind etc.), so wrapper-
-   introduced names like PTR / SIZE / FD aren't surfaced as free. The
-   walk runs against a lambda with no &key params, so the keyword
-   list is always free of itself."
+   the wrapper's lexical scope, so wrapper-introduced names aren't
+   surfaced as free."
   (let* ((handler-clauses
           `((elp-template-error (lambda (c) (error c)))
             (error
               (lambda (c)
                 (multiple-value-bind (line col)
                     (if *current-template-span*
-                        (byte->line+column ptr size
-                                           (first *current-template-span*))
+                        (source-line+column elp::source
+                                            (first *current-template-span*))
                         (values 1 1))
                   (error 'elp-template-error
-                         :file ,pathname
+                         :file (source-name elp::source)
                          :line line :column col
                          :original c))))))
-         ;; Candidate has the wrapper's lexical scope with BODY inline
-         ;; and no &key params. Walking it tells us which symbols are
-         ;; free with respect to the wrapper's own bindings.
+         ;; Candidate mirrors the wrapper's lexical scope so the
+         ;; walker doesn't mis-classify wrapper-bound names. We pass
+         ;; BODY in unmodified — wrapper-introduced names are bound by
+         ;; SOURCE-WRAP-LAMBDA-BODY's emitted form.
          (candidate
           `(lambda (&optional (stream *standard-output*))
              (let ((*standard-output* stream))
-               (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-                 (unwind-protect (handler-bind ,handler-clauses ,body)
-                   (%mmap-close ptr size fd)))
+               ,(source-wrap-lambda-body
+                 source `(handler-bind ,handler-clauses ,body))
                (values))))
          (free-vars (form-free-vars candidate))
          (supplied-p-vars
@@ -269,8 +166,6 @@
          ;; Check missing keys *inside* handler-bind so the
          ;; unbound-variable signal becomes an elp-template-error
          ;; with line/column rather than an unwrapped runtime error.
-         ;; If we used `(error 'unbound-variable …)` as a &key default
-         ;; the signal would fire outside handler-bind and escape.
          (key-checks
           (mapcar (lambda (var supplied-p)
                     `(unless ,supplied-p
@@ -282,12 +177,11 @@
          (body-fresh (copy-tree body)))
     `(lambda (stream &key ,@key-params &allow-other-keys)
        (let ((*standard-output* stream))
-         (multiple-value-bind (ptr size fd) (%mmap-open ,pathname)
-           (unwind-protect
-                (handler-bind ,handler-clauses
-                  ,@key-checks
-                  ,body-fresh)
-             (%mmap-close ptr size fd))))
+         ,(source-wrap-lambda-body
+           source
+           `(handler-bind ,handler-clauses
+              ,@key-checks
+              ,body-fresh)))
        (values))))
 
 (defun compile-template (pathname)
@@ -332,30 +226,30 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-(defun build-template-body (pathname ptr size)
-  "Read the template at PTR[0,SIZE) through a TEMPLATE-STREAM and
-   return the inner body sexp `(progn ,@forms)`. Reader errors are
-   translated into ELP-TEMPLATE-ERROR via the stream's POSITION-MAP."
-  (let* ((stream (make-instance 'template-stream :ptr ptr :size size))
+(defun build-template-body (source)
+  "Read the template SOURCE through a TEMPLATE-STREAM and return the
+   inner body sexp `(progn ,@forms)`. Reader errors are translated
+   into ELP-TEMPLATE-ERROR via the stream's POSITION-MAP."
+  (let* ((stream (make-instance 'template-stream :source source))
          (forms  '()))
     (handler-case
         (loop for form = (read stream nil :eof)
               until (eq form :eof)
               do (push form forms))
       ((or reader-error end-of-file) (c)
-        (translate-read-error c pathname ptr size stream)))
+        (translate-read-error c source stream)))
     `(progn ,@(nreverse forms))))
 
-(defun translate-read-error (condition pathname ptr size stream)
+(defun translate-read-error (condition source stream)
   "Translate a reader-error raised while reading STREAM into an
    ELP-TEMPLATE-ERROR pointing at the source byte that produced the
    offending reader position. Falls back to byte 0 when the stream
    has not yet reached any checkpoint."
   (let* ((reader-pos (ts-chars-read stream))
          (file-byte  (or (stream-byte-position stream reader-pos) 0)))
-    (multiple-value-bind (line col) (byte->line+column ptr size file-byte)
+    (multiple-value-bind (line col) (source-line+column source file-byte)
       (error 'elp-template-error
-             :file pathname :line line :column col
+             :file (source-name source) :line line :column col
              :original condition))))
 
 ;;;; Reader-driven codegen: template-stream gray stream
@@ -395,10 +289,12 @@
 ;;;; reader-pos that *will* land on the anchored region.
 
 (defclass template-stream (sb-gray:fundamental-character-input-stream)
-  ((ptr          :initarg :ptr        :reader   ts-ptr)
-   (size         :initarg :size       :reader   ts-size)
+  ((source       :initarg :source     :reader   ts-source
+    :documentation "Backing source — an MMAP-SOURCE or STRING-SOURCE.
+                    All byte scanning / substring extraction / text-emit
+                    codegen dispatches through the SOURCE protocol.")
    (cursor       :initform 0          :accessor ts-cursor
-    :documentation "Next mmap byte NEXT-CHUNK will look at.")
+    :documentation "Next source byte NEXT-CHUNK will look at.")
    (inside-code  :initform nil        :accessor ts-inside-code
     :documentation "T iff CURSOR sits past `<%` and the next NEXT-CHUNK
                     call should parse a tag rather than scan for one.")
@@ -408,62 +304,46 @@
     :documentation "Index of next character to return from CHUNK.")
    (pushback     :initform nil        :accessor ts-pushback)
    (chars-read   :initform 0          :accessor ts-chars-read)
-   (position-map :initform '()        :accessor ts-position-map)
-   (mode         :initarg :mode       :initform :render :reader ts-mode
-    :documentation "Either :RENDER (default) or :ANALYZE. :RENDER emits
-                    write-output-range + format wrappers suitable for
-                    compile + eval. :ANALYZE elides the runtime wrappers
-                    so the synthesized Lisp is purely user code (clean
-                    for static analysis / LSP symbol resolution)."))
+   (position-map :initform '()        :accessor ts-position-map))
   (:documentation
-   "Gray input stream wrapping an mmap'd ELP template. The standard
-    Lisp reader can READ from it directly; the stream synthesizes
-    WRITE-OUTPUT-RANGE wrapper forms around literal text spans and
-    feeds the bytes inside <% ... %> blocks straight through.
+   "Gray input stream wrapping a SOURCE (mmap- or string-backed) of an
+    ELP template. The standard Lisp reader can READ from it directly;
+    the stream synthesizes text-emit wrapper forms around literal text
+    spans and feeds the bytes inside <% ... %> blocks straight through.
 
-    POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints, oldest
+    POSITION-MAP records (READER-POS . SOURCE-BYTE) checkpoints, oldest
     last (push to front). A checkpoint says: at the moment the reader
     has consumed READER-POS chars, the next character will correspond
-    to MMAP-BYTE in the source template. STREAM-BYTE-POSITION uses it
-    to translate a reader position back to a source byte."))
+    to SOURCE-BYTE in the source. STREAM-BYTE-POSITION uses it to
+    translate a reader position back to a source byte; NIL SOURCE-BYTE
+    marks synthesized regions with no source backing."))
 
-(defun %byte-at (ptr offset)
-  (cffi:mem-aref (cffi:inc-pointer ptr offset) :unsigned-char 0))
-
-(defun synth-text-form (start end &optional (mode :render))
+(defun synth-text-form (source start end)
   "Source string for a literal-text span covering source bytes
-   [START, END), expressed as one Lisp form.
-
-   :RENDER emits the (write-output-range ...) call the runtime needs.
-   :ANALYZE elides it — the LSP doesn't care which bytes get written,
-   only what symbols are in scope. Trailing space terminates the form
-   so the next chunk's content does not run into the closing paren."
-  (ecase mode
-    (:render (format nil "(elp::write-output-range elp::ptr ~D ~D) "
-                     start end))
-    (:analyze "nil ")))
+   [START, END), expressed as one Lisp form. Delegates to
+   SOURCE-EMIT-TEXT-FORM so the form's shape matches what the
+   source's SOURCE-WRAP-LAMBDA-BODY will bind."
+  (source-emit-text-form source start end))
 
 (defparameter *blank-rx* (cl-ppcre:create-scanner "^\\s*$")
   "Pre-compiled scanner for blank-or-whitespace-only strings; matches
    <%= %> bodies that should be silently skipped.")
 
 (defun ts-advance-cursor (s needle)
-  "Search for NEEDLE in the mmap starting at (TS-CURSOR S). On hit,
+  "Search for NEEDLE in the source starting at (TS-CURSOR S). On hit,
    advance CURSOR to the byte immediately past NEEDLE and return the
-   match's start byte. On miss, advance CURSOR to SIZE and return
-   NIL. After the call CURSOR sits at the boundary the caller would
-   want to resume from."
-  (let* ((cur  (ts-cursor s))
-         (size (ts-size s))
-         (rel  (%memmem (cffi:inc-pointer (ts-ptr s) cur)
-                        (- size cur) needle)))
+   match's start byte. On miss, advance CURSOR to source length and
+   return NIL. After the call CURSOR sits at the boundary the caller
+   would want to resume from."
+  (let* ((source (ts-source s))
+         (cur    (ts-cursor s))
+         (match  (source-search source needle cur)))
     (cond
-      (rel
-       (let ((match-start (+ cur rel)))
-         (setf (ts-cursor s) (+ match-start (length needle)))
-         match-start))
+      (match
+       (setf (ts-cursor s) (+ match (length needle)))
+       match)
       (t
-       (setf (ts-cursor s) size)
+       (setf (ts-cursor s) (source-length source))
        nil))))
 
 (defun ts-close-trim-p (s close)
@@ -471,16 +351,17 @@
    `-`, i.e. the close delimiter is `-%>`."
   (and close
        (>= close 1)
-       (= (%byte-at (ts-ptr s) (1- close)) (char-code #\-))))
+       (= (source-byte (ts-source s) (1- close)) (char-code #\-))))
 
 (defun ts-open-trim-emit-end (s delim-pos)
   "Walk backward from DELIM-POS over ASCII space/tab bytes. If the walk
    reaches a newline, return the position just past it; if it reaches
    the start of the file through pure whitespace, return 0. Otherwise
    return DELIM-POS (no trim — there is non-whitespace on the line)."
-  (let ((i (1- delim-pos)))
+  (let ((source (ts-source s))
+        (i (1- delim-pos)))
     (loop while (>= i 0) do
-      (let ((b (%byte-at (ts-ptr s) i)))
+      (let ((b (source-byte source i)))
         (cond
           ((or (= b (char-code #\space)) (= b (char-code #\tab)))
            (decf i))
@@ -493,15 +374,16 @@
 (defun ts-skip-trailing-newline (s)
   "Advance S's CURSOR past at most one `\\r\\n` or `\\n`. Used after a
    close-trim `-%>` to drop the trailing line break."
-  (let* ((cur  (ts-cursor s))
-         (size (ts-size s)))
+  (let* ((source (ts-source s))
+         (cur  (ts-cursor s))
+         (size (source-length source)))
     (cond
       ((and (<= (+ cur 2) size)
-            (= (%byte-at (ts-ptr s) cur) (char-code #\return))
-            (= (%byte-at (ts-ptr s) (1+ cur)) (char-code #\newline)))
+            (= (source-byte source cur) (char-code #\return))
+            (= (source-byte source (1+ cur)) (char-code #\newline)))
        (setf (ts-cursor s) (+ cur 2)))
       ((and (< cur size)
-            (= (%byte-at (ts-ptr s) cur) (char-code #\newline)))
+            (= (source-byte source cur) (char-code #\newline)))
        (setf (ts-cursor s) (1+ cur))))))
 
 (defun ts-find-code-start (s)
@@ -510,14 +392,16 @@
    text run ends. Open-trim (`<%-`) pulls the end back over leading
    whitespace and the preceding newline, so a blank prefix line is
    dropped from the literal run. Returns :EOF when no further `<%`
-   exists; in that case cursor sits at SIZE."
+   exists; in that case cursor sits at source length."
   (let ((delim-start (ts-advance-cursor s "<%")))
     (cond
       ((null delim-start) :eof)
       (t
-       (let ((open-trim (and (< (ts-cursor s) (ts-size s))
-                             (= (%byte-at (ts-ptr s) (ts-cursor s))
-                                (char-code #\-)))))
+       (let* ((source (ts-source s))
+              (size   (source-length source))
+              (open-trim (and (< (ts-cursor s) size)
+                              (= (source-byte source (ts-cursor s))
+                                 (char-code #\-)))))
          (when open-trim (incf (ts-cursor s)))
          (if open-trim
              (ts-open-trim-emit-end s delim-start)
@@ -526,11 +410,11 @@
 (defun ts-find-code-end (s)
   "Advance cursor past the closing delimiter (`%>`, plus one trailing
    newline if `-%>`) and return the byte position where the tag body
-   ends. If no closing `%>` exists, cursor goes to SIZE and SIZE is
-   returned."
+   ends. If no closing `%>` exists, cursor goes to source length and
+   source length is returned."
   (let ((close (ts-advance-cursor s "%>")))
     (cond
-      ((null close) (ts-size s))
+      ((null close) (source-length (ts-source s)))
       ((ts-close-trim-p s close)
        (ts-skip-trailing-newline s)
        (1- close))
@@ -569,15 +453,6 @@
       (when cp-mmap-byte
         (+ cp-mmap-byte (- reader-pos cp-reader-pos))))))
 
-(defun mmap-substring (ptr start end)
-  "Materialize the mmap byte range [START, END) as a Lisp string,
-   one char per byte (Latin-1 mapping). Used to feed the source bytes
-   of a <% ... %> body to the standard reader without per-byte
-   foreign dereferences."
-  (cffi:foreign-string-to-lisp (cffi:inc-pointer ptr start)
-                               :count (- end start)
-                               :encoding :latin-1))
-
 (defun ts-parse-tag-chunk (s)
   "Cursor sits just past the open delimiter (`<%` or `<%-`). Classify
    by the byte at cursor (`=` expr / `#` comment / anything else
@@ -588,13 +463,14 @@
    The chunk is (STRING . ANCHORS), where ANCHORS is a list of
    (CHUNK-OFFSET . SOURCE-BYTE-OR-NIL) checkpoints in increasing
    offset order. SOURCE-BYTE is an integer for chunk regions whose
-   bytes originated in the .elp file; NIL marks synthesized regions
+   bytes originated in the source; NIL marks synthesized regions
    (text-emit wrappers, the FORMAT prefix on expr blocks, trailing
    delimiter spaces). NIL ANCHORS means the whole chunk is synthesized."
-  (let* ((size       (ts-size s))
+  (let* ((source     (ts-source s))
+         (size       (source-length source))
          (after-open (ts-cursor s))
          (first      (and (< after-open size)
-                          (%byte-at (ts-ptr s) after-open)))
+                          (source-byte source after-open)))
          (flavor     (cond ((eql first (char-code #\=)) :expr)
                            ((eql first (char-code #\#)) :comment)
                            (t                           :code)))
@@ -606,7 +482,7 @@
         (:comment nil)
         (:code
          ;; Body bytes followed by a synthesized delimiter space.
-         (let* ((body (mmap-substring (ts-ptr s) body-start body-end))
+         (let* ((body (source-substring source body-start body-end))
                 (body-len (length body)))
            (cons (concatenate 'string body " ")
                  `((0 . ,body-start)
@@ -614,26 +490,21 @@
         (:expr
          ;; Whitespace-only <%= %> silently emits nothing — surfacing
          ;; it would only produce a render-time FORMAT error with no
-         ;; obvious link back to the empty body.
-         (let* ((body (mmap-substring (ts-ptr s) body-start body-end))
+         ;; obvious link back to the empty body. The FORMAT wrapper
+         ;; references elp::*current-template-span* for error
+         ;; reporting; the lambda wrapper provides that binding (real
+         ;; for render; stub for analysis).
+         (let* ((body (source-substring source body-start body-end))
                 (body-len (length body)))
            (unless (cl-ppcre:scan *blank-rx* body)
-             (ecase (ts-mode s)
-               (:render
-                (let* ((prefix (format nil
-                                       "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                                       body-start body-end))
-                       (prefix-len (length prefix)))
-                  (cons (concatenate 'string prefix body ")) ")
-                        `((0 . nil)
-                          (,prefix-len . ,body-start)
-                          (,(+ prefix-len body-len) . nil)))))
-               (:analyze
-                ;; Strip the runtime FORMAT wrapper: emit just the
-                ;; user expression bytes plus a delimiter.
-                (cons (concatenate 'string body " ")
-                      `((0 . ,body-start)
-                        (,body-len . nil))))))))))))
+             (let* ((prefix (format nil
+                                    "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                    body-start body-end))
+                    (prefix-len (length prefix)))
+               (cons (concatenate 'string prefix body ")) ")
+                     `((0 . nil)
+                       (,prefix-len . ,body-start)
+                       (,(+ prefix-len body-len) . nil)))))))))))
 
 (defun ts-next-chunk (s)
   "Parse the next syntactic unit at (TS-CURSOR S) and return its
@@ -643,28 +514,28 @@
    leading text run as a chunk. Loops internally to skip units that
    emit no chunk (comments, whitespace-only <%= %>, fully-trimmed
    text runs)."
-  (loop
-    (when (>= (ts-cursor s) (ts-size s))
-      (return :eof))
-    (cond
-      ((ts-inside-code s)
-       (when-let ((c (ts-parse-tag-chunk s)))
-         (return c)))
-      (t
-       (let* ((text-start (ts-cursor s))
-              (text-end   (ts-find-code-start s)))
-         (cond
-           ((eq text-end :eof)
-            ;; No more tags; trailing literal text to EOF.
-            (return (cons (synth-text-form text-start (ts-size s)
-                                           (ts-mode s))
-                          nil)))
-           (t
-            (setf (ts-inside-code s) t)
-            (when (> text-end text-start)
-              (return (cons (synth-text-form text-start text-end
-                                             (ts-mode s))
-                            nil))))))))))
+  (let ((source (ts-source s)))
+    (loop
+      (when (>= (ts-cursor s) (source-length source))
+        (return :eof))
+      (cond
+        ((ts-inside-code s)
+         (when-let ((c (ts-parse-tag-chunk s)))
+           (return c)))
+        (t
+         (let* ((text-start (ts-cursor s))
+                (text-end   (ts-find-code-start s)))
+           (cond
+             ((eq text-end :eof)
+              ;; No more tags; trailing literal text to EOF.
+              (return (cons (synth-text-form source text-start
+                                             (source-length source))
+                            nil)))
+             (t
+              (setf (ts-inside-code s) t)
+              (when (> text-end text-start)
+                (return (cons (synth-text-form source text-start text-end)
+                              nil)))))))))))
 
 (defmethod sb-gray:stream-read-char ((s template-stream))
   ;; Pushback always wins. Re-incrementing CHARS-READ is correct
@@ -727,42 +598,36 @@
    inside a code region may not match an editor's UTF-8 / UTF-16
    position expectations.
 
-   Characters outside the latin-1 range (em-dash, smart-quotes, arrow
-   glyphs in template text, etc.) get substituted with #\\? in the
-   foreign buffer used for delimiter scanning — they're invisible to
-   the ASCII-only tag tokenizer either way, and the output canvas is
-   built from the original Lisp string, not from this buffer, so the
-   substitution doesn't affect what extract-code-text returns."
-  (let* ((size (length text))
-         (sanitized (map 'string
-                         (lambda (c) (if (< (char-code c) 256) c #\?))
-                         text))
-         (ptr  (cffi:foreign-string-alloc sanitized :encoding :latin-1))
+   Built on the string-source backend — no foreign allocation, no
+   Latin-1 sanitization. The ASCII-only `<%` / `%>` delimiters fall
+   out of CL:SEARCH directly. UTF-8 multibyte content inside template
+   text still tokenizes correctly (delimiters are ASCII), but
+   character offsets inside a code region may not match an editor's
+   UTF-8 / UTF-16 position expectations."
+  (let* ((source (make-instance 'string-source :text text))
+         (size   (source-length source))
+         (stream (make-instance 'template-stream :source source))
          (ranges '()))
-    (unwind-protect
-         (let ((stream (make-instance 'template-stream :ptr ptr :size size)))
-           (loop
-             (when (>= (ts-cursor stream) size) (return))
-             (let ((after-text-end (ts-find-code-start stream)))
-               (when (eq after-text-end :eof) (return))
-               ;; Cursor sits past `<%` or `<%-`. Classify the body
-               ;; flavor by the byte at cursor — same logic as
-               ;; TS-PARSE-TAG-CHUNK, but emitting source ranges
-               ;; instead of reader-ready chunks.
-               (let* ((after-open (ts-cursor stream))
-                      (first-byte (and (< after-open size)
-                                       (%byte-at ptr after-open)))
-                      (flavor (cond ((eql first-byte (char-code #\=)) :expr)
-                                    ((eql first-byte (char-code #\#)) :comment)
-                                    (t                                :code)))
-                      (body-start (if (eq flavor :code)
-                                      after-open
-                                      (1+ after-open))))
-                 (setf (ts-cursor stream) body-start)
-                 (let ((body-end (ts-find-code-end stream)))
-                   (unless (eq flavor :comment)
-                     (push (cons body-start body-end) ranges)))))))
-      (cffi:foreign-string-free ptr))
+    (loop
+      (when (>= (ts-cursor stream) size) (return))
+      (let ((after-text-end (ts-find-code-start stream)))
+        (when (eq after-text-end :eof) (return))
+        ;; Cursor sits past `<%` or `<%-`. Classify the body flavor
+        ;; by the byte at cursor — same logic as TS-PARSE-TAG-CHUNK,
+        ;; but emitting source ranges instead of reader-ready chunks.
+        (let* ((after-open (ts-cursor stream))
+               (first-byte (and (< after-open size)
+                                (source-byte source after-open)))
+               (flavor (cond ((eql first-byte (char-code #\=)) :expr)
+                             ((eql first-byte (char-code #\#)) :comment)
+                             (t                                :code)))
+               (body-start (if (eq flavor :code)
+                               after-open
+                               (1+ after-open))))
+          (setf (ts-cursor stream) body-start)
+          (let ((body-end (ts-find-code-end stream)))
+            (unless (eq flavor :comment)
+              (push (cons body-start body-end) ranges))))))
     (nreverse ranges)))
 
 (defun extract-code-text (text)
@@ -785,108 +650,108 @@
 ;;;; ============================================================
 ;;;; Public stream interface — full lambda form with position map.
 ;;;;
-;;;; OPEN-TEMPLATE-STREAM returns a character input stream whose
-;;;; contents are the complete (lambda (stream &key ...) ...) form
-;;;; that ELP would otherwise build via build-template-lambda. Bytes
-;;;; produced from the user's <% %> / <%= %> blocks are anchored —
-;;;; STREAM-BYTE-POSITION translates a reader position into the
-;;;; originating source byte. Bytes from the synthesized lambda
-;;;; prefix/suffix and from text-emit wrappers map to NIL.
+;;;; OPEN-TEMPLATE-STREAM-FROM-FILE / -FROM-STRING return a character
+;;;; input stream whose drained contents are an analysis lambda form
+;;;; for the template — same body shape the render path produces,
+;;;; wrapped in stub bindings so a static walker / LSP sees every
+;;;; symbol as a real lexical or function reference. Bytes produced
+;;;; from the user's <% %> / <%= %> blocks are anchored;
+;;;; STREAM-BYTE-POSITION translates reader positions into source bytes
+;;;; (NIL for synthesized prefix/suffix/text-emit chars).
 ;;;;
-;;;; The intended consumer is tooling that wants an .elp file as a
-;;;; single self-contained Lisp form: a Lisp LSP, a static walker,
-;;;; an indexer. The stream + position-map carry the "translated
-;;;; text plus byte map" pair through one object instead of two
-;;;; parallel values.
+;;;; The stream + position-map carry "translated text plus byte map"
+;;;; through one object — a Lisp-LSP can DRAIN the stream into its
+;;;; document-text slot and call STREAM-BYTE-POSITION for cursor
+;;;; translation, without knowing anything about ELP's internals.
 ;;;;
-;;;; Two passes:
-;;;;   1. Open an inner TEMPLATE-STREAM, drain it, build the body
-;;;;      sexp via the standard reader, and walk it with
-;;;;      HU.DWIM.WALKER to enumerate free variables.
-;;;;   2. Synthesize prefix (the lambda signature + wrappers, named
-;;;;      &key params for each free variable) and suffix (closing
-;;;;      forms), then build a WRAPPED-TEMPLATE-STREAM that drains
-;;;;      prefix → inner body chars → suffix and answers
-;;;;      STREAM-BYTE-POSITION by offsetting into the captured
-;;;;      inner POSITION-MAP.
+;;;; Implementation:
+;;;;   1. Build a SOURCE from the input (MMAP-SOURCE for a pathname,
+;;;;      STRING-SOURCE for a Lisp string).
+;;;;   2. Drain a TEMPLATE-STREAM over that source to capture
+;;;;      (BODY-CHARS, POSITION-MAP).
+;;;;   3. Walk the parsed body sexp for free variables.
+;;;;   4. Synthesize an analysis lambda prefix (stub bindings for the
+;;;;      body's WRITE-OUTPUT-RANGE refs, named &key per free var) and
+;;;;      suffix; return a TEMPLATE-LAMBDA-STREAM that serves
+;;;;      prefix → body → suffix.
 ;;;;
-;;;; The pass-1 drain is intentional: the &key list has to be known
-;;;; before the lambda signature can be synthesized, and the read
-;;;; sexp is what tells us. Generated forms fit in memory and that
-;;;; is fine for the use case (LSP analysis of a single .elp file).
+;;;; The analysis lambda doesn't COMPILE+RUN usefully — the stub
+;;;; bindings are NIL, so calling it would error inside
+;;;; WRITE-OUTPUT-RANGE. That's intentional: the consumer's job is
+;;;; static analysis, not execution.
 
-(defclass wrapped-template-stream (sb-gray:fundamental-character-input-stream)
+(defclass template-lambda-stream (sb-gray:fundamental-character-input-stream)
   ((prefix
-    :initarg :prefix :reader ws-prefix
-    :documentation "Synthesized lambda signature + wrapper opening,
-                    drained before the inner body chars. No source
-                    anchor.")
+    :initarg :prefix :reader ls-prefix
+    :documentation "Synthesized lambda signature + stub-binding wrapper,
+                    drained before the body chars. No source anchor.")
    (body
-    :initarg :body :reader ws-body
+    :initarg :body :reader ls-body
     :documentation "Captured character stream from the inner
                     TEMPLATE-STREAM: text-emit forms, code blocks,
-                    expr blocks. Anchored bytes here come from the
-                    .elp source.")
+                    expr blocks. Anchored bytes come from the source.")
    (suffix
-    :initarg :suffix :reader ws-suffix
+    :initarg :suffix :reader ls-suffix
     :documentation "Synthesized lambda closing forms. No source anchor.")
    (body-position-map
-    :initarg :body-position-map :reader ws-body-position-map
-    :documentation "POSITION-MAP from the inner TEMPLATE-STREAM at
-                    end of drain. Keys are character positions into
-                    BODY (== inner CHARS-READ at the time of the
-                    checkpoint).")
-   (pathname
-    :initarg :pathname :reader ws-pathname
-    :documentation "Source .elp pathname, retained for diagnostics.")
+    :initarg :body-position-map :reader ls-body-position-map
+    :documentation "POSITION-MAP from the inner TEMPLATE-STREAM at end
+                    of drain. Keys are character positions into BODY.")
+   (source-name
+    :initarg :source-name :reader ls-source-name
+    :documentation "Display name for the source (pathname for files,
+                    caller-supplied for strings). Retained for
+                    diagnostics.")
    (chars-read
-    :initform 0 :accessor ws-chars-read)
+    :initform 0 :accessor ls-chars-read)
    (pushback
-    :initform nil :accessor ws-pushback))
+    :initform nil :accessor ls-pushback))
   (:documentation
-   "Character input stream serving the full (lambda ...) form for an
-    .elp file. Drains prefix, then body, then suffix in order."))
+   "Character input stream serving the full analysis (lambda ...) form
+    for an ELP template. Drains prefix, then body, then suffix in
+    order. STREAM-BYTE-POSITION returns the originating source byte
+    for body chars and NIL for prefix/suffix chars."))
 
-(defmethod sb-gray:stream-read-char ((s wrapped-template-stream))
-  (when-let ((pb (ws-pushback s)))
-    (setf (ws-pushback s) nil)
-    (incf (ws-chars-read s))
+(defmethod sb-gray:stream-read-char ((s template-lambda-stream))
+  (when-let ((pb (ls-pushback s)))
+    (setf (ls-pushback s) nil)
+    (incf (ls-chars-read s))
     (return-from sb-gray:stream-read-char pb))
-  (let* ((p      (ws-chars-read s))
-         (prefix (ws-prefix s))
-         (body   (ws-body s))
-         (suffix (ws-suffix s))
+  (let* ((p      (ls-chars-read s))
+         (prefix (ls-prefix s))
+         (body   (ls-body s))
+         (suffix (ls-suffix s))
          (pl     (length prefix))
          (bl     (length body))
          (sl     (length suffix)))
     (cond
       ((< p pl)
-       (incf (ws-chars-read s))
+       (incf (ls-chars-read s))
        (char prefix p))
       ((< p (+ pl bl))
-       (incf (ws-chars-read s))
+       (incf (ls-chars-read s))
        (char body (- p pl)))
       ((< p (+ pl bl sl))
-       (incf (ws-chars-read s))
+       (incf (ls-chars-read s))
        (char suffix (- p pl bl)))
       (t :eof))))
 
-(defmethod sb-gray:stream-unread-char ((s wrapped-template-stream) char)
-  (setf (ws-pushback s) char)
-  (decf (ws-chars-read s))
+(defmethod sb-gray:stream-unread-char ((s template-lambda-stream) char)
+  (setf (ls-pushback s) char)
+  (decf (ls-chars-read s))
   nil)
 
-(defmethod stream-byte-position ((s wrapped-template-stream)
-                                 &optional (reader-pos (ws-chars-read s)))
-  (let* ((pl       (length (ws-prefix s)))
-         (bl       (length (ws-body s)))
+(defmethod stream-byte-position ((s template-lambda-stream)
+                                 &optional (reader-pos (ls-chars-read s)))
+  (let* ((pl       (length (ls-prefix s)))
+         (bl       (length (ls-body s)))
          (body-pos (- reader-pos pl)))
     (cond
       ((< reader-pos pl) nil)
       ((>= reader-pos (+ pl bl)) nil)
       (t
        (when-let ((checkpoint (find-if (lambda (c) (<= (car c) body-pos))
-                                       (ws-body-position-map s))))
+                                       (ls-body-position-map s))))
          (destructuring-bind (cp-reader-pos . cp-source-byte) checkpoint
            (when cp-source-byte
              (+ cp-source-byte (- body-pos cp-reader-pos)))))))))
@@ -904,9 +769,10 @@
 
 (defun %body-free-vars (body-chars)
   "Walk the body sexp parsed from BODY-CHARS (the drained inner stream)
-   for free variables, using the same lexical-scope candidate
-   BUILD-TEMPLATE-LAMBDA uses so wrapper-introduced names (ptr/size/fd,
-   stream, *current-template-span* let) are not surfaced as free."
+   for free variables, using a lexical-scope candidate that binds the
+   names BUILD-TEMPLATE-LAMBDA's wrapper would (ELP::PTR / SIZE / FD /
+   *current-template-span*), so wrapper-introduced names aren't
+   surfaced as free."
   (let* ((body-sexp (with-input-from-string (in body-chars)
                       (let ((forms '()))
                         (loop for f = (read in nil :eof)
@@ -915,74 +781,76 @@
                         `(progn ,@(nreverse forms)))))
          (candidate
           `(lambda (&optional (stream *standard-output*))
-             (let ((*standard-output* stream))
-               (multiple-value-bind (ptr size fd) (%mmap-open "")
-                 (declare (ignorable ptr size fd))
-                 ,body-sexp)
+             (let ((*standard-output* stream)
+                   (elp::ptr nil) (elp::size nil) (elp::fd nil))
+               (declare (ignorable elp::ptr elp::size elp::fd))
+               ,body-sexp
                (values)))))
     (form-free-vars candidate)))
 
 (defun %lambda-prefix (free-vars)
-  "Synthesized text for the analysis lambda signature. No runtime
-   wrappers — just the &key signature with one entry per free variable
-   in the template, an (ignorable …) declare, and a (progn opener so
-   the body forms line up as a sequence."
+  "Synthesized text for the analysis lambda. Stub-binds ELP::PTR / SIZE
+   / FD so the body's WRITE-OUTPUT-RANGE calls reference real lexicals
+   (the LSP / walker sees them as bound, not free); declares all
+   stubs and user kwargs ignorable; opens a (progn so the body forms
+   line up as a sequence."
   (with-output-to-string (out)
     (format out "(lambda (stream &key")
     (dolist (var free-vars)
       (format out " ~A" (symbol-name var)))
     (format out " &allow-other-keys)~%")
-    (format out "  (declare (ignorable stream")
+    (format out "  (let ((elp::ptr nil) (elp::size nil) (elp::fd nil))~%")
+    (format out "    (declare (ignorable stream elp::ptr elp::size elp::fd")
     (dolist (var free-vars)
       (format out " ~A" (symbol-name var)))
     (format out "))~%")
-    (format out "  (progn~%    ")))
+    (format out "    (progn~%      ")))
 
 (defun %lambda-suffix ()
-  (format nil "))~%"))
+  (format nil ")))~%"))
 
-(defun %drain-template-file (pathname)
-  "Open PATHNAME, mmap it, drain an inner TEMPLATE-STREAM in :ANALYZE
-   mode, and return (values BODY-CHARS POSITION-MAP). Zero-byte files
-   short-circuit to (values \"\" '()) — %mmap-open(2) rejects size=0
-   with EINVAL, so the empty case is handled here rather than letting
-   it bubble out of the mmap call."
-  (let ((file-size (with-open-file (f pathname) (file-length f))))
-    (when (zerop file-size)
-      (return-from %drain-template-file (values "" '()))))
-  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
-    (let ((inner (make-instance 'template-stream
-                                :ptr ptr :size size :mode :analyze)))
-      (unwind-protect (%drain-template-stream inner)
-        (%mmap-close ptr size fd)))))
+(defun %open-template-lambda-stream (source)
+  "Common back end of OPEN-TEMPLATE-STREAM-FROM-FILE and -FROM-STRING:
+   given a SOURCE, drain it, walk for free vars, and return a
+   TEMPLATE-LAMBDA-STREAM serving the full analysis lambda."
+  (let* ((inner (make-instance 'template-stream :source source)))
+    (multiple-value-bind (body-chars body-position-map)
+        (%drain-template-stream inner)
+      (let ((free-vars (%body-free-vars body-chars)))
+        (make-instance 'template-lambda-stream
+                       :prefix (%lambda-prefix free-vars)
+                       :body body-chars
+                       :suffix (%lambda-suffix)
+                       :body-position-map body-position-map
+                       :source-name (source-name source))))))
 
-(defun open-template-stream (pathname)
-  "Open PATHNAME as an .elp template and return a character input
-   stream whose drained contents are an analysis lambda form for that
-   template:
+(defun open-template-stream-from-file (pathname)
+  "Open PATHNAME as an .elp template and return a TEMPLATE-LAMBDA-STREAM
+   serving its analysis lambda form. Backed by MMAP-SOURCE — the
+   fast path for on-disk templates.
 
-     (lambda (stream &key VAR1 VAR2 … &allow-other-keys)
-       (declare (ignorable stream VAR1 VAR2 …))
-       (progn USER-FORM-1 USER-FORM-2 …))
-
-   VARi are the template's free variables (one &key per free symbol);
-   USER-FORM-i are the bodies of <% %> and <%= %> blocks verbatim, with
-   literal text spans collapsed to NIL. The form has no runtime
-   wrappers (no FORMAT, no write-output-range, no mmap, no
-   handler-bind) — it is for static analysis by Lisp walkers and LSPs,
-   not for COMPILE+RUN. The render path (ELP:RENDER /
-   ELP:COMPILE-TEMPLATE) is unaffected by this entry point.
+   Zero-byte files short-circuit through a STRING-SOURCE of \"\" so
+   %mmap-open's size=0 EINVAL never surfaces.
 
    STREAM-BYTE-POSITION on the returned stream maps a reader position
    back to a source byte for bytes that originated in the .elp file,
    and to NIL for synthesized wrapper / delimiter / text-emit bytes."
-  (multiple-value-bind (body-chars body-position-map)
-      (%drain-template-file pathname)
-    (let ((free-vars (%body-free-vars body-chars)))
-      (make-instance 'wrapped-template-stream
-                     :prefix (%lambda-prefix free-vars)
-                     :body body-chars
-                     :suffix (%lambda-suffix)
-                     :body-position-map body-position-map
-                     :pathname pathname))))
+  (let ((file-size (with-open-file (f pathname) (file-length f))))
+    (when (zerop file-size)
+      (return-from open-template-stream-from-file
+        (%open-template-lambda-stream
+         (make-instance 'string-source :text "" :name pathname)))))
+  (let ((source (open-mmap-source pathname)))
+    (unwind-protect (%open-template-lambda-stream source)
+      (close-mmap-source source))))
+
+(defun open-template-stream-from-string (text &key (name "<string>"))
+  "Treat TEXT as an .elp template body and return a TEMPLATE-LAMBDA-STREAM
+   serving its analysis lambda form. NAME (default \"<string>\") is the
+   display name surfaced in error reports.
+
+   The LSP-facing entry: passes the document text from a didChange
+   directly — no on-disk file needed."
+  (%open-template-lambda-stream
+   (make-instance 'string-source :text text :name name)))
 

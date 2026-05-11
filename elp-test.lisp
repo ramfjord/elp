@@ -341,15 +341,17 @@ line2
     (is (string= "     " (subseq out 6 11)))))
 
 ;;;; ============================================================
-;;;; open-template-stream — analysis lambda form with position map
+;;;; open-template-stream-from-file / -from-string
 ;;;;
-;;;; Two facets we care about: (1) the stream's drained text reads as
-;;;; one well-formed (lambda ...) form whose &key list covers exactly
-;;;; the free variables in the template, and (2) STREAM-BYTE-POSITION
-;;;; round-trips body chars to source bytes and returns NIL for
-;;;; synthesized wrapper / text-emit chars. The form is for static
-;;;; analysis (Lisp walkers, LSPs), not for COMPILE+RUN — the render
-;;;; path keeps its own codegen unchanged.
+;;;; Analysis lambda form with position map. Two facets we care about:
+;;;; (1) the stream's drained text reads as one well-formed (lambda
+;;;; ...) form whose &key list covers exactly the free variables in
+;;;; the template, with body chars that appear in the same render-
+;;;; shape COMPILE-TEMPLATE produces (write-output-range + FORMAT
+;;;; wrappers, plus stub bindings for ELP::PTR / SIZE / FD), and (2)
+;;;; STREAM-BYTE-POSITION round-trips body chars to source bytes,
+;;;; returning NIL for synthesized wrapper / text-emit chars. The
+;;;; render path (RENDER / COMPILE-TEMPLATE) is unaffected.
 
 (defun drain-stream (s)
   "Read all chars from S into a string."
@@ -376,45 +378,59 @@ line2
                       (t (first item)))
           when (eq item '&key) do (setf after-key t))))
 
+(defun tree-find (sym tree)
+  "T iff SYM appears anywhere in TREE."
+  (cond ((eq sym tree) t)
+        ((atom tree) nil)
+        (t (or (tree-find sym (car tree)) (tree-find sym (cdr tree))))))
+
 (test open-template-stream-shape
-  "Returned stream drains to (lambda (stream &key …) (declare …) (progn …)).
-   The &key list contains exactly the template's free variables; the
-   body has user expressions verbatim with no FORMAT / write-output-range
-   wrappers."
+  "Returned stream drains to (lambda (stream &key …) (let stub-bindings
+   (declare …) (progn …))). &key list contains exactly the template's
+   free variables; user symbols appear somewhere in the body."
   (with-template-file (p "Hi <%= name %>, age <%= age %>")
-    (let* ((s (elp:open-template-stream p))
+    (let* ((s (elp:open-template-stream-from-file p))
            (form (read-stream-form s)))
       (is (eq 'lambda (first form)))
       (is (equal (sort '(age name) #'string< :key #'symbol-name)
                  (sort (copy-list (find-lambda-key-list form))
                        #'string< :key #'symbol-name)))
-      ;; Body is (PROGN NIL name NIL age) — exact shape after read.
-      (let ((body (fourth form)))
-        (is (eq 'progn (first body)))
-        (is (member 'name body))
-        (is (member 'age body))
-        (is (not (find-if (lambda (x)
-                            (and (consp x)
-                                 (or (eq (first x) 'format)
-                                     (search "WRITE-OUTPUT-RANGE"
-                                             (string (first x))))))
-                          body)))))))
+      (is (tree-find 'name form))
+      (is (tree-find 'age form)))))
+
+(test open-template-stream-from-string-basic
+  "STRING-SOURCE entry point produces a lambda whose &key list reflects
+   the string's free variables. Text spans become inlined (write-string
+   ...) calls — no on-disk file involved."
+  (let* ((s (elp:open-template-stream-from-string "hello <%= who %>"))
+         (form (read-stream-form s)))
+    (is (eq 'lambda (first form)))
+    (is (equal '(who) (find-lambda-key-list form)))
+    (is (tree-find 'who form))
+    (is (tree-find 'write-string form))))
 
 (test open-template-stream-spanning-paren
   "Spanning-paren constructs survive as one user form. <% (when active %>
-   ON<% ) %> reads as a single (when active <text-stub>) inside the
-   progn body, with the dangling-paren halves stitched by the same
-   reader trick the engine uses."
+   ON<% ) %> reads as a single (when active …) somewhere in the body,
+   with the dangling-paren halves stitched by the same reader trick the
+   engine uses."
   (with-template-file (p "<% (when active %>ON<% ) %>")
-    (let* ((s (elp:open-template-stream p))
+    (let* ((s (elp:open-template-stream-from-file p))
            (form (read-stream-form s)))
-      (let* ((body (fourth form))
-             (when-form (find-if (lambda (x)
-                                   (and (consp x) (eq (first x) 'when)))
-                                 body)))
-        (is (consp when-form))
-        (is (eq 'when (first when-form)))
-        (is (eq 'active (second when-form)))))))
+      (let ((when-form (cdr (assoc 'when (alexandria:flatten form)))))
+        ;; Easier: walk the tree looking for a (when active …) form.
+        (let ((found (labels
+                         ((walk (x)
+                            (cond ((atom x) nil)
+                                  ((and (eq (first x) 'when)
+                                        (eq (second x) 'active))
+                                   x)
+                                  (t (or (walk (car x)) (walk (cdr x)))))))
+                       (walk form))))
+          (declare (ignore when-form))
+          (is (consp found))
+          (is (eq 'when (first found)))
+          (is (eq 'active (second found))))))))
 
 (test open-template-stream-position-map-anchored-bytes
   "Body chars whose source is a <% %> or <%= %> block map to their
@@ -431,7 +447,7 @@ line2
                                                   :element-type '(unsigned-byte 8))))
                              (read-sequence buf f)
                              buf)))
-           (s (elp:open-template-stream p))
+           (s (elp:open-template-stream-from-file p))
            (anchored-count 0))
       (loop for pos from 0
             for src = (elp:stream-byte-position s pos)
@@ -451,8 +467,8 @@ line2
    opener) and inter-tag synthesized chars all return NIL from
    STREAM-BYTE-POSITION — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
-    (let* ((s (elp:open-template-stream p))
-           (text-len (length (drain-stream (elp:open-template-stream p))))
+    (let* ((s (elp:open-template-stream-from-file p))
+           (text-len (length (drain-stream (elp:open-template-stream-from-file p))))
            (results (loop for pos from 0
                           for src = (elp:stream-byte-position s pos)
                           for c = (read-char s nil :eof)
@@ -474,14 +490,14 @@ line2
   "Empty .elp yields a minimal lambda that drains and reads as a
    single LAMBDA form without raising."
   (with-template-file (p "")
-    (let ((form (read-stream-form (elp:open-template-stream p))))
+    (let ((form (read-stream-form (elp:open-template-stream-from-file p))))
       (is (eq 'lambda (first form))))))
 
 (test open-template-stream-no-free-vars
   "Template with no free variables yields a lambda whose &key list
    has no user-facing entries — just &allow-other-keys."
   (with-template-file (p "plain text only")
-    (let* ((s (elp:open-template-stream p))
+    (let* ((s (elp:open-template-stream-from-file p))
            (form (read-stream-form s)))
       (is (null (find-lambda-key-list form))))))
 

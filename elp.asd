@@ -9,7 +9,11 @@
   :source-control (:git "https://github.com/thomasramfjord/mediaserver")
   :depends-on ("alexandria" "cffi" "cl-ppcre" "hu.dwim.walker" "uiop")
   :components
-  ((:file "elp")
+  ((:module "src"
+    :components
+    ((:file "package")
+     (:file "source" :depends-on ("package"))))
+   (:file "elp" :depends-on ("src"))
    (:file "cli" :depends-on ("elp")))
   :in-order-to ((test-op (test-op "elp/tests"))))
 
