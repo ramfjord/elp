@@ -341,6 +341,151 @@ line2
     (is (string= "     " (subseq out 6 11)))))
 
 ;;;; ============================================================
+;;;; open-template-stream — analysis lambda form with position map
+;;;;
+;;;; Two facets we care about: (1) the stream's drained text reads as
+;;;; one well-formed (lambda ...) form whose &key list covers exactly
+;;;; the free variables in the template, and (2) STREAM-BYTE-POSITION
+;;;; round-trips body chars to source bytes and returns NIL for
+;;;; synthesized wrapper / text-emit chars. The form is for static
+;;;; analysis (Lisp walkers, LSPs), not for COMPILE+RUN — the render
+;;;; path keeps its own codegen unchanged.
+
+(defun drain-stream (s)
+  "Read all chars from S into a string."
+  (with-output-to-string (out)
+    (loop for c = (read-char s nil :eof)
+          until (eq c :eof) do (write-char c out))))
+
+(defun read-stream-form (s)
+  "Read one Lisp form from S, returning the sexp."
+  (read s))
+
+(defun find-lambda-key-list (form)
+  "Given a (lambda (stream &key …) …) form, return the &key params'
+   variable names. Handles both the analyze shape (bare symbols) and
+   the render shape (((kw var) init supplied-p))."
+  (let ((lambda-list (second form)))
+    (loop with after-key = nil
+          for item in lambda-list
+          when (eq item '&allow-other-keys) do (loop-finish)
+          when (and after-key (not (member item lambda-list-keywords)))
+            collect (cond
+                      ((symbolp item) item)
+                      ((consp (first item)) (second (first item)))
+                      (t (first item)))
+          when (eq item '&key) do (setf after-key t))))
+
+(test open-template-stream-shape
+  "Returned stream drains to (lambda (stream &key …) (declare …) (progn …)).
+   The &key list contains exactly the template's free variables; the
+   body has user expressions verbatim with no FORMAT / write-output-range
+   wrappers."
+  (with-template-file (p "Hi <%= name %>, age <%= age %>")
+    (let* ((s (elp:open-template-stream p))
+           (form (read-stream-form s)))
+      (is (eq 'lambda (first form)))
+      (is (equal (sort '(age name) #'string< :key #'symbol-name)
+                 (sort (copy-list (find-lambda-key-list form))
+                       #'string< :key #'symbol-name)))
+      ;; Body is (PROGN NIL name NIL age) — exact shape after read.
+      (let ((body (fourth form)))
+        (is (eq 'progn (first body)))
+        (is (member 'name body))
+        (is (member 'age body))
+        (is (not (find-if (lambda (x)
+                            (and (consp x)
+                                 (or (eq (first x) 'format)
+                                     (search "WRITE-OUTPUT-RANGE"
+                                             (string (first x))))))
+                          body)))))))
+
+(test open-template-stream-spanning-paren
+  "Spanning-paren constructs survive as one user form. <% (when active %>
+   ON<% ) %> reads as a single (when active <text-stub>) inside the
+   progn body, with the dangling-paren halves stitched by the same
+   reader trick the engine uses."
+  (with-template-file (p "<% (when active %>ON<% ) %>")
+    (let* ((s (elp:open-template-stream p))
+           (form (read-stream-form s)))
+      (let* ((body (fourth form))
+             (when-form (find-if (lambda (x)
+                                   (and (consp x) (eq (first x) 'when)))
+                                 body)))
+        (is (consp when-form))
+        (is (eq 'when (first when-form)))
+        (is (eq 'active (second when-form)))))))
+
+(test open-template-stream-position-map-anchored-bytes
+  "Body chars whose source is a <% %> or <%= %> block map to their
+   original .elp byte. Walk every char of the drained stream and
+   verify that anchored chars round-trip to bytes whose template
+   content matches the read char.
+
+   STREAM-BYTE-POSITION's default semantics return the source byte
+   the reader is *about to read*, not the one it just read. The test
+   tracks the explicit position of each char before consuming it."
+  (with-template-file (p "x<%= name %>y")
+    (let* ((source-bytes (with-open-file (f p :element-type '(unsigned-byte 8))
+                           (let ((buf (make-array (file-length f)
+                                                  :element-type '(unsigned-byte 8))))
+                             (read-sequence buf f)
+                             buf)))
+           (s (elp:open-template-stream p))
+           (anchored-count 0))
+      (loop for pos from 0
+            for src = (elp:stream-byte-position s pos)
+            for c = (read-char s nil :eof)
+            until (eq c :eof)
+            when src
+              do (is (char= c (code-char (aref source-bytes src)))
+                     "char ~S at reader-pos ~D → source-byte ~D should match source byte ~A"
+                     c pos src (code-char (aref source-bytes src)))
+                 (incf anchored-count))
+      ;; Sanity: at least the 4 letters of "name" between the
+      ;; <%= %> delimiters were anchored.
+      (is (>= anchored-count 4)))))
+
+(test open-template-stream-position-map-synth-chars-nil
+  "Prefix chars (the (lambda …) signature, the (declare …), the (progn)
+   opener) and inter-tag synthesized chars all return NIL from
+   STREAM-BYTE-POSITION — they have no .elp source byte to point at."
+  (with-template-file (p "x<%= name %>y")
+    (let* ((s (elp:open-template-stream p))
+           (text-len (length (drain-stream (elp:open-template-stream p))))
+           (results (loop for pos from 0
+                          for src = (elp:stream-byte-position s pos)
+                          for c = (read-char s nil :eof)
+                          until (eq c :eof)
+                          collect (cons pos src))))
+      ;; The first two chars are `(l` opening the lambda — no source.
+      (is (null (cdr (assoc 0 results)))
+          "first char (the '(' of lambda) has no source")
+      (is (null (cdr (assoc 1 results)))
+          "second char (the 'l' of lambda) has no source")
+      ;; At least one position lands on a body byte with an integer
+      ;; source — the chars from inside <%= name %>.
+      (is (find-if (lambda (pair) (integerp (cdr pair))) results)
+          "at least one body char has a numeric source byte")
+      ;; Positions past EOF return NIL.
+      (is (null (elp:stream-byte-position s (1+ text-len)))))))
+
+(test open-template-stream-empty-template
+  "Empty .elp yields a minimal lambda that drains and reads as a
+   single LAMBDA form without raising."
+  (with-template-file (p "")
+    (let ((form (read-stream-form (elp:open-template-stream p))))
+      (is (eq 'lambda (first form))))))
+
+(test open-template-stream-no-free-vars
+  "Template with no free variables yields a lambda whose &key list
+   has no user-facing entries — just &allow-other-keys."
+  (with-template-file (p "plain text only")
+    (let* ((s (elp:open-template-stream p))
+           (form (read-stream-form s)))
+      (is (null (find-lambda-key-list form))))))
+
+;;;; ============================================================
 
 (defun run-tests ()
   "Run all ELP tests."
