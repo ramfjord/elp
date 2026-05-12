@@ -60,20 +60,17 @@
           (uiop:quit 1))
 
         (let ((template-file (car (reverse positional))))
-          ;; Load context if provided. Forms are read as data — no EVAL —
-          ;; so a literal alist `((name . "Alice") (age . 30))` works
-          ;; without quoting, and an unwrapped `((foo))` doesn't get
-          ;; misread as a function call. Each form may be either a full
-          ;; alist (`((k . v) ...)`) or a single binding (`(k . v)`); the
-          ;; shape decides whether to replace or push.
+          ;; Load context if provided. The file is one or more plist
+          ;; forms — `(:name "Alice" :age 30)` — read as data (no EVAL)
+          ;; and concatenated. Splitting across multiple forms lets a
+          ;; large context be authored in groups without one giant
+          ;; literal. Plist matches RENDER's &rest kwargs shape, so no
+          ;; conversion is needed.
           (let ((context '()))
             (when context-file
               (with-open-file (f context-file)
                 (loop for form = (read f nil nil)
-                      while form do
-                      (if (and (consp form) (consp (car form)))
-                          (setf context form)
-                          (push form context)))))
+                      while form do (setf context (append context form)))))
 
             (if print-form
                 ;; Print the sexp that RENDER would EVAL. Binding *package*
@@ -85,13 +82,16 @@
                       (*print-readably* nil)
                       (*package* (find-package :elp)))
                   (prin1 (function-lambda-expression
-                          (compile-template (pathname template-file))))
+                          (compile-template (filepath-source (pathname template-file)))))
                   (terpri))
                 ;; Render the template, streaming output through *standard-output*.
                 ;; In a saved binary, *standard-output* is an sb-sys:fd-stream, so
                 ;; write-output-range fires its zero-copy write(2) path on the
                 ;; mmap'd source instead of routing every text range through Lisp.
-                (render (pathname template-file) context)))))
+                (apply #'render
+                       (filepath-source (pathname template-file))
+                       *standard-output*
+                       context)))))
 
     (file-error (e)
       (format *error-output* "Error: ~A~%" e)

@@ -18,11 +18,17 @@
 ;;;;                         lexicals the emitted form references.
 ;;;;   SOURCE-WRAP-LAMBDA-BODY  Wrap a template lambda's protected
 ;;;;                         form in whatever bindings + cleanup this
-;;;;                         source needs. Default: identity (the
-;;;;                         body provides everything it references).
+;;;;                         source needs. Default: identity.
 ;;;;
-;;;; Plus SOURCE-NAME — a display name for error messages (a pathname
-;;;; for files, a caller-supplied string for buffers).
+;;;; Plus SOURCE-NAME and CLOSE-SOURCE.
+;;;;
+;;;; Construction: backend-named constructors share their symbols
+;;;; with their class names (function vs. class namespaces are
+;;;; separate in CL). `(mmap-source #P"foo.elp")` opens the mmap and
+;;;; returns a fresh instance; `(string-source "...")` wraps a string.
+;;;; FILEPATH-SOURCE is the convenience dispatcher: takes a pathname
+;;;; and returns either an MMAP-SOURCE or (for size=0 files, which
+;;;; mmap rejects with EINVAL) a STRING-SOURCE of "".
 
 (in-package :elp)
 
@@ -96,20 +102,46 @@
                                :encoding :latin-1))
 
 ;;;; ============================================================
-;;;; Protocol generics
+;;;; Abstract base class — gives the protocol generics a real
+;;;; specializer to document against, and gives callers a single type
+;;;; to declare for "any source" (e.g. FILEPATH-SOURCE's return).
 
-(defgeneric source-length (source))
-(defgeneric source-byte (source offset))
+(defclass source () ()
+  (:documentation
+   "Abstract base for ELP input sources. Concrete backends —
+    MMAP-SOURCE, STRING-SOURCE — inherit from this. The protocol
+    generics (SOURCE-LENGTH, SOURCE-BYTE, SOURCE-SEARCH, …) dispatch
+    on subclasses."))
+
+;;;; ============================================================
+;;;; Protocol generics. Method specializers determine dispatch; the
+;;;; docstrings describe expected argument/return types. (Generics
+;;;; manage their own FTYPE — DECLAIMing on a generic is overwritten
+;;;; by DEFGENERIC.)
+
+(defgeneric source-length (source)
+  (:documentation "Return the byte length of SOURCE as a non-negative integer."))
+
+(defgeneric source-byte (source offset)
+  (:documentation "Return the byte at OFFSET in SOURCE as an integer 0..255."))
+
 (defgeneric source-search (source needle start)
   (:documentation
    "Return the offset of NEEDLE (an ASCII string) in SOURCE at or
     after START, or NIL if not present."))
-(defgeneric source-substring (source start end))
+
+(defgeneric source-substring (source start end)
+  (:documentation "Return SOURCE bytes [START, END) as a Lisp string."))
+
 (defgeneric source-line+column (source byte-offset)
   (:documentation
    "Return (values LINE COL) — both 1-based — for BYTE-OFFSET in
     SOURCE. ASCII column semantics."))
-(defgeneric source-name (source))
+
+(defgeneric source-name (source)
+  (:documentation
+   "Return a display name for SOURCE — typically a pathname for
+    MMAP-SOURCE, a caller-supplied string for STRING-SOURCE."))
 
 (defgeneric source-emit-text-form (source start end)
   (:documentation
@@ -127,31 +159,66 @@
     in the compiled lambda.")
   (:method ((s t) body) body))
 
+(defgeneric close-source (source)
+  (:documentation
+   "Release any OS resources the source holds. Idempotent — calling
+    twice on the same source is safe. STRING-SOURCE uses the default
+    no-op method; MMAP-SOURCE unmaps and closes the underlying fd.")
+  (:method ((s t)) (declare (ignore s)) nil))
+
 ;;;; ============================================================
 ;;;; mmap-source — foreign-memory backed, the fast path for file
 ;;;; rendering. Render codegen does zero-copy WRITE(2) on the mapped
 ;;;; region via WRITE-OUTPUT-RANGE.
 
-(defclass mmap-source ()
-  ((ptr      :initarg :ptr      :reader mmap-source-ptr)
-   (size     :initarg :size     :reader mmap-source-size)
-   (fd       :initarg :fd       :reader mmap-source-fd)
-   (pathname :initarg :pathname :reader mmap-source-pathname))
+(defclass mmap-source (source)
+  ((ptr      :initarg :ptr      :accessor mmap-source-ptr)
+   (size     :initarg :size     :accessor mmap-source-size)
+   (fd       :initarg :fd       :accessor mmap-source-fd)
+   (pathname :initarg :pathname :reader   mmap-source-pathname))
   (:documentation
-   "Source backed by a memory-mapped file. Construct via
-    OPEN-MMAP-SOURCE; close via CLOSE-MMAP-SOURCE."))
+   "Source backed by a memory-mapped file. Construct via (MMAP-SOURCE
+    pathname); release via (CLOSE-SOURCE source). CLOSE-SOURCE is
+    idempotent — sets the mmap slots to NIL after unmapping.
 
-(defun open-mmap-source (pathname)
-  "Open PATHNAME, mmap it, and return a fresh MMAP-SOURCE.
-   Caller is responsible for CLOSE-MMAP-SOURCE."
+    PATHNAME must point to a regular file of size > 0; %mmap-open(2)
+    rejects size=0 with EINVAL. Use FILEPATH-SOURCE for the
+    convenience path that dispatches to STRING-SOURCE on empty
+    files."))
+
+(declaim (ftype (function (pathname) mmap-source) mmap-source))
+(defun mmap-source (pathname)
+  "Open PATHNAME read-only, mmap it, and return a fresh MMAP-SOURCE.
+   PATHNAME must have size > 0 — see the class docstring for the
+   rationale; FILEPATH-SOURCE handles the size=0 case.
+
+   Caller (or downstream consumer) is responsible for CLOSE-SOURCE.
+   COMPILE-TEMPLATE, RENDER, and OPEN-TEMPLATE-STREAM all close the
+   source after consuming it, so most callers don't need to manage
+   the lifecycle explicitly."
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
     (make-instance 'mmap-source
                    :ptr ptr :size size :fd fd :pathname pathname)))
 
-(defun close-mmap-source (source)
-  (%mmap-close (mmap-source-ptr source)
-               (mmap-source-size source)
-               (mmap-source-fd source)))
+(declaim (ftype (function (pathname) source) filepath-source))
+(defun filepath-source (pathname)
+  "Open PATHNAME and return a SOURCE for its contents. Returns a
+   STRING-SOURCE of \"\" for empty files (mmap rejects size=0 with
+   EINVAL), an MMAP-SOURCE otherwise. Callers should treat the
+   result as an abstract SOURCE — use the protocol generics, not
+   backend-specific accessors."
+  (if (zerop (with-open-file (f pathname) (file-length f)))
+      (string-source "" :name pathname)
+      (mmap-source pathname)))
+
+(defmethod close-source ((s mmap-source))
+  (when (mmap-source-ptr s)
+    (%mmap-close (mmap-source-ptr s)
+                 (mmap-source-size s)
+                 (mmap-source-fd s))
+    (setf (mmap-source-ptr s) nil
+          (mmap-source-size s) nil
+          (mmap-source-fd s)   nil)))
 
 (defmethod source-length ((s mmap-source))
   (mmap-source-size s))
@@ -192,7 +259,7 @@
 
 (defmethod source-emit-text-form ((s mmap-source) start end)
   ;; Zero-copy: references elp::ptr bound by SOURCE-WRAP-LAMBDA-BODY.
-  (format nil "(elp::write-output-range elp::ptr ~D ~D) " start end))
+  (format nil "(elp::write-mmap-range elp::ptr ~D ~D) " start end))
 
 (defmethod source-wrap-lambda-body ((s mmap-source) body)
   ;; Bind PTR/SIZE/FD lexicals the body's WRITE-OUTPUT-RANGE calls
@@ -214,11 +281,18 @@
 ;;;; Render codegen inlines string literals into the compiled lambda
 ;;;; — no source lexical needed at render time.
 
-(defclass string-source ()
+(defclass string-source (source)
   ((text :initarg :text :reader string-source-text)
    (name :initarg :name :initform "<string>" :reader string-source-name))
   (:documentation
-   "Source backed by a Lisp string."))
+   "Source backed by a Lisp string. Construct via (STRING-SOURCE text
+    &key name). CLOSE-SOURCE is a no-op."))
+
+(declaim (ftype (function (string &key (:name t)) string-source) string-source))
+(defun string-source (text &key (name "<string>"))
+  "Wrap TEXT in a STRING-SOURCE. NAME (default \"<string>\") is the
+   display name used in error messages."
+  (make-instance 'string-source :text text :name name))
 
 (defmethod source-length ((s string-source))
   (length (string-source-text s)))
@@ -254,3 +328,4 @@
 
 ;; SOURCE-WRAP-LAMBDA-BODY: default no-op method applies — the emitted
 ;; text forms are self-contained.
+;; CLOSE-SOURCE: default no-op method applies.

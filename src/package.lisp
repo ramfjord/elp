@@ -13,17 +13,22 @@
    :elp-template-error-line
    :elp-template-error-column
    :elp-template-error-original
-   ;; Embedded-language helpers — for tools that want only the code
-   :code-byte-ranges
-   :extract-code-text
-   ;; Source protocol — mmap-backed or string-backed input
+   ;; Source protocol — abstract SOURCE with two concrete backends.
+   ;; Backend class names double as constructors:
+   ;;   (mmap-source path)             — mmap, size > 0
+   ;;   (string-source text &key name) — Lisp-string backed
+   ;; FILEPATH-SOURCE is the convenience dispatcher: takes a
+   ;; pathname and returns either an MMAP-SOURCE or, for empty
+   ;; files, a STRING-SOURCE of "".
+   :source
    :mmap-source
    :string-source
+   :filepath-source
    :source-name
+   :close-source
    ;; Stream interface — full lambda-form character stream with
    ;; source-byte round-trip for the body bytes
-   :open-template-stream-from-file
-   :open-template-stream-from-string
-   :stream-byte-position
-   :template-stream
-   :template-lambda-stream))
+   :open-template-stream
+   :doc-offset->source-byte
+   :source-byte->doc-offset
+   :template-stream))

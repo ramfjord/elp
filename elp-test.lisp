@@ -16,7 +16,7 @@
 ;;;;
 ;;;; What we DON'T test separately, intentionally:
 ;;;;   - tokenizer internals (memmem/memchr, byte->line+column,
-;;;;     template-stream lex states) — exercised end-to-end through
+;;;;     unbound-template-stream lex states) — exercised end-to-end through
 ;;;;     every render test.
 ;;;;   - tag/syntax permutations beyond one example per feature —
 ;;;;     each adds maintenance cost without distinct failure modes.
@@ -47,7 +47,7 @@
    keyword bindings, return the rendered output as a string."
   (with-template-file (path template)
     (with-output-to-string (s)
-      (apply #'elp:render path s kwargs))))
+      (apply #'elp:render (elp:filepath-source path) s kwargs))))
 
 (defun render-error (template &rest kwargs)
   "Render TEMPLATE; return the elp-template-error if one was signaled,
@@ -173,8 +173,14 @@
                                            "<%= 1 %>"
                                            (make-string 50000 :initial-element #\b)))
       (flet ((codegen-length (path)
-               (let ((*print-pretty* nil))
-                 (length (prin1-to-string (elp::%template-lambda-form path)))))
+               ;; FUNCTION-LAMBDA-EXPRESSION on SBCL returns the
+               ;; lambda sexp that COMPILE consumed, letting us
+               ;; measure printed-form length without re-implementing
+               ;; the codegen here.
+               (let* ((fn (elp:compile-template (elp:filepath-source path)))
+                      (form (function-lambda-expression fn))
+                      (*print-pretty* nil))
+                 (length (prin1-to-string form))))
              (within-5% (a b)
                (< (abs (- a b)) (* 0.05 (min a b)))))
         (is (within-5% (codegen-length tiny) (codegen-length huge)))))))
@@ -214,21 +220,22 @@
 ;;;; render dispatch on a precompiled function
 ;;;; ============================================================
 
-(test render-on-precompiled-function-reuses-it
-  "RENDER specialized on a function passes kwargs straight through.
-   The compiled template can be reused across calls with different
-   kwargs — the compile-once / render-many contract."
+(test compile-template-returns-reusable-fn
+  "COMPILE-TEMPLATE returns a function reusable across calls with
+   different kwargs — the compile-once / render-many contract. The
+   SOURCE is consumed (CLOSE-SOURCE'd) during compilation; the
+   returned function is self-contained."
   (let ((path (make-pathname :name "elp-test-reuse" :type "elp")))
     (with-open-file (f path :direction :output :if-exists :supersede)
       (write-string "Hi <%= name %>!" f))
     (unwind-protect
-         (let ((tmpl (elp:compile-template path)))
+         (let ((tmpl (elp:compile-template (elp:filepath-source path))))
            (is (equal "Hi Alice!"
                       (with-output-to-string (s)
-                        (elp:render tmpl s :name "Alice"))))
+                        (funcall tmpl s :name "Alice"))))
            (is (equal "Hi Bob!"
                       (with-output-to-string (s)
-                        (elp:render tmpl s :name "Bob")))))
+                        (funcall tmpl s :name "Bob")))))
       (when (probe-file path) (delete-file path)))))
 
 ;;;; ============================================================
@@ -263,7 +270,12 @@
                (with-open-file (in path :element-type '(unsigned-byte 8))
                  (loop while (plusp (read-sequence buf in)))))
              (read-step ()
-               (elp::%template-lambda-form path))
+               ;; COMPILE-TEMPLATE drives the whole pipeline: drain +
+               ;; walk + lambda assembly + COMPILE. SBCL's COMPILE on
+               ;; the small assembled lambda is ~1ms (lambda size is
+               ;; bounded by code, not source bytes); the time is
+               ;; dominated by the drain over the multi-MB fixture.
+               (elp:compile-template (elp:filepath-source path)))
              (time-it (thunk)
                (let ((start (get-internal-real-time)))
                  (funcall thunk)
@@ -281,75 +293,17 @@
               ratio read-ms baseline-ms)))))))
 
 ;;;; ============================================================
-;;;; Embedded-language helpers — code-byte-ranges + extract-code-text.
-
-(test code-byte-ranges-basic-tags
-  "<%, <%=, <%# classified correctly; comment ranges excluded."
-  (let ((text "<%- (foo) -%>literal<%= bar %><%# secret %>tail"))
-    ;; <%- (foo) -%>:  body bytes 3..10 (" (foo) ")
-    ;; <%= bar %>:     body bytes 23..28 (" bar ")
-    ;; <%# secret %>:  comment, excluded
-    (is (equal '((3 . 10) (23 . 28))
-               (elp:code-byte-ranges text)))))
-
-(test code-byte-ranges-no-tags-returns-empty
-  "Plain text with no <% has no code regions."
-  (is (null (elp:code-byte-ranges "hello world")))
-  (is (null (elp:code-byte-ranges ""))))
-
-(test code-byte-ranges-multiline
-  "Tags spanning newlines: range covers all body bytes including \\n."
-  (let* ((text "before
-<%- (a)
-    (b) -%>
-after")
-         (ranges (elp:code-byte-ranges text)))
-    (is (= 1 (length ranges)))
-    (let* ((start (car (first ranges)))
-           (end   (cdr (first ranges)))
-           (body  (subseq text start end)))
-      (is (search "(a)" body))
-      (is (search "(b)" body)))))
-
-(test code-byte-ranges-trim-modifiers
-  "<%- and -%> trim markers aren't part of the body range."
-  (let* ((text "<%- (foo) -%>")
-         (ranges (elp:code-byte-ranges text))
-         (body  (subseq text (car (first ranges)) (cdr (first ranges)))))
-    (is (search "(foo)" body))
-    (is (not (search "-" body)))))
-
-(test extract-code-text-byte-equivalence
-  "Output is the same length as input; non-code bytes blanked to space."
-  (let* ((text "hello<%= bar %>world")
-         (out  (elp:extract-code-text text)))
-    (is (= (length text) (length out)))
-    (is (string= "     " (subseq out 0 5)))      ;; "hello"
-    (is (string= "     " (subseq out 15 20)))    ;; "world"
-    (is (string= "    bar  " (subseq out 5 14))) ;; <%= bar %> body kept
-    ))
-
-(test extract-code-text-preserves-newlines
-  "Newlines in the source survive blanking — line numbers don't shift."
-  (let* ((text "line1
-line2
-<%= bar %>")
-         (out  (elp:extract-code-text text)))
-    (is (char= #\Newline (char out 5)))
-    (is (char= #\Newline (char out 11)))
-    (is (string= "     " (subseq out 0 5)))    ;; pre-tag blanked
-    (is (string= "     " (subseq out 6 11)))))
-
-;;;; ============================================================
-;;;; open-template-stream-from-file / -from-string
+;;;; open-template-stream
 ;;;;
-;;;; Analysis lambda form with position map. Two facets we care about:
-;;;; (1) the stream's drained text reads as one well-formed (lambda
-;;;; ...) form whose &key list covers exactly the free variables in
-;;;; the template, with body chars that appear in the same render-
-;;;; shape COMPILE-TEMPLATE produces (write-output-range + FORMAT
+;;;; Analysis lambda form with position map. Driven by either
+;;;; FILE-SOURCE or STRING-SOURCE; the protocol abstracts the
+;;;; difference. Two facets we care about: (1) the stream's drained
+;;;; text reads as one well-formed (lambda ...) form whose &key list
+;;;; covers exactly the free variables in the template, with body
+;;;; chars that appear in the same render-shape COMPILE-TEMPLATE
+;;;; produces (write-output-range / write-string calls + FORMAT
 ;;;; wrappers, plus stub bindings for ELP::PTR / SIZE / FD), and (2)
-;;;; STREAM-BYTE-POSITION round-trips body chars to source bytes,
+;;;; DOC-OFFSET->SOURCE-BYTE round-trips body chars to source bytes,
 ;;;; returning NIL for synthesized wrapper / text-emit chars. The
 ;;;; render path (RENDER / COMPILE-TEMPLATE) is unaffected.
 
@@ -389,10 +343,10 @@ line2
    (declare …) (progn …))). &key list contains exactly the template's
    free variables; user symbols appear somewhere in the body."
   (with-template-file (p "Hi <%= name %>, age <%= age %>")
-    (let* ((s (elp:open-template-stream-from-file p))
+    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
            (form (read-stream-form s)))
       (is (eq 'lambda (first form)))
-      (is (equal (sort '(age name) #'string< :key #'symbol-name)
+      (is (equal (sort (list 'age 'name) #'string< :key #'symbol-name)
                  (sort (copy-list (find-lambda-key-list form))
                        #'string< :key #'symbol-name)))
       (is (tree-find 'name form))
@@ -402,7 +356,7 @@ line2
   "STRING-SOURCE entry point produces a lambda whose &key list reflects
    the string's free variables. Text spans become inlined (write-string
    ...) calls — no on-disk file involved."
-  (let* ((s (elp:open-template-stream-from-string "hello <%= who %>"))
+  (let* ((s (elp:open-template-stream (elp:string-source "hello <%= who %>")))
          (form (read-stream-form s)))
     (is (eq 'lambda (first form)))
     (is (equal '(who) (find-lambda-key-list form)))
@@ -415,62 +369,55 @@ line2
    with the dangling-paren halves stitched by the same reader trick the
    engine uses."
   (with-template-file (p "<% (when active %>ON<% ) %>")
-    (let* ((s (elp:open-template-stream-from-file p))
-           (form (read-stream-form s)))
-      (let ((when-form (cdr (assoc 'when (alexandria:flatten form)))))
-        ;; Easier: walk the tree looking for a (when active …) form.
-        (let ((found (labels
-                         ((walk (x)
-                            (cond ((atom x) nil)
-                                  ((and (eq (first x) 'when)
-                                        (eq (second x) 'active))
-                                   x)
-                                  (t (or (walk (car x)) (walk (cdr x)))))))
-                       (walk form))))
-          (declare (ignore when-form))
-          (is (consp found))
-          (is (eq 'when (first found)))
-          (is (eq 'active (second found))))))))
+    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
+           (form (read-stream-form s))
+           (when-form (labels ((walk (x)
+                                 (cond ((atom x) nil)
+                                       ((and (eq (first x) 'when)
+                                             (eq (second x) 'active))
+                                        x)
+                                       (t (or (walk (car x))
+                                              (walk (cdr x)))))))
+                        (walk form))))
+      (is (consp when-form))
+      (is (eq 'when (first when-form)))
+      (is (eq 'active (second when-form))))))
 
-(test open-template-stream-position-map-anchored-bytes
+(test open-template-stream-doc->source-anchored-bytes
   "Body chars whose source is a <% %> or <%= %> block map to their
    original .elp byte. Walk every char of the drained stream and
    verify that anchored chars round-trip to bytes whose template
-   content matches the read char.
-
-   STREAM-BYTE-POSITION's default semantics return the source byte
-   the reader is *about to read*, not the one it just read. The test
-   tracks the explicit position of each char before consuming it."
+   content matches the read char."
   (with-template-file (p "x<%= name %>y")
     (let* ((source-bytes (with-open-file (f p :element-type '(unsigned-byte 8))
                            (let ((buf (make-array (file-length f)
                                                   :element-type '(unsigned-byte 8))))
                              (read-sequence buf f)
                              buf)))
-           (s (elp:open-template-stream-from-file p))
+           (s (elp:open-template-stream (elp:filepath-source p)))
            (anchored-count 0))
       (loop for pos from 0
-            for src = (elp:stream-byte-position s pos)
+            for src = (elp:doc-offset->source-byte s pos)
             for c = (read-char s nil :eof)
             until (eq c :eof)
             when src
               do (is (char= c (code-char (aref source-bytes src)))
-                     "char ~S at reader-pos ~D → source-byte ~D should match source byte ~A"
+                     "char ~S at doc-offset ~D → source-byte ~D should match source byte ~A"
                      c pos src (code-char (aref source-bytes src)))
                  (incf anchored-count))
       ;; Sanity: at least the 4 letters of "name" between the
       ;; <%= %> delimiters were anchored.
       (is (>= anchored-count 4)))))
 
-(test open-template-stream-position-map-synth-chars-nil
+(test open-template-stream-doc->source-synth-chars-nil
   "Prefix chars (the (lambda …) signature, the (declare …), the (progn)
    opener) and inter-tag synthesized chars all return NIL from
-   STREAM-BYTE-POSITION — they have no .elp source byte to point at."
+   DOC-OFFSET->SOURCE-BYTE — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
-    (let* ((s (elp:open-template-stream-from-file p))
-           (text-len (length (drain-stream (elp:open-template-stream-from-file p))))
+    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
+           (text-len (length (drain-stream (elp:open-template-stream (elp:filepath-source p)))))
            (results (loop for pos from 0
-                          for src = (elp:stream-byte-position s pos)
+                          for src = (elp:doc-offset->source-byte s pos)
                           for c = (read-char s nil :eof)
                           until (eq c :eof)
                           collect (cons pos src))))
@@ -484,20 +431,47 @@ line2
       (is (find-if (lambda (pair) (integerp (cdr pair))) results)
           "at least one body char has a numeric source byte")
       ;; Positions past EOF return NIL.
-      (is (null (elp:stream-byte-position s (1+ text-len)))))))
+      (is (null (elp:doc-offset->source-byte s (1+ text-len)))))))
+
+(test open-template-stream-source->doc-round-trip
+  "DOC-OFFSET->SOURCE-BYTE and SOURCE-BYTE->DOC-OFFSET form a
+   reversible mapping for body chars: forward then reverse returns
+   the same doc-offset. The pair is what swank-lsp uses for cursor
+   translation in both directions."
+  (with-template-file (p "x<%= name %>y")
+    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
+           ;; Pick an anchored doc offset by scanning forward.
+           (anchored-doc
+            (loop for pos from 0
+                  for src = (elp:doc-offset->source-byte s pos)
+                  until (integerp src)
+                  finally (return pos)))
+           (src (elp:doc-offset->source-byte s anchored-doc))
+           (round-trip (elp:source-byte->doc-offset s src)))
+      (is (integerp src))
+      (is (= anchored-doc round-trip)))))
+
+(test source-byte->doc-offset-identity-default
+  "T methods default to identity — translators that produce a
+   byte-equivalent canvas (and consumers that haven't registered a
+   real mapping) get a no-op pair for free."
+  ;; A stand-in object — any value other than a template-stream uses
+  ;; the T-method identity defaults.
+  (is (= 42 (elp:doc-offset->source-byte :stub 42)))
+  (is (= 17 (elp:source-byte->doc-offset :stub 17))))
 
 (test open-template-stream-empty-template
   "Empty .elp yields a minimal lambda that drains and reads as a
    single LAMBDA form without raising."
   (with-template-file (p "")
-    (let ((form (read-stream-form (elp:open-template-stream-from-file p))))
+    (let ((form (read-stream-form (elp:open-template-stream (elp:filepath-source p)))))
       (is (eq 'lambda (first form))))))
 
 (test open-template-stream-no-free-vars
   "Template with no free variables yields a lambda whose &key list
    has no user-facing entries — just &allow-other-keys."
   (with-template-file (p "plain text only")
-    (let* ((s (elp:open-template-stream-from-file p))
+    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
            (form (read-stream-form s)))
       (is (null (find-lambda-key-list form))))))
 

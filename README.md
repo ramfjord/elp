@@ -64,9 +64,8 @@ track reader state when scanning for the close.
 ```lisp
 (use-package :elp)
 
-(render #p"template.elp"
-  '((name . "Alice")
-    (age . 30)))
+(render (filepath-source #p"template.elp") *standard-output*
+        :name "Alice" :age 30)
 ;; Writes to *standard-output*: Hello Alice, you are 30 years old.
 ```
 
@@ -83,10 +82,19 @@ Name: <%= name %><% (when (> age 30) %> (senior)<% ) %>
 ```
 
 ```lisp
-(render #p"template.elp"
-  '((name . "Bob")
-    (age . 35)))
+(render (filepath-source #p"template.elp") *standard-output*
+        :name "Bob" :age 35)
 ;; Writes to *standard-output*: Name: Bob (senior)
+```
+
+### Render from a String
+
+Useful for buffer-backed input (e.g. an LSP) or programmatically
+built templates — no on-disk file required:
+
+```lisp
+(render (string-source "Hi <%= name %>") *standard-output*
+        :name "Alice")
 ```
 
 ### Using with Full Lisp Power
@@ -102,11 +110,11 @@ PathChanged=<%= path %>
 ```
 
 ```lisp
-(render #p"systemd-unit.elp"
-  '((desc . "My Service")
-    (name . "myapp")
-    (config-files . ("/etc/myapp/config.yml"
-                     "/etc/myapp/secrets.env"))))
+(render (filepath-source #p"systemd-unit.elp") *standard-output*
+        :desc "My Service"
+        :name "myapp"
+        :config-files '("/etc/myapp/config.yml"
+                        "/etc/myapp/secrets.env"))
 ```
 
 ### Compile Once, Render Many
@@ -118,32 +126,59 @@ returned function:
 ```lisp
 (use-package :elp)
 
-(defparameter *page* (compile-template #p"page.elp"))
+(defparameter *page*
+  (compile-template (filepath-source #p"page.elp")))
 
 (funcall *page* *standard-output* :name "Alice")
-;; or via the alist-flavored render entry point:
-(render *page* '((name . "Alice")))
-(render *page* '((name . "Bob")))
+(funcall *page* *standard-output* :name "Bob")
 ```
 
 `compile-template` parses the template once and returns a function
-of `(stream &key var-1 var-2 … &allow-other-keys)`. Each free
+of `(stream &key var-1 var-2 … &allow-other-keys)`. The source is
+closed after compilation; the returned function is self-contained
+(mmap-source's wrap re-opens the mmap at render time). Each free
 template variable is one keyword parameter; missing keys signal
 `elp-template-error` at the reference site. Extra keyword arguments
 are silently ignored, so callers can pass a comprehensive bag of
-bindings and let each template pick the subset it needs. `render`
-accepts either a pathname (compiles on every call) or the compiled
-function; for ergonomics it takes an alist publicly and adapts it
-to the keyword-argument convention internally.
+bindings and let each template pick the subset it needs.
+
+## Sources
+
+`render`, `compile-template`, and `open-template-stream` all take a
+**source** — an object that knows where to find the template bytes.
+Two backends, plus a path-dispatching convenience:
+
+```lisp
+(filepath-source #p"path/to/file.elp")    ; mmap-source for regular files,
+                                          ; string-source "" for size=0
+(mmap-source #p"non-empty.elp")           ; mmap-backed directly (size > 0)
+(string-source "template text"
+               :name "buffer.elp")        ; Lisp-string-backed
+```
+
+Most callers reach for `filepath-source` when they have a path on
+disk: it returns an `mmap-source` for the common case and
+short-circuits to a `string-source` of `""` for empty files (which
+`mmap(2)` rejects with `EINVAL`). `mmap-source` is the bare backend
+constructor — useful when you already know the file is non-empty.
+
+A source is consumed by whichever entry point takes it (closed
+automatically). For long-lived use (compile-once render-many),
+`compile-template` returns a reusable function; the source itself is
+released as part of compilation.
 
 ## Context Variables
 
-Variables are passed as an association list (alist) where keys become symbols available in the template:
+Variables are passed as keyword arguments matching the template's
+free symbols. The compiled template's signature is
+`(stream &key VAR1 VAR2 … &allow-other-keys)`, so anything `&key`
+accepts works:
 
 ```lisp
-'((service-name . "radarr")
-  (port . 7878)
-  (enabled . t))
+(render (filepath-source #p"unit.elp") *standard-output*
+        :service-name "radarr"
+        :port 7878
+        :enabled t)
 ```
 
 Inside templates, reference them directly:
@@ -159,38 +194,97 @@ Active
 
 ### Public API
 
-**`(render input context-alist &optional stream)`**
+**`(render source stream &rest kwargs)`**
 
-Renders a template, streaming output bytes directly to `stream`
-(defaults to `*standard-output*`). Output is produced as bytes are
-generated, with no intermediate Lisp string. When `stream` is an
-`sb-sys:fd-stream` (e.g. the CLI's `*standard-output*` in a saved
-binary), literal text ranges are written via a single `write(2)`
-syscall directly on the mmap'd source — zero copy through Lisp.
+Compiles and renders `source` to `stream` with `kwargs` as the
+template's free-variable bindings. Output bytes go to `stream`
+as they are produced — no intermediate Lisp string. When `stream`
+is an `sb-sys:fd-stream` (e.g. the CLI's `*standard-output*` in a
+saved binary) *and* `source` is an `mmap-source`, literal text
+ranges write via a single `write(2)` syscall directly on the
+mmap'd region — zero copy through Lisp.
 
-- `input`: A pathname (compiled and rendered in one step) or the
-  compiled function returned by `compile-template`
-- `context-alist`: List of `(symbol . value)` pairs
-- `stream`: Destination stream (default: `*standard-output*`)
-- Returns: no useful value; consumers care about side effects on `stream`
+- `source`: an `mmap-source` or `string-source` (typically built via
+  `filepath-source` or `string-source`). Consumed
+  (`close-source`'d) as part of compilation.
+- `stream`: Destination stream.
+- `kwargs`: `&rest` plist passed through to the compiled template's
+  `&key` parameters.
 
 For callers that want the output as a string, wrap in
 `with-output-to-string`:
 
 ```lisp
 (with-output-to-string (s)
-  (render #p"template.elp" '((name . "Alice")) s))
+  (render (filepath-source #p"template.elp") s :name "Alice"))
 ```
 
-**`(compile-template pathname)` → function**
+**`(compile-template source)` → function**
 
-Compiles the template at `pathname` once and returns a function of
-`(stream &key var-1 var-2 … &allow-other-keys)`. Each free template
-variable is one keyword parameter; missing keys signal
-`elp-template-error` with line/column information. Extra keyword
-arguments pass through `&allow-other-keys` and are dropped — useful
-for splicing a comprehensive set of bindings into every render call
-and letting each template pick what it references.
+Compiles `source` once and returns a function of
+`(stream &key var-1 var-2 … &allow-other-keys)`. The source is
+closed before this function returns; the returned function is
+self-contained. Each free template variable is one keyword
+parameter; missing keys signal `elp-template-error` with line/column
+information. Extra keyword arguments pass through
+`&allow-other-keys` and are dropped.
+
+**`(filepath-source pathname)` → source**
+
+Convenience dispatcher: returns an `mmap-source` for a regular
+file, or a `string-source` of `""` for an empty file (since
+`mmap(2)` rejects size 0). Use this when you have a pathname and
+don't want to think about the empty-file edge case.
+
+**`(mmap-source pathname)` → mmap-source**
+
+Bare backend constructor. `pathname` must point to a regular file
+of size > 0. Use directly when you've already established that
+invariant; otherwise prefer `filepath-source`.
+
+**`(string-source text &key (name "<string>"))` → string-source**
+
+Wraps a Lisp string. `name` (default `"<string>"`) is the display
+name used in error messages.
+
+**`(close-source source)`**
+
+Releases any OS resources the source holds. Idempotent; no-op on
+`string-source`. Most callers don't invoke this directly —
+`render` / `compile-template` / `open-template-stream` do it
+automatically.
+
+**`(open-template-stream source)` → `template-stream`**
+
+Returns a character input stream whose drained text is the complete
+`(lambda (stream &key …) …)` form that `compile-template` would
+compile — in fact, `compile-template` is literally
+`(compile nil (read (open-template-stream source)))`. The stream is
+the canonical surface; the compiled function is one `read` + `compile`
+away.
+
+For static analysis (Lisp walkers, LSPs), drain the stream into a
+document buffer and walk the form. The mapping between document text
+and source bytes is exposed as a paired protocol — two generics,
+each direction:
+
+- **`(doc-offset->source-byte stream doc-offset)`** — forward. Returns
+  the originating source byte, or NIL if `doc-offset` lies in
+  synthesized wrapper / delimiter / text-emit territory.
+- **`(source-byte->doc-offset stream source-byte)`** — reverse.
+  Returns the document offset where `source-byte` appears, or NIL if
+  the byte doesn't surface in the document (e.g. inside a stripped
+  `<%# comment %>`).
+
+Both default to identity via T methods, so translators that produce
+byte-equivalent canvases (source and document offsets coincide) get
+no-op behavior without writing any methods.
+
+```lisp
+(let ((s (open-template-stream (filepath-source #p"foo.elp"))))
+  (doc-offset->source-byte s 42)   ; → 17 (or NIL)
+  (source-byte->doc-offset s 17))  ; → 42 (or NIL)
+```
 
 ### Errors
 
@@ -226,29 +320,68 @@ Or load directly:
 
 ## Implementation Notes
 
-- The template file is `mmap`'d once. The mapping is wrapped in a
-  custom Gray input stream (`template-stream`) that the standard Lisp
-  reader walks directly. Literal text spans are located via libc
-  `memmem`; only the bytes inside `<% ... %>` blocks are handed to the
-  reader as characters, plus a small synthesized prefix/suffix per
-  block. The file is never slurped into a Lisp string.
-- For each text span, the stream synthesizes a single
-  `(elp::write-output-range *template-ptr* START END)` call that, at
-  render time, writes those bytes straight from the mapping. When the
-  destination is an `sb-sys:fd-stream` (e.g. the CLI's stdout in a
-  saved binary), this is a single `write(2)` syscall on the mapped
-  pages — zero copy through Lisp.
-- The standard reader builds the body sexp directly from the stream;
-  there is no intermediate source-string assembly and no separate
-  tokenizer phase. Multi-block constructs like
-  `<% (dolist ... %> body <% ) %>` work because the reader is in the
-  middle of building a list when the stream transitions through `%>
-  ... text ... <%`, and the synthesized text-emit forms are appended
-  to the in-progress list.
-- A `position-map` on the stream records `(reader-position .
-  mmap-byte)` checkpoints at the start of each code or expression
-  body. Reader errors are translated into `elp-template-error` with
-  `file:line:column` by mapping the reader's stop position to a source
-  byte and counting newlines in the prefix via libc `memchr` — the
-  prefix scan is vectorized rather than per-byte.
+### Two-layer streaming
+
+There are two streams. The **inner** `unbound-template-stream` is a Gray
+input stream wrapped around a source (mmap-source or
+string-source). It drains the source into a continuous character
+stream of synthesized Lisp: literal text spans become
+`(elp::write-mmap-range elp::ptr START END)` calls (for mmap-source —
+zero-copy at render time) or `(write-string "literal")` calls (for
+string-source — inlined); `<%= … %>` blocks become
+`(let ((elp::*current-template-span* '(S E))) (format t "~A" body))`;
+`<% … %>` blocks pass the body chars through unchanged.
+
+The **outer** `template-stream` wraps the inner drain with the
+lambda signature, a per-source outer wrap (`multiple-value-bind` +
+`unwind-protect` for mmap-source; identity for string-source), a
+`handler-bind` for error translation, and `&key` supplied-p checks.
+Its drained text is the full compilable lambda; `compile-template`
+literally `read`s + `compile`s it.
+
+### Source protocol
+
+Anything that can act as a byte source for the template engine
+implements a small generic-function protocol: `source-length`,
+`source-byte`, `source-search` (memmem-shape), `source-substring`,
+`source-line+column`, `source-name`, `source-emit-text-form` (render
+codegen for literal text), `source-wrap-lambda-body` (per-source
+outer wrap). Two concrete classes today (`mmap-source`,
+`string-source`); the inner state machine is backend-agnostic.
+
+### Vectorized scanning, zero-copy render
+
+For mmap-source, literal text spans are located via libc `memmem`
+on the mapped region — only the bytes inside `<% ... %>` blocks pass
+through the Lisp reader. The file is never slurped into a Lisp
+string. At render time, `write-mmap-range` writes those bytes to an
+`sb-sys:fd-stream` via a single `write(2)` syscall directly on the
+mapped pages — zero copy through Lisp.
+
+For string-source, `cl:search` replaces `memmem` (the scanning
+protocol is generic) and literal text becomes inlined `write-string`
+calls in the compiled lambda — no runtime source binding needed.
+
+### Multi-block constructs
+
+`<% (dolist ... %> body <% ) %>` works because the standard reader is
+in the middle of building a list when the inner stream transitions
+through `%> ... text ... <%`. The synthesized text-emit forms get
+appended to the in-progress list naturally — there's no special
+multi-tag handling.
+
+### Position tracking + error translation
+
+The inner stream records `(reader-position . source-byte)`
+checkpoints whenever its emission transitions between
+source-anchored and synthesized regions. Reader errors translate to
+`elp-template-error` with `file:line:column` by looking up the
+reader's stop position in the position-map, falling back to
+`source-line+column` for the line/col conversion (libc `memchr` for
+mmap-source — vectorized newline scan).
+
+The outer `template-stream` inherits the inner position-map
+for its body region; prefix/suffix chars (synthesized wrapper)
+return NIL from `doc-offset->source-byte`. That's how an LSP turns a
+cursor in its translated buffer back into a source-file byte.
 
