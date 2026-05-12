@@ -16,7 +16,7 @@
 ;;;;
 ;;;; What we DON'T test separately, intentionally:
 ;;;;   - tokenizer internals (memmem/memchr, byte->line+column,
-;;;;     unbound-template-stream lex states) — exercised end-to-end through
+;;;;     template-body-stream lex states) — exercised end-to-end through
 ;;;;     every render test.
 ;;;;   - tag/syntax permutations beyond one example per feature —
 ;;;;     each adds maintenance cost without distinct failure modes.
@@ -293,29 +293,22 @@
               ratio read-ms baseline-ms)))))))
 
 ;;;; ============================================================
-;;;; open-template-stream
+;;;; translate-template
 ;;;;
-;;;; Analysis lambda form with position map. Driven by either
-;;;; FILE-SOURCE or STRING-SOURCE; the protocol abstracts the
-;;;; difference. Two facets we care about: (1) the stream's drained
-;;;; text reads as one well-formed (lambda ...) form whose &key list
-;;;; covers exactly the free variables in the template, with body
-;;;; chars that appear in the same render-shape COMPILE-TEMPLATE
-;;;; produces (write-output-range / write-string calls + FORMAT
-;;;; wrappers, plus stub bindings for ELP::PTR / SIZE / FD), and (2)
-;;;; DOC-OFFSET->SOURCE-BYTE round-trips body chars to source bytes,
-;;;; returning NIL for synthesized wrapper / text-emit chars. The
-;;;; render path (RENDER / COMPILE-TEMPLATE) is unaffected.
+;;;; Analysis lambda materialization. Driven by either MMAP-SOURCE or
+;;;; STRING-SOURCE; the protocol abstracts the difference. Two facets
+;;;; we care about: (1) the TRANSLATED-TEMPLATE-TEXT reads as one
+;;;; well-formed (lambda ...) form whose &key list covers exactly the
+;;;; free variables in the template, with body chars that appear in
+;;;; the same render-shape COMPILE-TEMPLATE produces
+;;;; (write-mmap-range / write-string calls + FORMAT wrappers), and
+;;;; (2) DOC-OFFSET->SOURCE-BYTE round-trips body chars to source
+;;;; bytes, returning NIL for synthesized wrapper / text-emit chars.
+;;;; The render path (RENDER / COMPILE-TEMPLATE) is unaffected.
 
-(defun drain-stream (s)
-  "Read all chars from S into a string."
-  (with-output-to-string (out)
-    (loop for c = (read-char s nil :eof)
-          until (eq c :eof) do (write-char c out))))
-
-(defun read-stream-form (s)
-  "Read one Lisp form from S, returning the sexp."
-  (read s))
+(defun template-form (tt)
+  "Read one Lisp form from TT's translated text."
+  (read-from-string (elp:translated-template-text tt)))
 
 (defun find-lambda-key-list (form)
   "Given a (lambda (stream &key …) …) form, return the &key params'
@@ -338,13 +331,13 @@
         ((atom tree) nil)
         (t (or (tree-find sym (car tree)) (tree-find sym (cdr tree))))))
 
-(test open-template-stream-shape
+(test translate-template-shape
   "Returned stream drains to (lambda (stream &key …) (let stub-bindings
    (declare …) (progn …))). &key list contains exactly the template's
    free variables; user symbols appear somewhere in the body."
   (with-template-file (p "Hi <%= name %>, age <%= age %>")
-    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
-           (form (read-stream-form s)))
+    (let* ((s (elp:translate-template (elp:filepath-source p)))
+           (form (template-form s)))
       (is (eq 'lambda (first form)))
       (is (equal (sort (list 'age 'name) #'string< :key #'symbol-name)
                  (sort (copy-list (find-lambda-key-list form))
@@ -352,25 +345,25 @@
       (is (tree-find 'name form))
       (is (tree-find 'age form)))))
 
-(test open-template-stream-from-string-basic
+(test translate-template-from-string-basic
   "STRING-SOURCE entry point produces a lambda whose &key list reflects
    the string's free variables. Text spans become inlined (write-string
    ...) calls — no on-disk file involved."
-  (let* ((s (elp:open-template-stream (elp:string-source "hello <%= who %>")))
-         (form (read-stream-form s)))
+  (let* ((s (elp:translate-template (elp:string-source "hello <%= who %>")))
+         (form (template-form s)))
     (is (eq 'lambda (first form)))
     (is (equal '(who) (find-lambda-key-list form)))
     (is (tree-find 'who form))
     (is (tree-find 'write-string form))))
 
-(test open-template-stream-spanning-paren
+(test translate-template-spanning-paren
   "Spanning-paren constructs survive as one user form. <% (when active %>
    ON<% ) %> reads as a single (when active …) somewhere in the body,
    with the dangling-paren halves stitched by the same reader trick the
    engine uses."
   (with-template-file (p "<% (when active %>ON<% ) %>")
-    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
-           (form (read-stream-form s))
+    (let* ((s (elp:translate-template (elp:filepath-source p)))
+           (form (template-form s))
            (when-form (labels ((walk (x)
                                  (cond ((atom x) nil)
                                        ((and (eq (first x) 'when)
@@ -383,7 +376,7 @@
       (is (eq 'when (first when-form)))
       (is (eq 'active (second when-form))))))
 
-(test open-template-stream-doc->source-anchored-bytes
+(test translate-template-doc->source-anchored-bytes
   "Body chars whose source is a <% %> or <%= %> block map to their
    original .elp byte. Walk every char of the drained stream and
    verify that anchored chars round-trip to bytes whose template
@@ -394,33 +387,29 @@
                                                   :element-type '(unsigned-byte 8))))
                              (read-sequence buf f)
                              buf)))
-           (s (elp:open-template-stream (elp:filepath-source p)))
+           (tt (elp:translate-template (elp:filepath-source p)))
+           (text (elp:translated-template-text tt))
            (anchored-count 0))
-      (loop for pos from 0
-            for src = (elp:doc-offset->source-byte s pos)
-            for c = (read-char s nil :eof)
-            until (eq c :eof)
+      (loop for pos below (length text)
+            for src = (elp:doc-offset->source-byte tt pos)
             when src
-              do (is (char= c (code-char (aref source-bytes src)))
+              do (is (char= (char text pos) (code-char (aref source-bytes src)))
                      "char ~S at doc-offset ~D → source-byte ~D should match source byte ~A"
-                     c pos src (code-char (aref source-bytes src)))
+                     (char text pos) pos src (code-char (aref source-bytes src)))
                  (incf anchored-count))
       ;; Sanity: at least the 4 letters of "name" between the
       ;; <%= %> delimiters were anchored.
       (is (>= anchored-count 4)))))
 
-(test open-template-stream-doc->source-synth-chars-nil
+(test translate-template-doc->source-synth-chars-nil
   "Prefix chars (the (lambda …) signature, the (declare …), the (progn)
    opener) and inter-tag synthesized chars all return NIL from
    DOC-OFFSET->SOURCE-BYTE — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
-    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
-           (text-len (length (drain-stream (elp:open-template-stream (elp:filepath-source p)))))
-           (results (loop for pos from 0
-                          for src = (elp:doc-offset->source-byte s pos)
-                          for c = (read-char s nil :eof)
-                          until (eq c :eof)
-                          collect (cons pos src))))
+    (let* ((tt (elp:translate-template (elp:filepath-source p)))
+           (text (elp:translated-template-text tt))
+           (results (loop for pos below (length text)
+                          collect (cons pos (elp:doc-offset->source-byte tt pos)))))
       ;; The first two chars are `(l` opening the lambda — no source.
       (is (null (cdr (assoc 0 results)))
           "first char (the '(' of lambda) has no source")
@@ -431,15 +420,15 @@
       (is (find-if (lambda (pair) (integerp (cdr pair))) results)
           "at least one body char has a numeric source byte")
       ;; Positions past EOF return NIL.
-      (is (null (elp:doc-offset->source-byte s (1+ text-len)))))))
+      (is (null (elp:doc-offset->source-byte tt (1+ (length text))))))))
 
-(test open-template-stream-source->doc-round-trip
+(test translate-template-source->doc-round-trip
   "DOC-OFFSET->SOURCE-BYTE and SOURCE-BYTE->DOC-OFFSET form a
    reversible mapping for body chars: forward then reverse returns
    the same doc-offset. The pair is what swank-lsp uses for cursor
    translation in both directions."
   (with-template-file (p "x<%= name %>y")
-    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
+    (let* ((s (elp:translate-template (elp:filepath-source p)))
            ;; Pick an anchored doc offset by scanning forward.
            (anchored-doc
             (loop for pos from 0
@@ -455,24 +444,24 @@
   "T methods default to identity — translators that produce a
    byte-equivalent canvas (and consumers that haven't registered a
    real mapping) get a no-op pair for free."
-  ;; A stand-in object — any value other than a template-stream uses
+  ;; A stand-in object — any value other than a translated-template uses
   ;; the T-method identity defaults.
   (is (= 42 (elp:doc-offset->source-byte :stub 42)))
   (is (= 17 (elp:source-byte->doc-offset :stub 17))))
 
-(test open-template-stream-empty-template
+(test translate-template-empty-template
   "Empty .elp yields a minimal lambda that drains and reads as a
    single LAMBDA form without raising."
   (with-template-file (p "")
-    (let ((form (read-stream-form (elp:open-template-stream (elp:filepath-source p)))))
+    (let ((form (template-form (elp:translate-template (elp:filepath-source p)))))
       (is (eq 'lambda (first form))))))
 
-(test open-template-stream-no-free-vars
+(test translate-template-no-free-vars
   "Template with no free variables yields a lambda whose &key list
    has no user-facing entries — just &allow-other-keys."
   (with-template-file (p "plain text only")
-    (let* ((s (elp:open-template-stream (elp:filepath-source p)))
-           (form (read-stream-form s)))
+    (let* ((s (elp:translate-template (elp:filepath-source p)))
+           (form (template-form s)))
       (is (null (find-lambda-key-list form))))))
 
 ;;;; ============================================================

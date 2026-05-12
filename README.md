@@ -144,7 +144,7 @@ bindings and let each template pick the subset it needs.
 
 ## Sources
 
-`render`, `compile-template`, and `open-template-stream` all take a
+`render`, `compile-template`, and `translate-template` all take a
 **source** — an object that knows where to find the template bytes.
 Two backends, plus a path-dispatching convenience:
 
@@ -251,27 +251,31 @@ name used in error messages.
 
 Releases any OS resources the source holds. Idempotent; no-op on
 `string-source`. Most callers don't invoke this directly —
-`render` / `compile-template` / `open-template-stream` do it
+`render` / `compile-template` / `translate-template` do it
 automatically.
 
-**`(open-template-stream source)` → `template-stream`**
+**`(translate-template source)` → `translated-template`**
 
-Returns a character input stream whose drained text is the complete
+Returns a `translated-template` object holding the complete
 `(lambda (stream &key …) …)` form that `compile-template` would
-compile — in fact, `compile-template` is literally
-`(compile nil (read (open-template-stream source)))`. The stream is
-the canonical surface; the compiled function is one `read` + `compile`
-away.
+compile, as text, plus a position-map for cursor translation. In
+fact, `compile-template` is literally
+`(compile nil (read-from-string (translated-template-text
+(translate-template source))))` — the translated-template is the
+canonical surface; the compiled function is one `read-from-string` +
+`compile` away.
 
-For static analysis (Lisp walkers, LSPs), drain the stream into a
-document buffer and walk the form. The mapping between document text
-and source bytes is exposed as a paired protocol — two generics,
-each direction:
+**`(translated-template-text tt)` → string**
 
-- **`(doc-offset->source-byte stream doc-offset)`** — forward. Returns
+The full lambda text. For static analysis (Lisp walkers, LSPs),
+paste this into a document buffer and walk the form. The mapping
+between document text and source bytes is a paired protocol — two
+generics, each direction:
+
+- **`(doc-offset->source-byte tt doc-offset)`** — forward. Returns
   the originating source byte, or NIL if `doc-offset` lies in
   synthesized wrapper / delimiter / text-emit territory.
-- **`(source-byte->doc-offset stream source-byte)`** — reverse.
+- **`(source-byte->doc-offset tt source-byte)`** — reverse.
   Returns the document offset where `source-byte` appears, or NIL if
   the byte doesn't surface in the document (e.g. inside a stripped
   `<%# comment %>`).
@@ -281,9 +285,10 @@ byte-equivalent canvases (source and document offsets coincide) get
 no-op behavior without writing any methods.
 
 ```lisp
-(let ((s (open-template-stream (filepath-source #p"foo.elp"))))
-  (doc-offset->source-byte s 42)   ; → 17 (or NIL)
-  (source-byte->doc-offset s 17))  ; → 42 (or NIL)
+(let ((tt (translate-template (filepath-source #p"foo.elp"))))
+  (translated-template-text tt)      ; → "(lambda (stream &key name) …)"
+  (doc-offset->source-byte tt 42)    ; → 17 (or NIL)
+  (source-byte->doc-offset tt 17))   ; → 42 (or NIL)
 ```
 
 ### Errors
@@ -320,24 +325,28 @@ Or load directly:
 
 ## Implementation Notes
 
-### Two-layer streaming
+### One stream, one materialized result
 
-There are two streams. The **inner** `unbound-template-stream` is a Gray
-input stream wrapped around a source (mmap-source or
-string-source). It drains the source into a continuous character
-stream of synthesized Lisp: literal text spans become
+A `template-body-stream` is a Gray input stream wrapped around a
+source (mmap-source or string-source). It synthesizes a continuous
+character stream of Lisp: literal text spans become
 `(elp::write-mmap-range elp::ptr START END)` calls (for mmap-source —
 zero-copy at render time) or `(write-string "literal")` calls (for
 string-source — inlined); `<%= … %>` blocks become
 `(let ((elp::*current-template-span* '(S E))) (format t "~A" body))`;
-`<% … %>` blocks pass the body chars through unchanged.
+`<% … %>` blocks pass the body chars through unchanged. Position-map
+checkpoints accumulate at chunk transitions, mapping
+character-positions to source bytes.
 
-The **outer** `template-stream` wraps the inner drain with the
-lambda signature, a per-source outer wrap (`multiple-value-bind` +
-`unwind-protect` for mmap-source; identity for string-source), a
-`handler-bind` for error translation, and `&key` supplied-p checks.
-Its drained text is the full compilable lambda; `compile-template`
-literally `read`s + `compile`s it.
+The `translated-template` object holds the **materialized** result:
+the body-stream is drained into a string, spliced between a
+synthesized prefix (lambda signature, per-source outer wrap —
+`multiple-value-bind` + `unwind-protect` for mmap-source, identity
+for string-source — `handler-bind` for error translation, `&key`
+supplied-p checks) and suffix (closing parens, cleanup, `(values)`).
+The position-map's keys shift by the prefix length so they index
+directly into the final text. `compile-template` is then a one-line
+`read-from-string` + `compile` over `translated-template-text`.
 
 ### Source protocol
 
@@ -365,14 +374,14 @@ calls in the compiled lambda — no runtime source binding needed.
 ### Multi-block constructs
 
 `<% (dolist ... %> body <% ) %>` works because the standard reader is
-in the middle of building a list when the inner stream transitions
+in the middle of building a list when the body-stream transitions
 through `%> ... text ... <%`. The synthesized text-emit forms get
 appended to the in-progress list naturally — there's no special
 multi-tag handling.
 
 ### Position tracking + error translation
 
-The inner stream records `(reader-position . source-byte)`
+The body-stream records `(reader-position . source-byte)`
 checkpoints whenever its emission transitions between
 source-anchored and synthesized regions. Reader errors translate to
 `elp-template-error` with `file:line:column` by looking up the
@@ -380,8 +389,9 @@ reader's stop position in the position-map, falling back to
 `source-line+column` for the line/col conversion (libc `memchr` for
 mmap-source — vectorized newline scan).
 
-The outer `template-stream` inherits the inner position-map
-for its body region; prefix/suffix chars (synthesized wrapper)
-return NIL from `doc-offset->source-byte`. That's how an LSP turns a
-cursor in its translated buffer back into a source-file byte.
+The `translated-template` inherits the position-map for its body
+region (with keys shifted by the prefix length); prefix/suffix chars
+(synthesized wrapper) return NIL from `doc-offset->source-byte`.
+That's how an LSP turns a cursor in its translated buffer back into a
+source-file byte.
 

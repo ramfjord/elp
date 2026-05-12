@@ -84,7 +84,7 @@
 ;;;; Two-step model:
 ;;;;   1. Build a SOURCE (see src/source.lisp for constructors).
 ;;;;   2. Hand it to RENDER (one-shot), COMPILE-TEMPLATE (reusable
-;;;;      function), or OPEN-TEMPLATE-STREAM (analysis lambda stream
+;;;;      function), or TRANSLATE-TEMPLATE (analysis lambda stream
 ;;;;      for static walkers / LSPs).
 ;;;;
 ;;;; All three consume the source — they call CLOSE-SOURCE after the
@@ -107,11 +107,12 @@
    ELP-TEMPLATE-ERROR with the correct line/column. Extra keyword
    arguments are silently ignored.
 
-   Reads the lambda form straight from OPEN-TEMPLATE-STREAM. SOURCE
-   is consumed (CLOSE-SOURCE'd) by that call. The compiled lambda is
-   self-contained — runtime acquisition (if any) lives in the
-   source's SOURCE-WRAP-LAMBDA-BODY."
-  (compile nil (read (open-template-stream source))))
+   Reads the lambda form from TRANSLATE-TEMPLATE's materialized text.
+   SOURCE is consumed (CLOSE-SOURCE'd) by that call. The compiled
+   lambda is self-contained — runtime acquisition (if any) lives in
+   the source's SOURCE-WRAP-LAMBDA-BODY."
+  (compile nil (read-from-string
+                (translated-template-text (translate-template source)))))
 
 (declaim (ftype (function (t stream &rest t) t) render))
 (defun render (source stream &rest kwargs)
@@ -156,47 +157,7 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-(declaim (ftype (function (unbound-template-stream) list) %template-free-vars))
-(defun %template-free-vars (inner)
-  "Discover the template's free variables from a drained
-   UNBOUND-TEMPLATE-STREAM. Two internal steps: parse INNER's
-   captured text into a body sexp, then walk the sexp in a candidate
-   that mirrors the runtime wrapper's lexical scope (so wrapper-
-   introduced names ELP::PTR / SIZE / FD / SOURCE aren't classified as
-   free; *current-template-span* is a defvar so it's already
-   proclaimed special).
-
-   Reader errors during parsing are translated to ELP-TEMPLATE-ERROR
-   via INNER's position-map and source — must run while INNER's source
-   is still open, since the translator queries SOURCE-LINE+COLUMN."
-  (let* ((source (source inner))
-         (body-sexp
-          (with-input-from-string (in (translated-text inner))
-            (handler-case
-                (let ((forms '()))
-                  (loop for form = (read in nil :eof)
-                        until (eq form :eof)
-                        do (push form forms))
-                  `(progn ,@(nreverse forms)))
-              ((or reader-error end-of-file) (c)
-                (let* ((reader-pos (file-position in))
-                       (file-byte  (or (doc-offset->source-byte inner reader-pos)
-                                       0)))
-                  (multiple-value-bind (line col)
-                      (source-line+column source file-byte)
-                    (error 'elp-template-error
-                           :file (source-name source) :line line :column col
-                           :original c))))))))
-    (form-free-vars
-     `(lambda (&optional (stream *standard-output*))
-        (let ((*standard-output* stream)
-              (elp::ptr nil) (elp::size nil) (elp::fd nil)
-              (elp::source nil))
-          (declare (ignorable elp::ptr elp::size elp::fd elp::source))
-          ,body-sexp
-          (values))))))
-
-;;;; Reader-driven codegen: unbound-template-stream gray stream
+;;;; Reader-driven codegen: template-body-stream gray stream
 ;;;;
 ;;;; A SB-GRAY input stream wrapped around an mmap'd template region.
 ;;;; Synthesizes Lisp source characters on the fly so that the standard
@@ -232,7 +193,7 @@
 ;;;; pushed at key=chars-read+CHAR-OFFSET, anchor=SOURCE-BYTE — the
 ;;;; reader-pos that *will* land on the anchored region.
 
-(defclass unbound-template-stream (sb-gray:fundamental-character-input-stream)
+(defclass template-body-stream (sb-gray:fundamental-character-input-stream)
   ((source          :initarg :source     :reader   source
     :documentation "Backing SOURCE. All byte scanning / substring
                     extraction / text-emit codegen dispatches through
@@ -251,7 +212,7 @@
    (position-map    :initform '()        :accessor position-map)
    (translated-text :initform nil        :accessor translated-text
     :documentation "Captured drained character output, populated by
-                    %DRAIN-UNBOUND-TEMPLATE-STREAM. NIL until drain
+                    %DRAIN-TEMPLATE-BODY-STREAM. NIL until drain
                     runs. Lets the stream act as its own
                     fully-self-contained record of (source, translated
                     chars, position-map) for downstream consumers like
@@ -265,9 +226,11 @@
     POSITION-MAP records (READER-POS . SOURCE-BYTE) checkpoints, oldest
     last (push to front). A checkpoint says: at the moment the reader
     has consumed READER-POS chars, the next character will correspond
-    to SOURCE-BYTE in the source. DOC-OFFSET->SOURCE-BYTE uses it to
-    translate a reader position back to a source byte; NIL SOURCE-BYTE
-    marks synthesized regions with no source backing."))
+    to SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
+    regions with no source backing. The map is consumed by
+    TRANSLATED-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
+    the keys by the prefix length and stores the result for
+    DOC-OFFSET->SOURCE-BYTE / SOURCE-BYTE->DOC-OFFSET lookup."))
 
 (defun synth-text-form (source start end)
   "Source string for a literal-text span covering source bytes
@@ -379,66 +342,11 @@
    ANCHOR is either an integer source-byte (for chars that originated
    in the .elp file) or NIL (for synthesized chars — text-emit
    wrappers, the expr-prefix FORMAT call, the lambda signature, etc).
-   DOC-OFFSET->SOURCE-BYTE returns NIL for any reader position covered by
-   a NIL-anchored checkpoint."
+   NIL-anchored checkpoints survive into the outer TRANSLATED-TEMPLATE
+   so DOC-OFFSET->SOURCE-BYTE can return NIL for those regions."
   (let ((top (car (position-map s))))
     (unless (equal top (cons key anchor))
       (push (cons key anchor) (position-map s)))))
-
-;;;; ============================================================
-;;;; Reversible doc-offset ↔ source-byte mapping.
-;;;;
-;;;; Two paired generics. The TEMPLATE-STREAM returned by
-;;;; OPEN-TEMPLATE-STREAM specializes both; together they form a
-;;;; "reversible mapping" between coordinates in the drained
-;;;; document text and bytes in the original source.
-;;;;
-;;;; T methods on both default to identity — translators that produce
-;;;; a byte-equivalent canvas (source and document offsets coincide)
-;;;; inherit identity behavior for free.
-;;;;
-;;;; Returns NIL when the input position has no corresponding location
-;;;; in the other coordinate system: synthesized chars (no source
-;;;; backing) for DOC-OFFSET->SOURCE-BYTE, and source bytes that don't
-;;;; appear in the document (e.g. inside a stripped <%# comment %>)
-;;;; for SOURCE-BYTE->DOC-OFFSET.
-
-(defgeneric doc-offset->source-byte (s doc-offset)
-  (:documentation
-   "Map DOC-OFFSET (a character index into S's drained text) to the
-    corresponding source byte in the .elp file. Returns NIL when
-    DOC-OFFSET lies in synthesized (non-source-anchored) territory."))
-
-(defgeneric source-byte->doc-offset (s source-byte)
-  (:documentation
-   "Map SOURCE-BYTE (an offset into the .elp file) to the
-    corresponding character index in S's drained text. Returns NIL
-    when SOURCE-BYTE has no representation in the document (e.g.
-    bytes inside a comment tag that was stripped)."))
-
-;; T-method identity defaults — byte-equivalent translators inherit
-;; these without writing any methods.
-(defmethod doc-offset->source-byte ((s t) doc-offset) doc-offset)
-(defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
-
-(defmethod doc-offset->source-byte ((s unbound-template-stream) doc-offset)
-  ;; Position-map is sorted descending by doc-offset; the first entry
-  ;; with key <= DOC-OFFSET is the chunk containing it. NIL CDR means
-  ;; the chunk is synthesized (no source).
-  (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
-                          (position-map s))))
-    (destructuring-bind (cp-doc . cp-src) cp
-      (when cp-src (+ cp-src (- doc-offset cp-doc))))))
-
-(defmethod source-byte->doc-offset ((s unbound-template-stream) source-byte)
-  ;; Scan for an anchored entry (integer CDR) whose source range
-  ;; covers SOURCE-BYTE; the first such entry (newest-first order) is
-  ;; the chunk.
-  (when-let ((cp (find-if (lambda (c)
-                            (and (integerp (cdr c)) (<= (cdr c) source-byte)))
-                          (position-map s))))
-    (destructuring-bind (cp-doc . cp-src) cp
-      (+ cp-doc (- source-byte cp-src)))))
 
 (defun ts-parse-tag-chunk (s)
   "Cursor sits just past the open delimiter (`<%` or `<%-`). Classify
@@ -524,7 +432,7 @@
                 (return (cons (synth-text-form source text-start text-end)
                               nil)))))))))))
 
-(defmethod sb-gray:stream-read-char ((s unbound-template-stream))
+(defmethod sb-gray:stream-read-char ((s template-body-stream))
   ;; Pushback always wins. Re-incrementing CHARS-READ is correct
   ;; because UNREAD-CHAR decremented it.
   (when-let ((pb (pushback s)))
@@ -561,58 +469,56 @@
          (incf (chars-read s))
          (return-from sb-gray:stream-read-char (char str pos)))))))
 
-(defmethod sb-gray:stream-unread-char ((s unbound-template-stream) char)
+(defmethod sb-gray:stream-unread-char ((s template-body-stream) char)
   (setf (pushback s) char)
   (decf (chars-read s))
   nil)
 
 ;;;; ============================================================
-;;;; Public stream interface — full lambda form with position map.
+;;;; Public translation interface — full lambda form with position map.
 ;;;;
-;;;; OPEN-TEMPLATE-STREAM-FROM-FILE / -FROM-STRING return a character
-;;;; input stream whose drained contents are an analysis lambda form
-;;;; for the template — same body shape the render path produces,
-;;;; wrapped in stub bindings so a static walker / LSP sees every
+;;;; TRANSLATE-TEMPLATE returns a TRANSLATED-TEMPLATE: a materialized
+;;;; analysis lambda form for the template — same body shape the
+;;;; render path produces, wrapped so a static walker / LSP sees every
 ;;;; symbol as a real lexical or function reference. Bytes produced
 ;;;; from the user's <% %> / <%= %> blocks are anchored;
-;;;; DOC-OFFSET->SOURCE-BYTE translates reader positions into source bytes
-;;;; (NIL for synthesized prefix/suffix/text-emit chars).
+;;;; DOC-OFFSET->SOURCE-BYTE translates document offsets into source
+;;;; bytes (NIL for synthesized prefix/suffix/text-emit chars).
 ;;;;
-;;;; The stream + position-map carry "translated text plus byte map"
-;;;; through one object — a Lisp-LSP can DRAIN the stream into its
-;;;; document-text slot and call DOC-OFFSET->SOURCE-BYTE for cursor
-;;;; translation, without knowing anything about ELP's internals.
+;;;; The text + position-map travel together — a Lisp-LSP can paste
+;;;; TRANSLATED-TEMPLATE-TEXT into a document buffer and use the
+;;;; position-map for cursor translation, without knowing anything
+;;;; about ELP's internals.
 ;;;;
 ;;;; Implementation:
 ;;;;   1. Accept a SOURCE (see src/source.lisp).
-;;;;   2. Drain a TEMPLATE-STREAM over that source to capture
-;;;;      (BODY-CHARS, POSITION-MAP).
+;;;;   2. Drain a TEMPLATE-BODY-STREAM over that source to materialize
+;;;;      the inner body text + per-chunk position-map checkpoints.
 ;;;;   3. Walk the parsed body sexp for free variables.
-;;;;   4. Synthesize an analysis lambda prefix (stub bindings for the
-;;;;      body's WRITE-OUTPUT-RANGE refs, named &key per free var) and
-;;;;      suffix; return a TEMPLATE-STREAM that serves
-;;;;      prefix → body → suffix.
+;;;;   4. Synthesize an analysis lambda prefix (signature, wrapper
+;;;;      open, handler-bind, supplied-p checks) and suffix; splice
+;;;;      the inner body between them. Shift the inner position-map
+;;;;      keys by the prefix length so they index into the final text.
 ;;;;
-;;;; The analysis lambda doesn't COMPILE+RUN usefully — the stub
-;;;; bindings are NIL, so calling it would error inside
-;;;; WRITE-OUTPUT-RANGE. That's intentional: the consumer's job is
-;;;; static analysis, not execution.
+;;;; The analysis lambda doesn't COMPILE+RUN usefully on its own —
+;;;; SOURCE-WRAP-LAMBDA-BODY's mmap mvb re-opens the source at render
+;;;; time; for static analysis the consumer reads the text, not runs
+;;;; it.
 
-(defclass template-stream (sb-gray:fundamental-character-input-stream)
-  (;; The three computed slots below are populated by
-   ;; INITIALIZE-INSTANCE :AFTER from the :SOURCE initarg. Callers
-   ;; don't construct the inner stream, don't drive the drain, don't
-   ;; see the codegen pipeline — just hand the constructor a SOURCE
-   ;; and the resulting stream's drained text is the analysis lambda
-   ;; for that template.
-   (text
-    :reader text
+(defclass translated-template ()
+  ;; All three slots are populated by INITIALIZE-INSTANCE :AFTER from
+  ;; the :SOURCE initarg. Callers don't construct the inner stream,
+  ;; don't drive the drain, don't see the codegen pipeline — just hand
+  ;; the constructor a SOURCE and the resulting object is the
+  ;; materialized analysis lambda for that template.
+  ((text
+    :reader translated-template-text
     :documentation "Full lambda text: synthesized prefix (signature,
                     wrapper open, handler-bind, supplied-p checks) +
                     translated inner-template chars (text-emit forms,
                     code blocks, expr blocks) + synthesized suffix
-                    (closing parens, cleanup, (values)). Drained
-                    linearly by READ-CHAR.")
+                    (closing parens, cleanup, (values)). Pass through
+                    READ-FROM-STRING to get the lambda sexp.")
    (position-map
     :reader position-map
     :documentation "Doc-offset-relative position-map — pre-shifted so
@@ -624,28 +530,25 @@
     :reader source-name
     :documentation "Display name for the source (pathname for files,
                     caller-supplied for strings). Retained for
-                    diagnostics.")
-   (chars-read
-    :initform 0 :accessor chars-read)
-   (pushback
-    :initform nil :accessor pushback))
+                    diagnostics."))
   (:documentation
-   "Character input stream serving the full analysis (lambda ...) form
-    for an ELP template. Constructed from a SOURCE via
-    `(make-instance 'template-stream :source source)`; usually via
-    OPEN-TEMPLATE-STREAM, which adds CLOSE-SOURCE lifecycle management.
-    Drains prefix, then translated-text, then suffix in order.
-    DOC-OFFSET->SOURCE-BYTE returns the originating source byte for
-    body chars and NIL for wrapper chars."))
+   "Materialized analysis form for an ELP template: the wrapped
+    lambda's printed text bundled with a position-map that translates
+    document offsets back to source bytes. Built from a SOURCE via
+    TRANSLATE-TEMPLATE (or `(make-instance 'translated-template
+    :source source)` directly). DOC-OFFSET->SOURCE-BYTE and
+    SOURCE-BYTE->DOC-OFFSET specialize on this class for cursor
+    translation in both directions; NIL out for synthesized (non-
+    source-anchored) regions."))
 
-(defmethod initialize-instance :after ((s template-stream) &key source)
-  "Run the codegen pipeline: drain a fresh UNBOUND-TEMPLATE-STREAM over
-   SOURCE, walk for free variables, build the wrapped lambda sexp with
-   a body-splice marker, PRIN1 it, split the printed text on the
-   marker, and populate S's slots with the resulting prefix /
-   translated-text / suffix / position-map / source-name."
-  (let* ((inner (%drain-unbound-template-stream
-                 (make-instance 'unbound-template-stream :source source)))
+(defmethod initialize-instance :after ((s translated-template) &key source)
+  "Run the codegen pipeline: drain a fresh TEMPLATE-BODY-STREAM over
+   SOURCE, walk for free variables, build the wrapped lambda sexp
+   with a body-splice marker, PRIN1 it, split the printed text on the
+   marker, and populate S's TEXT / POSITION-MAP / SOURCE-NAME slots
+   with the prefix + inner translation + suffix concatenated."
+  (let* ((inner (%drain-template-body-stream
+                 (make-instance 'template-body-stream :source source)))
          ;; Parse + walk for free variables. Must run while SOURCE is
          ;; still open — reader-error translation needs
          ;; SOURCE-LINE+COLUMN against the original .elp file.
@@ -721,24 +624,42 @@
               (slot-value s 'source-name)
               (source-name source))))))
 
-(defmethod sb-gray:stream-read-char ((s template-stream))
-  (when-let ((pb (pushback s)))
-    (setf (pushback s) nil)
-    (incf (chars-read s))
-    (return-from sb-gray:stream-read-char pb))
-  (let ((p (chars-read s))
-        (txt (text s)))
-    (cond
-      ((>= p (length txt)) :eof)
-      (t (incf (chars-read s))
-         (char txt p)))))
+;;;; ============================================================
+;;;; Reversible doc-offset ↔ source-byte mapping.
+;;;;
+;;;; Two paired generics. TRANSLATED-TEMPLATE specializes both;
+;;;; together they form a reversible mapping between coordinates in
+;;;; the translated text and bytes in the original source.
+;;;;
+;;;; T methods on both default to identity — translators that produce
+;;;; a byte-equivalent canvas (source and document offsets coincide)
+;;;; inherit identity behavior for free.
+;;;;
+;;;; Returns NIL when the input position has no corresponding location
+;;;; in the other coordinate system: synthesized chars (no source
+;;;; backing) for DOC-OFFSET->SOURCE-BYTE, and source bytes that don't
+;;;; appear in the document (e.g. inside a stripped <%# comment %>)
+;;;; for SOURCE-BYTE->DOC-OFFSET.
 
-(defmethod sb-gray:stream-unread-char ((s template-stream) char)
-  (setf (pushback s) char)
-  (decf (chars-read s))
-  nil)
+(defgeneric doc-offset->source-byte (s doc-offset)
+  (:documentation
+   "Map DOC-OFFSET (a character index into S's translated text) to the
+    corresponding source byte in the .elp file. Returns NIL when
+    DOC-OFFSET lies in synthesized (non-source-anchored) territory."))
 
-(defmethod doc-offset->source-byte ((s template-stream) doc-offset)
+(defgeneric source-byte->doc-offset (s source-byte)
+  (:documentation
+   "Map SOURCE-BYTE (an offset into the .elp file) to the
+    corresponding character index in S's translated text. Returns NIL
+    when SOURCE-BYTE has no representation in the document (e.g.
+    bytes inside a comment tag that was stripped)."))
+
+;; T-method identity defaults — byte-equivalent translators inherit
+;; these without writing any methods.
+(defmethod doc-offset->source-byte ((s t) doc-offset) doc-offset)
+(defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
+
+(defmethod doc-offset->source-byte ((s translated-template) doc-offset)
   ;; Position-map keys are already doc-relative (shifted during
   ;; construction). Direct lookup. NIL CDR marks synthesized regions.
   (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
@@ -746,25 +667,74 @@
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
-(defmethod source-byte->doc-offset ((s template-stream) source-byte)
+(defmethod source-byte->doc-offset ((s translated-template) source-byte)
   (when-let ((cp (find-if (lambda (c)
                             (and (integerp (cdr c)) (<= (cdr c) source-byte)))
                           (position-map s))))
     (destructuring-bind (cp-doc . cp-src) cp
       (+ cp-doc (- source-byte cp-src)))))
 
-(defun %drain-unbound-template-stream (inner)
-  "Read all characters from INNER (an UNBOUND-TEMPLATE-STREAM) and
-   store them in INNER's text slot. Position-map populates as a
-   side-effect of the read-char calls. Returns INNER so the caller
-   can chain. After this runs, INNER's slots (UTS-TEXT, UTS-POSITION-MAP,
-   UTS-SOURCE) form a self-contained record."
+(defun %drain-template-body-stream (inner)
+  "Read all characters from INNER (a TEMPLATE-BODY-STREAM) into its
+   TRANSLATED-TEXT slot. Position-map populates as a side-effect of
+   the read-char calls. Returns INNER so the caller can chain.
+   After this runs, INNER's (SOURCE, TRANSLATED-TEXT, POSITION-MAP)
+   slots form a self-contained record of the body translation."
   (let ((out (make-string-output-stream)))
     (loop for c = (sb-gray:stream-read-char inner)
           until (eq c :eof)
           do (write-char c out))
     (setf (translated-text inner) (get-output-stream-string out))
     inner))
+
+(declaim (ftype (function (template-body-stream) list) %template-free-vars))
+(defun %template-free-vars (inner)
+  "Discover the template's free variables from a drained
+   TEMPLATE-BODY-STREAM. Two internal steps: parse INNER's
+   captured text into a body sexp, then walk the sexp in a candidate
+   that mirrors the runtime wrapper's lexical scope (so wrapper-
+   introduced names ELP::PTR / SIZE / FD / SOURCE aren't classified as
+   free; *current-template-span* is a defvar so it's already
+   proclaimed special).
+
+   Reader errors during parsing are translated to ELP-TEMPLATE-ERROR
+   via INNER's position-map and source — must run while INNER's source
+   is still open, since the translator queries SOURCE-LINE+COLUMN."
+  (let* ((source (source inner))
+         (body-sexp
+          (with-input-from-string (in (translated-text inner))
+            (handler-case
+                (let ((forms '()))
+                  (loop for form = (read in nil :eof)
+                        until (eq form :eof)
+                        do (push form forms))
+                  `(progn ,@(nreverse forms)))
+              ((or reader-error end-of-file) (c)
+                ;; Walk INNER's position-map directly — same lookup
+                ;; DOC-OFFSET->SOURCE-BYTE does on the outer, but the
+                ;; inner stream is internal and doesn't get the public
+                ;; generic. Position-map keys are newest-first, so the
+                ;; first entry with key <= reader-pos is the chunk.
+                (let* ((reader-pos (file-position in))
+                       (cp (find-if (lambda (c) (<= (car c) reader-pos))
+                                    (position-map inner)))
+                       (file-byte
+                        (or (and cp (cdr cp)
+                                 (+ (cdr cp) (- reader-pos (car cp))))
+                            0)))
+                  (multiple-value-bind (line col)
+                      (source-line+column source file-byte)
+                    (error 'elp-template-error
+                           :file (source-name source) :line line :column col
+                           :original c))))))))
+    (form-free-vars
+     `(lambda (&optional (stream *standard-output*))
+        (let ((*standard-output* stream)
+              (elp::ptr nil) (elp::size nil) (elp::fd nil)
+              (elp::source nil))
+          (declare (ignorable elp::ptr elp::size elp::fd elp::source))
+          ,body-sexp
+          (values))))))
 
 (defun %split-text-on-marker (text marker)
   "TEXT is the PRIN1 of a wrapped lambda sexp; MARKER is the
@@ -781,27 +751,29 @@
     (values (subseq text 0 split)
             (subseq text (+ split (length marker-text))))))
 
-(declaim (ftype (function (t) template-stream) open-template-stream))
-(defun open-template-stream (source)
-  "Consume SOURCE and return a TEMPLATE-STREAM serving its compiled
-   lambda form as a character stream.
+(declaim (ftype (function (t) translated-template) translate-template))
+(defun translate-template (source)
+  "Consume SOURCE and return a TRANSLATED-TEMPLATE — the analysis
+   lambda's text plus a position-map.
 
-   The drained text is the same form COMPILE-TEMPLATE compiles —
-   COMPILE-TEMPLATE is literally `(compile nil (read (open-template-stream
-   source)))`. The stream is the canonical surface; the compiled
-   function is one CL `read` + `compile` away.
+   The text is the same form COMPILE-TEMPLATE compiles —
+   COMPILE-TEMPLATE is literally
+       (compile nil (read-from-string
+                     (translated-template-text (translate-template source))))
+   so the translated-template is the canonical surface; the compiled
+   function is one READ-FROM-STRING + COMPILE away.
 
    Body chars (from the user's <% %> and <%= %> blocks) carry
    DOC-OFFSET->SOURCE-BYTE anchors to source bytes; wrapper chars
    (synthesized lambda signature, per-source outer wrap,
    handler-bind, key-checks) return NIL.
 
-   Implementation: TEMPLATE-STREAM's INITIALIZE-INSTANCE :AFTER does
-   all the codegen work — draining the inner stream, walking for free
-   vars, building and splitting the wrapped lambda text. This
-   function just owns SOURCE's lifecycle: construct the stream, then
+   Implementation: TRANSLATED-TEMPLATE's INITIALIZE-INSTANCE :AFTER
+   does all the codegen work — draining the inner stream, walking
+   for free vars, building and splicing the wrapped lambda text. This
+   function just owns SOURCE's lifecycle: construct the object, then
    CLOSE-SOURCE."
   (unwind-protect
-       (make-instance 'template-stream :source source)
+       (make-instance 'translated-template :source source)
     (close-source source)))
 

@@ -26,9 +26,10 @@
    :filepath-source
    :source-name
    :close-source
-   ;; Stream interface — full lambda-form character stream with
-   ;; source-byte round-trip for the body bytes
-   :open-template-stream
+   ;; Translation interface — materialized lambda-form text plus a
+   ;; reversible doc-offset ↔ source-byte mapping for static analysis.
+   :translate-template
+   :translated-template
+   :translated-template-text
    :doc-offset->source-byte
-   :source-byte->doc-offset
-   :template-stream))
+   :source-byte->doc-offset))

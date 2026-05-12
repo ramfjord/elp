@@ -1,7 +1,7 @@
 ;;;; Source protocol + concrete backends (MMAP-SOURCE, STRING-SOURCE).
 ;;;;
 ;;;; A SOURCE is whatever the template engine scans / reads / writes
-;;;; bytes from. The TEMPLATE-STREAM state machine in elp.lisp drives
+;;;; bytes from. The TEMPLATE-BODY-STREAM state machine in elp.lisp drives
 ;;;; the protocol generically — same code, two backends.
 ;;;;
 ;;;; The protocol is six generics:
@@ -193,7 +193,7 @@
    rationale; FILEPATH-SOURCE handles the size=0 case.
 
    Caller (or downstream consumer) is responsible for CLOSE-SOURCE.
-   COMPILE-TEMPLATE, RENDER, and OPEN-TEMPLATE-STREAM all close the
+   COMPILE-TEMPLATE, RENDER, and TRANSLATE-TEMPLATE all close the
    source after consuming it, so most callers don't need to manage
    the lifecycle explicitly."
   (multiple-value-bind (ptr size fd) (%mmap-open pathname)
