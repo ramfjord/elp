@@ -61,7 +61,7 @@ A small protocol class lets both implement a shared interface
 Ordered. Each leaves the tree green (`make test` passes) and is a
 single reviewable diff.
 
-1. **Make `source-wrap-lambda-body` bind `elp::source` uniformly.**
+1. ✅ **Make `source-wrap-lambda-body` bind `elp::source` uniformly.**
    Today only mmap-source binds it; string-source's identity wrapper
    leaves the handler-bind's `elp::source` reference unbound, so a
    string-source template raising mid-render crashes the handler

@@ -326,6 +326,17 @@
   (format nil "(write-string ~S) "
           (subseq (string-source-text s) start end)))
 
-;; SOURCE-WRAP-LAMBDA-BODY: default no-op method applies — the emitted
-;; text forms are self-contained.
+(defmethod source-wrap-lambda-body ((s string-source) body)
+  ;; Text-emit forms are self-contained for string-source, but the
+  ;; handler-bind in the generated lambda dispatches SOURCE-LINE+COLUMN
+  ;; / SOURCE-NAME through ELP::SOURCE. Bind it to a fresh STRING-SOURCE
+  ;; carrying the original text + display name so error reporting works
+  ;; the same as the mmap path. The text is captured into the compiled
+  ;; lambda; no runtime acquisition step.
+  (let ((text (string-source-text s))
+        (name (string-source-name s)))
+    `(let ((elp::source
+            (make-instance 'elp::string-source :text ,text :name ,name)))
+       ,body)))
+
 ;; CLOSE-SOURCE: default no-op method applies.

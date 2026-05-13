@@ -204,6 +204,25 @@
     (is (= 2 (elp:elp-template-error-line err)))
     (is (= 4 (elp:elp-template-error-column err)))))
 
+(test error-position-runtime-string-source
+  "Runtime error in a string-source template — exercises the
+   handler-bind path without an mmap wrapper. The handler references
+   ELP::SOURCE for source-name / source-line+column; string-source
+   must bind it just like mmap-source does, or the handler itself
+   crashes on unbound-variable instead of producing the wrapped
+   condition."
+  (let* ((tmpl (elp:compile-template
+                (elp:string-source
+                 (format nil "first line~%<%= (/ 1 0) %>~%")
+                 :name "test-template")))
+         (err (handler-case
+                  (progn (with-output-to-string (s) (funcall tmpl s)) nil)
+                (elp:elp-template-error (c) c))))
+    (is (typep err 'elp:elp-template-error))
+    (is (equal "test-template" (elp:elp-template-error-file err)))
+    (is (= 2 (elp:elp-template-error-line err)))
+    (is (= 4 (elp:elp-template-error-column err)))))
+
 (test error-position-readtime
   "Read-time error (e.g. unbalanced paren in a <% %> block) wraps
    as elp-template-error with a location pointing inside the
