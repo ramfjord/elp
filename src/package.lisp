@@ -43,6 +43,7 @@
    :template-text
    :template-form
    :translate-closed
+   :splice-template
    :closed-template
    :closed-template-text
    :closed-template-open

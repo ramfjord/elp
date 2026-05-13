@@ -607,6 +607,34 @@
                  (with-output-to-string (s) (funcall fn-2 s :name "Bob")))))))
 
 ;;;; ============================================================
+;;;; SPLICE-TEMPLATE — compile-time splice of an open-template's body
+;;;; into the caller's lexical scope. The substitution happens at
+;;;; macro-expand time, so the body's free refs resolve against
+;;;; whatever lexicals exist at the call site — not against kwargs.
+
+(test splice-template-uses-caller-lexicals
+  "splice-template's expansion is part of the caller's lambda, so
+   its free refs resolve against the surrounding LET. No kwargs,
+   no closed-template wrapper."
+  (with-template-file (p "Hi <%= name %>!")
+    (let ((name "Ada"))
+      (declare (ignorable name))
+      (is (equal "Hi Ada!"
+                 (with-output-to-string (*standard-output*)
+                   (eval `(let ((name ,name))
+                            (declare (ignorable name))
+                            (elp:splice-template ,(namestring p))))))))))
+
+(test splice-template-resolves-per-iteration-bindings
+  "Splicing inside a loop body resolves free refs to each iteration's
+   FOR-clause bindings — the use case (loop-services-style)."
+  (with-template-file (p "(<%= service %>)")
+    (let ((out (with-output-to-string (*standard-output*)
+                 (eval `(loop for service in '("radarr" "sonarr" "prowlarr")
+                              do (elp:splice-template ,(namestring p)))))))
+      (is (equal "(radarr)(sonarr)(prowlarr)" out)))))
+
+;;;; ============================================================
 
 (defun run-tests ()
   "Run all ELP tests."

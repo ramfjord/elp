@@ -331,6 +331,27 @@ host project provides, instead of being shadowed by a synthesized
   (open-template-free-vars st))    ; → (NAME)
 ```
 
+**`(splice-template source-designator)` → splices an open-template inline**
+
+A macro that reads an open-template at macro-expand time and returns
+its body sexp. The substitution happens before the surrounding code
+is compiled, so the body's free references resolve against whatever
+lexicals exist at the call site — no kwargs, no closure shape, no
+runtime indirection.
+
+```lisp
+(loop for service in services
+      for name = (getf service :name)
+      for port = (getf service :port)
+      do (elp:splice-template #p"sub-template.elp"))
+```
+
+`source-designator` is evaluated at macro-expand time and must yield
+a pathname, a path string, or a `source` object. Common pattern for
+embedding sub-templates inside a host context that already binds the
+right symbols; closed-template is still the right tool when the
+bindings come from runtime data.
+
 ### Errors
 
 **`elp-template-error`**

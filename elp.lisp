@@ -868,3 +868,31 @@
    handler-bind, key-checks) return NIL."
   (make-instance 'closed-template :source source))
 
+;;;; ============================================================
+;;;; Compile-time splicing of open-templates into the caller's scope.
+
+(defmacro splice-template (source-designator)
+  "Read an OPEN-TEMPLATE at macro-expand time and return its body sexp
+   so the caller's lexical scope binds the template's free variables.
+   SOURCE-DESIGNATOR is evaluated at macro-expand time and must yield
+   a SOURCE, a pathname, or a path string.
+
+   This is the mechanism for embedding a sub-template inside a context
+   that already binds the right symbols — e.g., inside a LOOP whose
+   FOR clauses bind the names the sub-template references. Because
+   the macro substitutes the body sexp *before* the surrounding code
+   is compiled, those references resolve to the caller's lexicals the
+   same way they would if you'd typed the body inline.
+
+   Because the source is read at macro-expand time, SOURCE-DESIGNATOR
+   must be resolvable then — typically a literal pathname or string.
+   The file's contents are baked into the resulting code; at runtime
+   the compiled form re-opens the file to read literal bytes
+   (mmap-source) or has them inlined as strings (string-source)."
+  (let* ((designator (eval source-designator))
+         (source (etypecase designator
+                   (source designator)
+                   (pathname (filepath-source designator))
+                   (string (filepath-source (pathname designator))))))
+    (template-form (translate-open source))))
+
