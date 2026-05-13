@@ -8,8 +8,8 @@
 ;;;; Package definition is in src/package.lisp; SOURCE protocol +
 ;;;; backends (MMAP-SOURCE / STRING-SOURCE) are in src/source.lisp.
 ;;;; This file holds the template engine itself: free-vars walker,
-;;;; render API, gray-stream parser, codegen, and public stream entry
-;;;; points.
+;;;; render API, tokenizer + translator (TOKEN → TRANSLATION), and
+;;;; the OPEN-TEMPLATE / CLOSED-TEMPLATE public surface.
 
 (in-package :elp)
 
