@@ -25,7 +25,9 @@
    :string-source
    :filepath-source
    :source-name
+   :open-source
    :close-source
+   :with-open-source
    ;; Translation interface — materialized lambda-form text plus a
    ;; reversible doc-offset ↔ source-byte mapping for static analysis.
    ;; Two layers:

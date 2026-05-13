@@ -159,6 +159,16 @@
     in the compiled lambda.")
   (:method ((s t) body) body))
 
+(defgeneric open-source (source)
+  (:documentation
+   "Acquire whatever OS resources the source needs to satisfy the
+    byte-access protocol (SOURCE-BYTE / SOURCE-SUBSTRING / etc.).
+    Idempotent in spirit but not required to be — callers should
+    open exactly once per matching CLOSE-SOURCE. Returns SOURCE for
+    chaining. STRING-SOURCE uses the default no-op method;
+    MMAP-SOURCE opens + mmaps the underlying file.")
+  (:method ((s t)) s))
+
 (defgeneric close-source (source)
   (:documentation
    "Release any OS resources the source holds. Idempotent — calling
@@ -166,20 +176,31 @@
     no-op method; MMAP-SOURCE unmaps and closes the underlying fd.")
   (:method ((s t)) (declare (ignore s)) nil))
 
+(defmacro with-open-source ((var source-form) &body body)
+  "Bind VAR to SOURCE-FORM, OPEN-SOURCE it, run BODY with the source
+   open, and CLOSE-SOURCE on any exit (normal or non-local). The
+   standard CL `with-open-file` shape for the SOURCE protocol."
+  `(let ((,var ,source-form))
+     (open-source ,var)
+     (unwind-protect (progn ,@body)
+       (close-source ,var))))
+
 ;;;; ============================================================
 ;;;; mmap-source — foreign-memory backed, the fast path for file
 ;;;; rendering. Render codegen does zero-copy WRITE(2) on the mapped
 ;;;; region via WRITE-OUTPUT-RANGE.
 
 (defclass mmap-source (source)
-  ((ptr      :initarg :ptr      :accessor mmap-source-ptr)
-   (size     :initarg :size     :accessor mmap-source-size)
-   (fd       :initarg :fd       :accessor mmap-source-fd)
-   (pathname :initarg :pathname :reader   mmap-source-pathname))
+  ((ptr      :initform nil :accessor mmap-source-ptr)
+   (size     :initform nil :accessor mmap-source-size)
+   (fd       :initform nil :accessor mmap-source-fd)
+   (pathname :initarg :pathname :reader mmap-source-pathname))
   (:documentation
    "Source backed by a memory-mapped file. Construct via (MMAP-SOURCE
-    pathname); release via (CLOSE-SOURCE source). CLOSE-SOURCE is
-    idempotent — sets the mmap slots to NIL after unmapping.
+    pathname) — construction is pure (no IO). Resource acquisition
+    happens on OPEN-SOURCE; release on CLOSE-SOURCE. Both are
+    idempotent. The common path bundles open+close around use via
+    WITH-OPEN-SOURCE; ELP's template constructors do so internally.
 
     PATHNAME must point to a regular file of size > 0; %mmap-open(2)
     rejects size=0 with EINVAL. Use FILEPATH-SOURCE for the
@@ -188,17 +209,19 @@
 
 (declaim (ftype (function (pathname) mmap-source) mmap-source))
 (defun mmap-source (pathname)
-  "Open PATHNAME read-only, mmap it, and return a fresh MMAP-SOURCE.
-   PATHNAME must have size > 0 — see the class docstring for the
-   rationale; FILEPATH-SOURCE handles the size=0 case.
+  "Build an MMAP-SOURCE descriptor for PATHNAME. Pure construction —
+   no IO, no fd acquired. Call OPEN-SOURCE (or WITH-OPEN-SOURCE) to
+   actually mmap the file. PATHNAME must point to a file of size > 0
+   when OPEN-SOURCE runs; FILEPATH-SOURCE handles the size=0 case."
+  (make-instance 'mmap-source :pathname pathname))
 
-   Caller (or downstream consumer) is responsible for CLOSE-SOURCE.
-   COMPILE-TEMPLATE, RENDER, and TRANSLATE-TEMPLATE all close the
-   source after consuming it, so most callers don't need to manage
-   the lifecycle explicitly."
-  (multiple-value-bind (ptr size fd) (%mmap-open pathname)
-    (make-instance 'mmap-source
-                   :ptr ptr :size size :fd fd :pathname pathname)))
+(defmethod open-source ((s mmap-source))
+  "Open + mmap the underlying file. Sets PTR/SIZE/FD slots."
+  (multiple-value-bind (ptr size fd) (%mmap-open (mmap-source-pathname s))
+    (setf (mmap-source-ptr s) ptr
+          (mmap-source-size s) size
+          (mmap-source-fd s)   fd))
+  s)
 
 (declaim (ftype (function (pathname) source) filepath-source))
 (defun filepath-source (pathname)
@@ -262,19 +285,21 @@
   (format nil "(elp::write-mmap-range elp::ptr ~D ~D) " start end))
 
 (defmethod source-wrap-lambda-body ((s mmap-source) body)
-  ;; Bind PTR/SIZE/FD lexicals the body's WRITE-OUTPUT-RANGE calls
-  ;; reference. Also bind a fresh runtime MMAP-SOURCE at SOURCE so the
-  ;; handler-bind in BUILD-TEMPLATE-LAMBDA can dispatch
-  ;; SOURCE-LINE+COLUMN / SOURCE-NAME generically.
+  ;; Build a fresh runtime MMAP-SOURCE bound to ELP::SOURCE (so the
+  ;; handler-bind can dispatch SOURCE-LINE+COLUMN / SOURCE-NAME
+  ;; generically), open it via the OPEN-SOURCE protocol, and expose
+  ;; PTR/SIZE/FD as lexicals the body's WRITE-MMAP-RANGE calls
+  ;; reference. CLOSE-SOURCE on unwind.
   (let ((pathname (mmap-source-pathname s)))
-    `(multiple-value-bind (elp::ptr elp::size elp::fd)
-         (elp::%mmap-open ,pathname)
-       (let ((elp::source
-              (make-instance 'elp::mmap-source
-                             :ptr elp::ptr :size elp::size :fd elp::fd
-                             :pathname ,pathname)))
-         (unwind-protect ,body
-           (elp::%mmap-close elp::ptr elp::size elp::fd))))))
+    `(let ((elp::source (elp::mmap-source ,pathname)))
+       (elp::open-source elp::source)
+       (unwind-protect
+           (let ((elp::ptr  (elp::mmap-source-ptr  elp::source))
+                 (elp::size (elp::mmap-source-size elp::source))
+                 (elp::fd   (elp::mmap-source-fd   elp::source)))
+             (declare (ignorable elp::size elp::fd))
+             ,body)
+         (elp::close-source elp::source)))))
 
 ;;;; ============================================================
 ;;;; string-source — Lisp-string backed. No runtime acquisition cost.

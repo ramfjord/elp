@@ -87,15 +87,18 @@
 ;;;;      function), or TRANSLATE-TEMPLATE (analysis lambda stream
 ;;;;      for static walkers / LSPs).
 ;;;;
-;;;; All three consume the source — they call CLOSE-SOURCE after the
-;;;; drain step. The compiled lambda RENDER / COMPILE-TEMPLATE produces
-;;;; is self-contained; whatever the source's SOURCE-WRAP-LAMBDA-BODY
-;;;; emits handles its own runtime acquisition + release, so the
-;;;; original source object can be closed.
+;;;; All three drive the source's OPEN-SOURCE / CLOSE-SOURCE pair
+;;;; internally — callers pass a constructed source descriptor and
+;;;; don't manage its lifecycle. SOURCE is left in the same un-opened
+;;;; state it came in (close-source restores ptr/size/fd to nil for
+;;;; mmap-source) and may be reused across multiple calls.
+;;;;
+;;;; The compiled lambda RENDER / COMPILE-TEMPLATE produces is
+;;;; self-contained; whatever the source's SOURCE-WRAP-LAMBDA-BODY
+;;;; emits acquires + releases its own resources at render time.
 ;;;;
 ;;;; Compile-once / render-many: COMPILE-TEMPLATE returns a function,
-;;;; reusable across calls with different kwargs. The source closes
-;;;; after compilation; the returned function is independent of it.
+;;;; reusable across calls with different kwargs.
 
 (declaim (ftype (function (t) function) compile-template))
 (defun compile-template (source)
@@ -108,9 +111,10 @@
    arguments are silently ignored.
 
    Reads the lambda form from TRANSLATE-TEMPLATE's materialized text.
-   SOURCE is consumed (CLOSE-SOURCE'd) by that call. The compiled
-   lambda is self-contained — runtime acquisition (if any) lives in
-   the source's SOURCE-WRAP-LAMBDA-BODY."
+   The translator opens SOURCE, drains it, and closes it; SOURCE may
+   be reused for further calls. The compiled lambda is self-contained
+   — runtime acquisition (if any) lives in the source's
+   SOURCE-WRAP-LAMBDA-BODY."
   (compile nil (read-from-string
                 (closed-template-text (translate-template source)))))
 
@@ -125,9 +129,10 @@
    SB-SYS:FD-STREAM destination) are dispatched through the source
    protocol; callers don't pick a path explicitly.
 
-   SOURCE is consumed (CLOSE-SOURCE'd) as part of compilation. For
-   compile-once / render-many, call COMPILE-TEMPLATE directly and
-   FUNCALL the returned function each time."
+   SOURCE is opened and closed by COMPILE-TEMPLATE; the descriptor
+   is reusable afterward. For compile-once / render-many, call
+   COMPILE-TEMPLATE directly and FUNCALL the returned function each
+   time."
   (apply (compile-template source) stream kwargs))
 
 ;;;; Internal Helper Functions
@@ -575,15 +580,28 @@
   (:documentation
    "Translated template body: the inner translated chars wrapped in
     the source-specific lexical context (ELP::SOURCE etc.) and
-    error-translating handler-bind. Construct via TRANSLATE-OPEN
-    (manages source lifecycle) or `(make-instance 'open-template
-    :source source)` directly (caller closes the source)."))
+    error-translating handler-bind. Construct via `(make-instance
+    'open-template :source source)` — the constructor opens SOURCE,
+    drains it, and closes it. SOURCE is left in the same un-opened
+    state it came in and may be reused for further construction.
+    TRANSLATE-OPEN is a one-liner alias."))
 
 (defmethod initialize-instance :after ((s open-template) &key source)
-  "Drain a fresh TEMPLATE-BODY-STREAM over SOURCE, walk for free
-   variables, build the source-wrap + handler-bind sexp around a
-   body-splice marker, PRIN1 it, splice the inner translated chars
-   in, and populate S's slots."
+  "Open SOURCE, drain a fresh TEMPLATE-BODY-STREAM over it, walk for
+   free variables, build the source-wrap + handler-bind sexp around
+   a body-splice marker, PRIN1 it, splice the inner translated chars
+   in, and populate S's slots. SOURCE is closed on any exit (normal
+   or non-local) — this is the layer that owns the source's
+   open/close lifecycle; CLOSED-TEMPLATE's constructor delegates
+   here and inherits the guarantee."
+  (open-source source)
+  (unwind-protect
+       (%populate-open-template s source)
+    (close-source source)))
+
+(defun %populate-open-template (s source)
+  "Slot-filling helper for OPEN-TEMPLATE's INITIALIZE-INSTANCE :AFTER.
+   Pulled out as a defun so the unwind-protect form stays readable."
   (let* ((inner (%drain-template-body-stream
                  (make-instance 'template-body-stream :source source)))
          ;; Parse + walk for free variables. Must run while SOURCE is
@@ -634,12 +652,12 @@
 
 (declaim (ftype (function (t) open-template) translate-open))
 (defun translate-open (source)
-  "Consume SOURCE and return a OPEN-TEMPLATE. Mirrors
-   TRANSLATE-TEMPLATE's source-lifecycle ownership: closes SOURCE on
-   return."
-  (unwind-protect
-       (make-instance 'open-template :source source)
-    (close-source source)))
+  "Build an OPEN-TEMPLATE from SOURCE. One-liner alias for
+   `(make-instance 'open-template :source source)`. The constructor
+   opens SOURCE, drains it, and closes it — SOURCE is left in the
+   same un-opened state it came in, and may be reused for further
+   template construction."
+  (make-instance 'open-template :source source))
 
 (defclass closed-template (template)
   ;; CLOSED-TEMPLATE composition: holds a OPEN-TEMPLATE and adds the
@@ -848,27 +866,21 @@
 
 (declaim (ftype (function (t) closed-template) translate-template))
 (defun translate-template (source)
-  "Consume SOURCE and return a CLOSED-TEMPLATE — the analysis
-   lambda's text plus a position-map.
+  "Build a CLOSED-TEMPLATE from SOURCE — the analysis lambda's text
+   plus a position-map. One-liner alias for `(make-instance
+   'closed-template :source source)`; the inner OPEN-TEMPLATE
+   constructor opens SOURCE, drains it, and closes it. SOURCE is
+   reusable across multiple TRANSLATE-TEMPLATE calls.
 
-   The text is the same form COMPILE-TEMPLATE compiles —
    COMPILE-TEMPLATE is literally
        (compile nil (read-from-string
                      (closed-template-text (translate-template source))))
-   so the closed-template is the canonical surface; the compiled
+   — the closed-template is the canonical surface; the compiled
    function is one READ-FROM-STRING + COMPILE away.
 
    Body chars (from the user's <% %> and <%= %> blocks) carry
    DOC-OFFSET->SOURCE-BYTE anchors to source bytes; wrapper chars
    (synthesized lambda signature, per-source outer wrap,
-   handler-bind, key-checks) return NIL.
-
-   Implementation: CLOSED-TEMPLATE's INITIALIZE-INSTANCE :AFTER
-   does all the codegen work — draining the inner stream, walking
-   for free vars, building and splicing the wrapped lambda text. This
-   function just owns SOURCE's lifecycle: construct the object, then
-   CLOSE-SOURCE."
-  (unwind-protect
-       (make-instance 'closed-template :source source)
-    (close-source source)))
+   handler-bind, key-checks) return NIL."
+  (make-instance 'closed-template :source source))
 

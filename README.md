@@ -162,10 +162,14 @@ short-circuits to a `string-source` of `""` for empty files (which
 `mmap(2)` rejects with `EINVAL`). `mmap-source` is the bare backend
 constructor — useful when you already know the file is non-empty.
 
-A source is consumed by whichever entry point takes it (closed
-automatically). For long-lived use (compile-once render-many),
-`compile-template` returns a reusable function; the source itself is
-released as part of compilation.
+A source is **constructed pure** — `(mmap-source path)` just builds
+a descriptor, no IO. Resource acquisition happens via the
+`open-source` / `close-source` pair, idiomatically through the
+`with-open-source` macro. The template constructors do this
+internally, so callers usually just hand a source to
+`compile-template` / `render` / `translate-template` and ignore the
+mechanics. The descriptor survives the call and can be reused for
+further template construction; nothing is "consumed."
 
 ## Context Variables
 
@@ -205,8 +209,8 @@ ranges write via a single `write(2)` syscall directly on the
 mmap'd region — zero copy through Lisp.
 
 - `source`: an `mmap-source` or `string-source` (typically built via
-  `filepath-source` or `string-source`). Consumed
-  (`close-source`'d) as part of compilation.
+  `filepath-source` or `string-source`). Opened and closed by the
+  call; the descriptor is reusable afterward.
 - `stream`: Destination stream.
 - `kwargs`: `&rest` plist passed through to the compiled template's
   `&key` parameters.

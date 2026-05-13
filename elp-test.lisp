@@ -561,6 +561,52 @@
               st (elp:doc-offset->source-byte st doc-pos)))))))
 
 ;;;; ============================================================
+;;;; Source open/close protocol — pure construction, explicit
+;;;; acquire/release. Sources are reusable: build the descriptor
+;;;; once, then OPEN-SOURCE / CLOSE-SOURCE around each use.
+
+(test mmap-source-construction-is-pure
+  "(MMAP-SOURCE path) builds a descriptor without opening — ptr/size/fd
+   stay nil until OPEN-SOURCE runs."
+  (with-template-file (p "hello")
+    (let ((s (elp:mmap-source p)))
+      (is (null (elp::mmap-source-ptr s)))
+      (is (null (elp::mmap-source-size s)))
+      (is (null (elp::mmap-source-fd s)))
+      (elp:close-source s)
+      (is (null (elp::mmap-source-ptr s))
+          "close-source on an unopened source is a no-op"))))
+
+(test with-open-source-acquires-and-releases
+  "WITH-OPEN-SOURCE opens on entry, closes on exit. Inside the body
+   the source is usable; afterward it's closed."
+  (with-template-file (p "hello world")
+    (let ((s (elp:mmap-source p)))
+      (elp:with-open-source (src s)
+        (is (not (null (elp::mmap-source-ptr src))))
+        (is (= 11 (elp::source-length src))))
+      (is (null (elp::mmap-source-ptr s))
+          "close-source ran on body exit"))))
+
+(test source-is-reusable
+  "After a template constructor closes a source, the descriptor is
+   still valid for further construction. Build the same template
+   twice from one source and render each — both produce the expected
+   output."
+  (with-template-file (p "Hi <%= name %>")
+    (let* ((src (elp:filepath-source p))
+           (fn-1 (compile nil (read-from-string
+                               (elp:template-text
+                                (elp:translate-template src)))))
+           (fn-2 (compile nil (read-from-string
+                               (elp:template-text
+                                (elp:translate-template src))))))
+      (is (equal "Hi Alice"
+                 (with-output-to-string (s) (funcall fn-1 s :name "Alice"))))
+      (is (equal "Hi Bob"
+                 (with-output-to-string (s) (funcall fn-2 s :name "Bob")))))))
+
+;;;; ============================================================
 
 (defun run-tests ()
   "Run all ELP tests."
