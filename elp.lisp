@@ -185,7 +185,9 @@
    :comment}; START and END are inclusive/exclusive byte offsets of
    the unit's payload (the literal text run, or the tag body excluding
    delimiters). Produced by NEXT-TOKEN; consumed by TRANSLATE-TOKEN."
-  kind start end)
+  (kind  nil :type (member :text :code :expr :comment))
+  (start 0   :type unsigned-byte)
+  (end   0   :type unsigned-byte))
 
 (defstruct (anchor (:constructor anchor (offset source-byte)))
   "Checkpoint inside a translation's TEXT. At character OFFSET into
@@ -193,14 +195,16 @@
    source — or no source byte (SOURCE-BYTE = NIL) for synthesized
    regions (text-emit wrappers, expr-prefix FORMAT call, trailing
    delimiter spaces)."
-  offset source-byte)
+  (offset      0 :type unsigned-byte)
+  (source-byte 0 :type (or unsigned-byte null)))
 
 (defstruct (translation (:constructor translation (text anchors)))
   "What one TOKEN emits: TEXT is the Lisp source characters, ANCHORS
    is a list of ANCHOR ordered by OFFSET. ANCHORS always starts at
    offset 0 so the translation's source-anchored state at its first
    character is explicit."
-  text anchors)
+  (text    "" :type string)
+  (anchors () :type list))
 
 (defclass template-body-translator ()
   ((source          :initarg :source     :reader   source
@@ -338,6 +342,8 @@
        (1- close))
       (t close))))
 
+(declaim (ftype (function (template-body-translator anchor unsigned-byte) t)
+                push-anchor))
 (defun push-anchor (s a base)
   "Push ANCHOR A onto S's POSITION-MAP at key=(BASE + ANCHOR-OFFSET),
    skipped if it would duplicate the most recent entry. Position-map
@@ -348,6 +354,7 @@
     (unless (equal top entry)
       (push entry (position-map s)))))
 
+(declaim (ftype (function (template-body-translator) token) parse-tag-token))
 (defun parse-tag-token (s)
   "Cursor sits just past the open delimiter (`<%` or `<%-`). Classify
    the tag by the byte at cursor (`=` expr / `#` comment / anything
@@ -368,6 +375,8 @@
       (setf (inside-code s) nil)
       (token kind body-start body-end))))
 
+(declaim (ftype (function (template-body-translator) (or token (eql :eof)))
+                next-token))
 (defun next-token (s)
   "Parse the next syntactic unit at (CURSOR S) and return its TOKEN,
    or :EOF when CURSOR has reached source length. Dispatches on
@@ -396,6 +405,7 @@
               (when (> text-end text-start)
                 (return (token :text text-start text-end)))))))))))
 
+(declaim (ftype (function (source token) (or translation null)) translate-token))
 (defun translate-token (source tok)
   "Translate one TOKEN to its TRANSLATION, or NIL if it emits nothing.
    :TEXT tokens become a SOURCE-EMIT-TEXT-FORM call (synthesized text,
