@@ -112,7 +112,7 @@
    lambda is self-contained — runtime acquisition (if any) lives in
    the source's SOURCE-WRAP-LAMBDA-BODY."
   (compile nil (read-from-string
-                (translated-template-text (translate-template source)))))
+                (lambda-template-text (translate-template source)))))
 
 (declaim (ftype (function (t stream &rest t) t) render))
 (defun render (source stream &rest kwargs)
@@ -228,7 +228,7 @@
     has consumed READER-POS chars, the next character will correspond
     to SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
     regions with no source backing. The map is consumed by
-    TRANSLATED-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
+    LAMBDA-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
     the keys by the prefix length and stores the result for
     DOC-OFFSET->SOURCE-BYTE / SOURCE-BYTE->DOC-OFFSET lookup."))
 
@@ -342,7 +342,7 @@
    ANCHOR is either an integer source-byte (for chars that originated
    in the .elp file) or NIL (for synthesized chars — text-emit
    wrappers, the expr-prefix FORMAT call, the lambda signature, etc).
-   NIL-anchored checkpoints survive into the outer TRANSLATED-TEMPLATE
+   NIL-anchored checkpoints survive into the outer LAMBDA-TEMPLATE
    so DOC-OFFSET->SOURCE-BYTE can return NIL for those regions."
   (let ((top (car (position-map s))))
     (unless (equal top (cons key anchor))
@@ -477,7 +477,7 @@
 ;;;; ============================================================
 ;;;; Public translation interface — full lambda form with position map.
 ;;;;
-;;;; TRANSLATE-TEMPLATE returns a TRANSLATED-TEMPLATE: a materialized
+;;;; TRANSLATE-TEMPLATE returns a LAMBDA-TEMPLATE: a materialized
 ;;;; analysis lambda form for the template — same body shape the
 ;;;; render path produces, wrapped so a static walker / LSP sees every
 ;;;; symbol as a real lexical or function reference. Bytes produced
@@ -486,7 +486,7 @@
 ;;;; bytes (NIL for synthesized prefix/suffix/text-emit chars).
 ;;;;
 ;;;; The text + position-map travel together — a Lisp-LSP can paste
-;;;; TRANSLATED-TEMPLATE-TEXT into a document buffer and use the
+;;;; LAMBDA-TEMPLATE-TEXT into a document buffer and use the
 ;;;; position-map for cursor translation, without knowing anything
 ;;;; about ELP's internals.
 ;;;;
@@ -611,18 +611,18 @@
        (make-instance 'sexp-template :source source)
     (close-source source)))
 
-(defclass translated-template ()
+(defclass lambda-template ()
   ;; LAMBDA-TEMPLATE composition: holds a SEXP-TEMPLATE and adds the
   ;; callable (LAMBDA (STREAM &KEY …)) wrapper plus supplied-p
   ;; discipline. SEXP-TEMPLATE owns the source-wrap and the
   ;; body-error handler-bind; this layer owns the kwargs interface
   ;; and the missing-kwarg → ELP-TEMPLATE-ERROR translation.
   ((sexp-template
-    :reader translated-template-sexp
+    :reader lambda-template-sexp
     :documentation "Inner SEXP-TEMPLATE — the bare emitter form this
                     callable wraps.")
    (text
-    :reader translated-template-text
+    :reader lambda-template-text
     :documentation "Full lambda text. Pass through READ-FROM-STRING
                     to get the lambda sexp.")
    (position-map
@@ -636,9 +636,9 @@
    "Materialized analysis lambda for an ELP template, built by
     wrapping a SEXP-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
     signature. Construct via TRANSLATE-TEMPLATE or `(make-instance
-    'translated-template :source source)`."))
+    'lambda-template :source source)`."))
 
-(defmethod initialize-instance :after ((s translated-template) &key source)
+(defmethod initialize-instance :after ((s lambda-template) &key source)
   "Build the inner SEXP-TEMPLATE, then wrap with the kwarg signature,
    *standard-output* let, and unbound-variable handler-bind that
    covers the supplied-p checks. Splice the sexp-template's text in
@@ -698,7 +698,7 @@
 ;;;; ============================================================
 ;;;; Reversible doc-offset ↔ source-byte mapping.
 ;;;;
-;;;; Two paired generics. TRANSLATED-TEMPLATE specializes both;
+;;;; Two paired generics. LAMBDA-TEMPLATE specializes both;
 ;;;; together they form a reversible mapping between coordinates in
 ;;;; the translated text and bytes in the original source.
 ;;;;
@@ -730,7 +730,7 @@
 (defmethod doc-offset->source-byte ((s t) doc-offset) doc-offset)
 (defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
 
-(defmethod doc-offset->source-byte ((s translated-template) doc-offset)
+(defmethod doc-offset->source-byte ((s lambda-template) doc-offset)
   ;; Position-map keys are already doc-relative (shifted during
   ;; construction). Direct lookup. NIL CDR marks synthesized regions.
   (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
@@ -739,14 +739,14 @@
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
 (defmethod doc-offset->source-byte ((s sexp-template) doc-offset)
-  ;; Same lookup shape as TRANSLATED-TEMPLATE's method — these collapse
+  ;; Same lookup shape as LAMBDA-TEMPLATE's method — these collapse
   ;; into one method on the shared protocol class in a later commit.
   (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
                           (position-map s))))
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
-(defmethod source-byte->doc-offset ((s translated-template) source-byte)
+(defmethod source-byte->doc-offset ((s lambda-template) source-byte)
   (when-let ((cp (find-if (lambda (c)
                             (and (integerp (cdr c)) (<= (cdr c) source-byte)))
                           (position-map s))))
@@ -837,16 +837,16 @@
     (values (subseq text 0 split)
             (subseq text (+ split (length marker-text))))))
 
-(declaim (ftype (function (t) translated-template) translate-template))
+(declaim (ftype (function (t) lambda-template) translate-template))
 (defun translate-template (source)
-  "Consume SOURCE and return a TRANSLATED-TEMPLATE — the analysis
+  "Consume SOURCE and return a LAMBDA-TEMPLATE — the analysis
    lambda's text plus a position-map.
 
    The text is the same form COMPILE-TEMPLATE compiles —
    COMPILE-TEMPLATE is literally
        (compile nil (read-from-string
-                     (translated-template-text (translate-template source))))
-   so the translated-template is the canonical surface; the compiled
+                     (lambda-template-text (translate-template source))))
+   so the lambda-template is the canonical surface; the compiled
    function is one READ-FROM-STRING + COMPILE away.
 
    Body chars (from the user's <% %> and <%= %> blocks) carry
@@ -854,12 +854,20 @@
    (synthesized lambda signature, per-source outer wrap,
    handler-bind, key-checks) return NIL.
 
-   Implementation: TRANSLATED-TEMPLATE's INITIALIZE-INSTANCE :AFTER
+   Implementation: LAMBDA-TEMPLATE's INITIALIZE-INSTANCE :AFTER
    does all the codegen work — draining the inner stream, walking
    for free vars, building and splicing the wrapped lambda text. This
    function just owns SOURCE's lifecycle: construct the object, then
    CLOSE-SOURCE."
   (unwind-protect
-       (make-instance 'translated-template :source source)
+       (make-instance 'lambda-template :source source)
     (close-source source)))
+
+;;;; Deprecated aliases — TRANSLATED-TEMPLATE was the original class
+;;;; name before the SEXP-TEMPLATE / LAMBDA-TEMPLATE split. Kept for
+;;;; one cycle so external callers don't break on rename; remove once
+;;;; downstream consumers (mediaserver render path, swank-elp) migrate.
+(setf (find-class 'translated-template) (find-class 'lambda-template))
+(setf (fdefinition 'translated-template-text) #'lambda-template-text)
+(setf (fdefinition 'translated-template-sexp) #'lambda-template-sexp)
 

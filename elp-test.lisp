@@ -316,7 +316,7 @@
 ;;;;
 ;;;; Analysis lambda materialization. Driven by either MMAP-SOURCE or
 ;;;; STRING-SOURCE; the protocol abstracts the difference. Two facets
-;;;; we care about: (1) the TRANSLATED-TEMPLATE-TEXT reads as one
+;;;; we care about: (1) the LAMBDA-TEMPLATE-TEXT reads as one
 ;;;; well-formed (lambda ...) form whose &key list covers exactly the
 ;;;; free variables in the template, with body chars that appear in
 ;;;; the same render-shape COMPILE-TEMPLATE produces
@@ -327,7 +327,7 @@
 
 (defun template-form (tt)
   "Read one Lisp form from TT's translated text."
-  (read-from-string (elp:translated-template-text tt)))
+  (read-from-string (elp:lambda-template-text tt)))
 
 (defun find-lambda-key-list (form)
   "Given a (lambda (stream &key …) …) form, return the &key params'
@@ -407,7 +407,7 @@
                              (read-sequence buf f)
                              buf)))
            (tt (elp:translate-template (elp:filepath-source p)))
-           (text (elp:translated-template-text tt))
+           (text (elp:lambda-template-text tt))
            (anchored-count 0))
       (loop for pos below (length text)
             for src = (elp:doc-offset->source-byte tt pos)
@@ -426,7 +426,7 @@
    DOC-OFFSET->SOURCE-BYTE — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
     (let* ((tt (elp:translate-template (elp:filepath-source p)))
-           (text (elp:translated-template-text tt))
+           (text (elp:lambda-template-text tt))
            (results (loop for pos below (length text)
                           collect (cons pos (elp:doc-offset->source-byte tt pos)))))
       ;; The first two chars are `(l` opening the lambda — no source.
@@ -463,7 +463,7 @@
   "T methods default to identity — translators that produce a
    byte-equivalent canvas (and consumers that haven't registered a
    real mapping) get a no-op pair for free."
-  ;; A stand-in object — any value other than a translated-template uses
+  ;; A stand-in object — any value other than a lambda-template uses
   ;; the T-method identity defaults.
   (is (= 42 (elp:doc-offset->source-byte :stub 42)))
   (is (= 17 (elp:source-byte->doc-offset :stub 17))))
@@ -485,7 +485,7 @@
 
 ;;;; ============================================================
 ;;;; sexp-template — the bare emitter form, sits one layer below
-;;;; translated-template. Owns: source-wrap + handler-bind + inner
+;;;; lambda-template. Owns: source-wrap + handler-bind + inner
 ;;;; translated chars; free-vars discovered during construction.
 ;;;; Does NOT have a callable signature — its TEXT, when READ and
 ;;;; evaluated, emits to current *standard-output* with free vars
@@ -528,18 +528,33 @@
       (is (integerp src))
       (is (= anchored-doc round-trip)))))
 
-(test translated-template-wraps-sexp-template
-  "translated-template composes a sexp-template. Same source → both
+(test lambda-template-wraps-sexp-template
+  "lambda-template composes a sexp-template. Same source → both
    layers see the same free-vars and the inner sexp-template-text is
-   embedded in translated-template-text."
+   embedded in lambda-template-text."
   (let* ((src-text "Hi <%= name %>!")
          (tt (elp:translate-template (elp:string-source src-text)))
-         (inner (elp:translated-template-sexp tt)))
+         (inner (elp:lambda-template-sexp tt)))
     (is (typep inner 'elp:sexp-template))
     (is (equal (elp:sexp-template-free-vars inner) '(name)))
     (is (search (elp:sexp-template-text inner)
-                (elp:translated-template-text tt))
-        "translated-template-text must contain sexp-template-text verbatim")))
+                (elp:lambda-template-text tt))
+        "lambda-template-text must contain sexp-template-text verbatim")))
+
+(test translated-template-alias-still-works
+  "TRANSLATED-TEMPLATE survives as an alias for LAMBDA-TEMPLATE for
+   one cycle so downstream consumers (mediaserver render, swank-elp)
+   can migrate without breaking. Same class identity, same accessor
+   functions."
+  (let ((tt (elp:translate-template (elp:string-source "hi <%= who %>"))))
+    (is (typep tt 'elp:translated-template))
+    (is (typep tt 'elp:lambda-template))
+    (is (eq (find-class 'elp:translated-template)
+            (find-class 'elp:lambda-template)))
+    (is (equal (elp:translated-template-text tt)
+               (elp:lambda-template-text tt)))
+    (is (eq (elp:translated-template-sexp tt)
+            (elp:lambda-template-sexp tt)))))
 
 ;;;; ============================================================
 

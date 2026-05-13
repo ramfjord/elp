@@ -103,7 +103,7 @@ single reviewable diff.
      translated-template body** — both will collapse onto a protocol
      class in commit 4.
 
-3. **Rename `translated-template` → `lambda-template`; switch to
+3. ✅ **Rename `translated-template` → `lambda-template`; switch to
    composition.** Holds a `sexp-template` slot; constructor builds
    the inner sexp-template, then wraps with the callable lambda
    signature + supplied-p checks. Position-map queries delegate to
@@ -112,6 +112,21 @@ single reviewable diff.
    break in this commit.
    *Verify:* `make test` green; rendered output of existing fixtures
    byte-identical; `translated-template-text` still works via alias.
+   **Decisions:**
+   - **Composition was already done in commit 2** — the `sexp-template`
+     extraction inherently turned `translated-template`'s constructor
+     into a composition wrapper. This commit just renames the class.
+   - **Position-map is pre-shifted at construction, not queried
+     through delegation.** Cheaper at query time and matches the
+     pre-rename behavior. Operationally equivalent to delegating to
+     the inner sexp-template + adding the prefix offset per query.
+   - **Aliases use `(setf (find-class …))` + `(setf (fdefinition …))`
+     rather than a subclass or deftype** — gives full transparency
+     for `make-instance`, `typep`, accessor calls, all in one form.
+   - **Entry function `translate-template` was *not* renamed.** Its
+     return-type name changed, but the function name is fine —
+     consumer code reads naturally as "translate a template", not
+     tied to the return class's name.
 
 4. **Protocol class + shared generics.** Introduce a small protocol
    class both implement. `template-text`, `template-form`, and the
