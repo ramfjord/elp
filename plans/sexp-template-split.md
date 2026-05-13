@@ -1,13 +1,13 @@
-# Split `translated-template` into sexp-template + lambda-template
+# Split `translated-template` into open-template + closed-template
 
 ## Goal
 
 Replace the single `translated-template` class with two composed layers:
 
-- **`sexp-template`** — translated body as a string, source-specific
+- **`open-template`** — translated body as a string, source-specific
   wrapper applied, position-map, free-vars, source-name. Evaluable
   on its own given free-var bindings; the analysis/LSP surface.
-- **`lambda-template`** — composes a sexp-template, adds the
+- **`closed-template`** — composes an open-template, adds the
   callable `(lambda (stream &key …))` wrapper with supplied-p
   discipline. The render surface.
 
@@ -24,10 +24,10 @@ A small protocol class lets both implement a shared interface
   and callable-wrapping — only because free-var discovery sits
   between them. Splitting puts each job on its own layer.
 - **READ failures during edits shouldn't destroy the whole object.**
-  With the split, a sexp-template can exist even when free-var
+  With the split, an open-template can exist even when free-var
   discovery fails — LSP keeps text + position-map.
-- **Composition over inheritance.** Lambda-template *wraps* a
-  sexp-template; it isn't a *kind of* one. HAS-A matches data flow
+- **Composition over inheritance.** Closed-template *wraps* a
+  open-template; it isn't a *kind of* one. HAS-A matches data flow
   and keeps the protocol open to future variants.
 
 ## Sequencing
@@ -39,19 +39,19 @@ A small protocol class lets both implement a shared interface
    bound. Standalone, lands first because step 2 depends on the
    wrapper being uniform across backends.
 
-2. **Extract `sexp-template`.** Eagerly drain the stream in its
+2. **Extract `open-template`.** Eagerly drain the stream in its
    constructor; own text, position-map, source-name, free-vars;
    apply the source wrapper and the handler-bind. Stream class
    becomes a private implementation detail of the constructor.
 
-3. **Reframe `translated-template` → `lambda-template`** as
-   composition over a sexp-template slot. Position-map queries
-   delegate to the inner sexp-template plus the prefix shift.
+3. **Reframe `translated-template` → `closed-template`** as
+   composition over an open-template slot. Position-map queries
+   delegate to the inner open-template plus the prefix shift.
 
 4. **Protocol class + shared generics.** `template-text`,
    `template-form`, and the doc↔source generics live on the
-   protocol class. Lambda-template-only operations
-   (compile-to-callable) stay on lambda-template.
+   protocol class. Closed-template-only operations
+   (compile-to-callable) stay on closed-template.
 
 5. **Docs.** Update README.md, package docstrings, and any internal
    comments that reference the old single-class design.
@@ -72,54 +72,54 @@ single reviewable diff.
    `elp-template-error` with the supplied display name (not the raw
    unbound-variable crash). Existing tests stay green.
 
-2. ✅ **Extract `sexp-template` class.** New class owning text,
+2. ✅ **Extract `open-template` class.** New class owning text,
    position-map, source-name, free-vars. Constructor eagerly drains
    a `template-body-stream`, applies `source-wrap-lambda-body`, and
    wraps the handler-bind inside that. Stream class becomes a
    private detail of the constructor. `translated-template` keeps
-   working — for this commit it consumes a `sexp-template`
+   working — for this commit it consumes a `open-template`
    internally instead of driving the stream directly, but its
    external contract is unchanged.
    *Verify:* `make test` green. Add tests that directly construct a
-   `sexp-template`, READ its text, and confirm free-vars and
+   `open-template`, READ its text, and confirm free-vars and
    position-map match what `translated-template` produced on the
    same source.
    **Decisions:**
-   - **`*print-circle*` must be NIL for sexp-template's PRIN1.** Each
+   - **`*print-circle*` must be NIL for open-template's PRIN1.** Each
      layer PRIN1s separately, then their texts are concatenated. With
      `*print-circle* T` the two outputs assign overlapping `#N=`
      labels and the concatenated text fails to READ
-     ("multiply-defined label"). Lambda-template still needs
+     ("multiply-defined label"). Closed-template still needs
      `*print-circle* T` to share supplied-p gensym labels across its
      `&key` declaration and `unless` checks.
    - **Two handler-binds instead of cross-layer splicing.**
-     Sexp-template owns the runtime-error handler-bind (needs
-     `elp::source` from source-wrap). Lambda-template adds its own
-     `(handler-bind ((unbound-variable …)))` outside sexp-template
+     Open-template owns the runtime-error handler-bind (needs
+     `elp::source` from source-wrap). Closed-template adds its own
+     `(handler-bind ((unbound-variable …)))` outside open-template
      to translate supplied-p check failures. Keeps the layer
-     boundary clean — no marker-splicing to insert lambda-template
-     prelude inside sexp-template's body.
-   - **Doc↔source methods on sexp-template duplicate the
+     boundary clean — no marker-splicing to insert closed-template
+     prelude inside open-template's body.
+   - **Doc↔source methods on open-template duplicate the
      translated-template body** — both will collapse onto a protocol
      class in commit 4.
 
-3. ✅ **Rename `translated-template` → `lambda-template`; switch to
-   composition.** Holds a `sexp-template` slot; constructor builds
-   the inner sexp-template, then wraps with the callable lambda
+3. ✅ **Rename `translated-template` → `closed-template`; switch to
+   composition.** Holds a `open-template` slot; constructor builds
+   the inner open-template, then wraps with the callable lambda
    signature + supplied-p checks. Position-map queries delegate to
-   the inner sexp-template with prefix-length offset. Old name kept
+   the inner open-template with prefix-length offset. Old name kept
    as a deprecated alias for one cycle so external callers don't
    break in this commit.
    *Verify:* `make test` green; rendered output of existing fixtures
    byte-identical; `translated-template-text` still works via alias.
    **Decisions:**
-   - **Composition was already done in commit 2** — the `sexp-template`
+   - **Composition was already done in commit 2** — the `open-template`
      extraction inherently turned `translated-template`'s constructor
      into a composition wrapper. This commit just renames the class.
    - **Position-map is pre-shifted at construction, not queried
      through delegation.** Cheaper at query time and matches the
      pre-rename behavior. Operationally equivalent to delegating to
-     the inner sexp-template + adding the prefix offset per query.
+     the inner open-template + adding the prefix offset per query.
    - **Aliases use `(setf (find-class …))` + `(setf (fdefinition …))`
      rather than a subclass or deftype** — gives full transparency
      for `make-instance`, `typep`, accessor calls, all in one form.
@@ -131,7 +131,7 @@ single reviewable diff.
 4. ✅ **Protocol class + shared generics.** Introduce a small protocol
    class both implement. `template-text`, `template-form`, and the
    doc↔source generics live there. Compile-to-callable stays
-   lambda-template-only. Update exports; retire the deprecated
+   closed-template-only. Update exports; retire the deprecated
    `translated-template` alias.
    *Verify:* `make test` green. Add tests that exercise the
    protocol generics polymorphically across both classes.
@@ -139,7 +139,7 @@ single reviewable diff.
    - **Protocol class uses shared slots, not pure abstract methods.**
      `template` owns `text`, `position-map`, `source-name`;
      subclasses re-list slot names just to add their own
-     class-specific readers (`sexp-template-text` etc.) — CLOS
+     class-specific readers (`open-template-text` etc.) — CLOS
      slot inheritance merges the definitions onto one slot.
      Constructors keep using `(setf (slot-value s 'text) …)` and
      it Just Works.
@@ -151,7 +151,7 @@ single reviewable diff.
      the new `elp:template-form` GF via the test package's
      `:use :elp`, redefining the fdefinition on the imported symbol
      so all calls (including `elp:template-form`) hit the
-     test-local function that called `lambda-template-text`
+     test-local function that called `closed-template-text`
      directly. Replaced helper calls with `elp:template-form`.
 
 5. ✅ **Docs.** README.md, package docstrings, internal comments
@@ -163,3 +163,20 @@ single reviewable diff.
      this commit only touches README.md (the public-facing
      translation API section and the implementation-notes section
      "One stream, two materialized layers").
+
+6. ✅ **Rename: sexp-template → open-template, lambda-template →
+   closed-template.** Naming by *property* (has free refs vs.
+   self-contained), not by *form shape* (both are sexps; lambda is
+   one closing strategy). Standard PL terminology for open/closed
+   terms. Also renames `translate-sexp` → `translate-open` and the
+   composition reader `lambda-template-sexp` → `closed-template-open`.
+   *Verify:* `make test` green.
+   **Decisions:**
+   - **Kept flat hierarchy.** `closed-template` is the only concrete
+     closing strategy today; if a second one materializes (e.g.,
+     alist-binding instead of kwarg-binding), a subclass slots in
+     alongside without rework.
+   - **Plan file kept its `sexp-template-split.md` slug** to
+     preserve git-history continuity. Naming inside the plan
+     reflects the final state (open/closed); commit messages on
+     the branch preserve the original sexp/lambda step.

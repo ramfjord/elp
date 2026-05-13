@@ -112,7 +112,7 @@
    lambda is self-contained — runtime acquisition (if any) lives in
    the source's SOURCE-WRAP-LAMBDA-BODY."
   (compile nil (read-from-string
-                (lambda-template-text (translate-template source)))))
+                (closed-template-text (translate-template source)))))
 
 (declaim (ftype (function (t stream &rest t) t) render))
 (defun render (source stream &rest kwargs)
@@ -228,7 +228,7 @@
     has consumed READER-POS chars, the next character will correspond
     to SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
     regions with no source backing. The map is consumed by
-    LAMBDA-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
+    CLOSED-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
     the keys by the prefix length and stores the result for
     DOC-OFFSET->SOURCE-BYTE / SOURCE-BYTE->DOC-OFFSET lookup."))
 
@@ -342,7 +342,7 @@
    ANCHOR is either an integer source-byte (for chars that originated
    in the .elp file) or NIL (for synthesized chars — text-emit
    wrappers, the expr-prefix FORMAT call, the lambda signature, etc).
-   NIL-anchored checkpoints survive into the outer LAMBDA-TEMPLATE
+   NIL-anchored checkpoints survive into the outer CLOSED-TEMPLATE
    so DOC-OFFSET->SOURCE-BYTE can return NIL for those regions."
   (let ((top (car (position-map s))))
     (unless (equal top (cons key anchor))
@@ -477,7 +477,7 @@
 ;;;; ============================================================
 ;;;; Public translation interface — full lambda form with position map.
 ;;;;
-;;;; TRANSLATE-TEMPLATE returns a LAMBDA-TEMPLATE: a materialized
+;;;; TRANSLATE-TEMPLATE returns a CLOSED-TEMPLATE: a materialized
 ;;;; analysis lambda form for the template — same body shape the
 ;;;; render path produces, wrapped so a static walker / LSP sees every
 ;;;; symbol as a real lexical or function reference. Bytes produced
@@ -486,7 +486,7 @@
 ;;;; bytes (NIL for synthesized prefix/suffix/text-emit chars).
 ;;;;
 ;;;; The text + position-map travel together — a Lisp-LSP can paste
-;;;; LAMBDA-TEMPLATE-TEXT into a document buffer and use the
+;;;; CLOSED-TEMPLATE-TEXT into a document buffer and use the
 ;;;; position-map for cursor translation, without knowing anything
 ;;;; about ELP's internals.
 ;;;;
@@ -506,8 +506,8 @@
 ;;;; it.
 
 ;;;; ============================================================
-;;;; TEMPLATE — protocol class shared by SEXP-TEMPLATE and
-;;;; LAMBDA-TEMPLATE. Owns the three slots both layers carry:
+;;;; TEMPLATE — protocol class shared by OPEN-TEMPLATE and
+;;;; CLOSED-TEMPLATE. Owns the three slots both layers carry:
 ;;;; TEXT, POSITION-MAP, SOURCE-NAME. Not intended for direct
 ;;;; instantiation; the subclasses fill the slots in their own
 ;;;; INITIALIZE-INSTANCE :AFTER methods.
@@ -517,10 +517,10 @@
     :reader template-text
     :documentation "PRIN1'd generated code, READable. Layer-specific
                     contract:
-                      SEXP-TEMPLATE — emits to current
+                      OPEN-TEMPLATE — emits to current
                         *standard-output* when evaluated (given
                         free-var bindings).
-                      LAMBDA-TEMPLATE — a (lambda (stream &key …))
+                      CLOSED-TEMPLATE — a (lambda (stream &key …))
                         form ready for COMPILE.")
    (position-map
     :reader position-map
@@ -531,8 +531,8 @@
     :documentation "Display name for the source."))
   (:documentation
    "Protocol class for ELP-generated template forms. Concrete
-    subclasses are SEXP-TEMPLATE (bare emitter form, LSP/analysis
-    surface) and LAMBDA-TEMPLATE (callable wrapper, render surface).
+    subclasses are OPEN-TEMPLATE (bare emitter form, LSP/analysis
+    surface) and CLOSED-TEMPLATE (callable wrapper, render surface).
     Shared generics live on this class; layer-specific contract
     lives on the subclasses."))
 
@@ -545,9 +545,9 @@
     (read-from-string (template-text s))))
 
 ;;;; ============================================================
-;;;; SEXP-TEMPLATE — the bare emitter form.
+;;;; OPEN-TEMPLATE — the bare emitter form.
 ;;;;
-;;;; A SEXP-TEMPLATE owns the translated template body wrapped in:
+;;;; A OPEN-TEMPLATE owns the translated template body wrapped in:
 ;;;;   1. SOURCE-WRAP-LAMBDA-BODY (binds ELP::SOURCE, plus ELP::PTR
 ;;;;      etc. for mmap backends so text-emits can dispatch).
 ;;;;   2. A HANDLER-BIND that translates runtime conditions inside
@@ -559,27 +559,27 @@
 ;;;; bindings for the template's free variables. There is no
 ;;;; callable signature: free vars are looked up in the calling
 ;;;; environment. Missing-binding detection lives one layer up at
-;;;; LAMBDA-TEMPLATE; sexp-template is the surface a LSP wants
+;;;; CLOSED-TEMPLATE; open-template is the surface a LSP wants
 ;;;; (no synthetic &key shadowing of project-bound names).
 
-(defclass sexp-template (template)
+(defclass open-template (template)
   ;; TEXT, POSITION-MAP, SOURCE-NAME inherited from TEMPLATE. Re-list
-  ;; TEXT only to add the subclass-specific reader SEXP-TEMPLATE-TEXT
+  ;; TEXT only to add the subclass-specific reader OPEN-TEMPLATE-TEXT
   ;; for callers that want the explicit name.
-  ((text :reader sexp-template-text)
+  ((text :reader open-template-text)
    (free-vars
-    :reader sexp-template-free-vars
+    :reader open-template-free-vars
     :documentation "List of symbols referenced free in the template
-                    body, in stable order (the order LAMBDA-TEMPLATE
+                    body, in stable order (the order CLOSED-TEMPLATE
                     will turn into &key params)."))
   (:documentation
    "Translated template body: the inner translated chars wrapped in
     the source-specific lexical context (ELP::SOURCE etc.) and
-    error-translating handler-bind. Construct via TRANSLATE-SEXP
-    (manages source lifecycle) or `(make-instance 'sexp-template
+    error-translating handler-bind. Construct via TRANSLATE-OPEN
+    (manages source lifecycle) or `(make-instance 'open-template
     :source source)` directly (caller closes the source)."))
 
-(defmethod initialize-instance :after ((s sexp-template) &key source)
+(defmethod initialize-instance :after ((s open-template) &key source)
   "Drain a fresh TEMPLATE-BODY-STREAM over SOURCE, walk for free
    variables, build the source-wrap + handler-bind sexp around a
    body-splice marker, PRIN1 it, splice the inner translated chars
@@ -591,7 +591,7 @@
          ;; SOURCE-LINE+COLUMN against the original file.
          (free-vars (%template-free-vars inner))
          ;; Uninterned sentinel marking where the inner chars splice.
-         (marker (make-symbol "ELP-SEXP-TEMPLATE-BODY-PLACEHOLDER"))
+         (marker (make-symbol "ELP-OPEN-TEMPLATE-BODY-PLACEHOLDER"))
          (wrapped-sexp
           (source-wrap-lambda-body
            source
@@ -609,8 +609,8 @@
                               :line line :column col
                               :original c)))))
               ,marker)))
-         ;; *print-circle* NIL: SEXP-TEMPLATE has no twice-referenced
-         ;; gensyms, and the text is concatenated into LAMBDA-TEMPLATE's
+         ;; *print-circle* NIL: OPEN-TEMPLATE has no twice-referenced
+         ;; gensyms, and the text is concatenated into CLOSED-TEMPLATE's
          ;; PRIN1 output — sharing labels (#N=) generated here would
          ;; collide with labels generated there.
          (text (let ((*print-pretty* nil)
@@ -632,47 +632,47 @@
               (slot-value s 'free-vars)
               free-vars)))))
 
-(declaim (ftype (function (t) sexp-template) translate-sexp))
-(defun translate-sexp (source)
-  "Consume SOURCE and return a SEXP-TEMPLATE. Mirrors
+(declaim (ftype (function (t) open-template) translate-open))
+(defun translate-open (source)
+  "Consume SOURCE and return a OPEN-TEMPLATE. Mirrors
    TRANSLATE-TEMPLATE's source-lifecycle ownership: closes SOURCE on
    return."
   (unwind-protect
-       (make-instance 'sexp-template :source source)
+       (make-instance 'open-template :source source)
     (close-source source)))
 
-(defclass lambda-template (template)
-  ;; LAMBDA-TEMPLATE composition: holds a SEXP-TEMPLATE and adds the
+(defclass closed-template (template)
+  ;; CLOSED-TEMPLATE composition: holds a OPEN-TEMPLATE and adds the
   ;; callable (LAMBDA (STREAM &KEY …)) wrapper plus supplied-p
-  ;; discipline. SEXP-TEMPLATE owns the source-wrap and the
+  ;; discipline. OPEN-TEMPLATE owns the source-wrap and the
   ;; body-error handler-bind; this layer owns the kwargs interface
   ;; and the missing-kwarg → ELP-TEMPLATE-ERROR translation.
   ;;
   ;; TEXT, POSITION-MAP, SOURCE-NAME inherited from TEMPLATE.
-  ((text :reader lambda-template-text)
-   (sexp-template
-    :reader lambda-template-sexp
-    :documentation "Inner SEXP-TEMPLATE — the bare emitter form this
+  ((text :reader closed-template-text)
+   (open-template
+    :reader closed-template-open
+    :documentation "Inner OPEN-TEMPLATE — the bare emitter form this
                     callable wraps."))
   (:documentation
    "Materialized analysis lambda for an ELP template, built by
-    wrapping a SEXP-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
+    wrapping a OPEN-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
     signature. Construct via TRANSLATE-TEMPLATE or `(make-instance
-    'lambda-template :source source)`."))
+    'closed-template :source source)`."))
 
-(defmethod initialize-instance :after ((s lambda-template) &key source)
-  "Build the inner SEXP-TEMPLATE, then wrap with the kwarg signature,
+(defmethod initialize-instance :after ((s closed-template) &key source)
+  "Build the inner OPEN-TEMPLATE, then wrap with the kwarg signature,
    *standard-output* let, and unbound-variable handler-bind that
-   covers the supplied-p checks. Splice the sexp-template's text in
+   covers the supplied-p checks. Splice the open-template's text in
    at the body marker; shift its position-map by the prefix length."
-  (let* ((inner (make-instance 'sexp-template :source source))
-         (free-vars (sexp-template-free-vars inner))
+  (let* ((inner (make-instance 'open-template :source source))
+         (free-vars (open-template-free-vars inner))
          (name (source-name inner))
          (supplied-p-vars
           (mapcar (lambda (v)
                     (gensym (format nil "~A-SUPPLIED-P-" v)))
                   free-vars))
-         (marker (make-symbol "ELP-LAMBDA-TEMPLATE-BODY-PLACEHOLDER"))
+         (marker (make-symbol "ELP-CLOSED-TEMPLATE-BODY-PLACEHOLDER"))
          ;; Outer wrap: lambda signature + *standard-output* rebind +
          ;; handler-bind that translates supplied-p UNBOUND-VARIABLE
          ;; into ELP-TEMPLATE-ERROR. Missing-kwarg errors come from
@@ -707,9 +707,9 @@
     (multiple-value-bind (prefix suffix)
         (%split-text-on-marker text marker)
       (let ((pl (length prefix)))
-        (setf (slot-value s 'sexp-template) inner
+        (setf (slot-value s 'open-template) inner
               (slot-value s 'text)
-              (concatenate 'string prefix (sexp-template-text inner) suffix)
+              (concatenate 'string prefix (open-template-text inner) suffix)
               (slot-value s 'position-map)
               (mapcar (lambda (cp)
                         (destructuring-bind (body-pos . source-byte) cp
@@ -720,7 +720,7 @@
 ;;;; ============================================================
 ;;;; Reversible doc-offset ↔ source-byte mapping.
 ;;;;
-;;;; Two paired generics. LAMBDA-TEMPLATE specializes both;
+;;;; Two paired generics. CLOSED-TEMPLATE specializes both;
 ;;;; together they form a reversible mapping between coordinates in
 ;;;; the translated text and bytes in the original source.
 ;;;;
@@ -753,8 +753,8 @@
 (defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
 
 (defmethod doc-offset->source-byte ((s template) doc-offset)
-  ;; Single method on the protocol class — both SEXP-TEMPLATE and
-  ;; LAMBDA-TEMPLATE pre-shift their position-map keys to be
+  ;; Single method on the protocol class — both OPEN-TEMPLATE and
+  ;; CLOSED-TEMPLATE pre-shift their position-map keys to be
   ;; doc-relative at construction, so the lookup is identical.
   ;; NIL CDR marks synthesized regions.
   (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
@@ -846,16 +846,16 @@
     (values (subseq text 0 split)
             (subseq text (+ split (length marker-text))))))
 
-(declaim (ftype (function (t) lambda-template) translate-template))
+(declaim (ftype (function (t) closed-template) translate-template))
 (defun translate-template (source)
-  "Consume SOURCE and return a LAMBDA-TEMPLATE — the analysis
+  "Consume SOURCE and return a CLOSED-TEMPLATE — the analysis
    lambda's text plus a position-map.
 
    The text is the same form COMPILE-TEMPLATE compiles —
    COMPILE-TEMPLATE is literally
        (compile nil (read-from-string
-                     (lambda-template-text (translate-template source))))
-   so the lambda-template is the canonical surface; the compiled
+                     (closed-template-text (translate-template source))))
+   so the closed-template is the canonical surface; the compiled
    function is one READ-FROM-STRING + COMPILE away.
 
    Body chars (from the user's <% %> and <%= %> blocks) carry
@@ -863,12 +863,12 @@
    (synthesized lambda signature, per-source outer wrap,
    handler-bind, key-checks) return NIL.
 
-   Implementation: LAMBDA-TEMPLATE's INITIALIZE-INSTANCE :AFTER
+   Implementation: CLOSED-TEMPLATE's INITIALIZE-INSTANCE :AFTER
    does all the codegen work — draining the inner stream, walking
    for free vars, building and splicing the wrapped lambda text. This
    function just owns SOURCE's lifecycle: construct the object, then
    CLOSE-SOURCE."
   (unwind-protect
-       (make-instance 'lambda-template :source source)
+       (make-instance 'closed-template :source source)
     (close-source source)))
 

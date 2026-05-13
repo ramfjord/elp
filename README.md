@@ -254,13 +254,13 @@ Releases any OS resources the source holds. Idempotent; no-op on
 `render` / `compile-template` / `translate-template` do it
 automatically.
 
-**Two layers: `sexp-template` and `lambda-template`**
+**Two layers: `open-template` and `closed-template`**
 
-Translation runs in two composed steps. `sexp-template` carries the
+Translation runs in two composed steps. `open-template` carries the
 template body wrapped in just enough scaffolding to be evaluable
 (the source-specific lexical context plus the runtime-error
 handler-bind) — free variables stay as bare symbols, no keyword-arg
-signature shadowing them. `lambda-template` wraps a sexp-template
+signature shadowing them. `closed-template` wraps an open-template
 with the callable `(lambda (stream &key …))` signature and
 supplied-p discipline; it's what `compile-template` compiles.
 
@@ -277,15 +277,15 @@ Both implement a shared `template` protocol:
   to identity via T methods, so byte-equivalent translators get
   no-op behavior for free.
 
-**`(translate-template source)` → `lambda-template`**
+**`(translate-template source)` → `closed-template`**
 
 Returns the callable lambda surface. `compile-template` is literally
-`(compile nil (read-from-string (lambda-template-text
-(translate-template source))))` — the lambda-template is the
+`(compile nil (read-from-string (closed-template-text
+(translate-template source))))` — the closed-template is the
 canonical surface; the compiled function is one `read-from-string` +
 `compile` away.
 
-**`(translate-sexp source)` → `sexp-template`**
+**`(translate-open source)` → `open-template`**
 
 Returns the bare emitter surface — same source, one fewer wrap.
 Useful for Lisp LSPs / static analyzers that want template-body
@@ -296,13 +296,13 @@ host project provides, instead of being shadowed by a synthesized
 ```lisp
 (let ((tt (translate-template (filepath-source #p"foo.elp"))))
   (template-text tt)               ; → "(lambda (stream &key name) …)"
-  (lambda-template-sexp tt)        ; → #<sexp-template …>
+  (closed-template-open tt)        ; → #<open-template …>
   (doc-offset->source-byte tt 42)  ; → 17 (or NIL)
   (source-byte->doc-offset tt 17)) ; → 42 (or NIL)
 
-(let ((st (translate-sexp (filepath-source #p"foo.elp"))))
+(let ((st (translate-open (filepath-source #p"foo.elp"))))
   (template-text st)               ; → "(let ((elp::source …)) (handler-bind …))"
-  (sexp-template-free-vars st))    ; → (NAME)
+  (open-template-free-vars st))    ; → (NAME)
 ```
 
 ### Errors
@@ -354,14 +354,14 @@ character-positions to source bytes.
 
 The drain feeds two composed layers:
 
-- **`sexp-template`** wraps the inner chars in
+- **`open-template`** wraps the inner chars in
   `source-wrap-lambda-body` (binds `elp::source`, plus
   `elp::ptr/size/fd` for mmap-source) and a `handler-bind` that
   translates runtime errors inside the body into
   `elp-template-error` with source line/column from
   `*current-template-span*`. Its text, when READ and evaluated,
   emits to current `*standard-output*` given free-var bindings.
-- **`lambda-template`** wraps a sexp-template in
+- **`closed-template`** wraps an open-template in
   `(lambda (stream &key …) (let ((*standard-output* stream)) …))`
   with one supplied-p check per free variable and an outer
   `handler-bind` that translates missing-kwarg `unbound-variable`
@@ -371,8 +371,8 @@ The drain feeds two composed layers:
 Each layer pre-shifts its inner position-map by the prefix length
 its outer text adds, so position-map keys always index directly
 into that layer's text. The two `handler-bind`s split cleanly by
-responsibility: sexp-template's catches body-runtime errors (needs
-`elp::source` in scope); lambda-template's catches supplied-p
+responsibility: open-template's catches body-runtime errors (needs
+`elp::source` in scope); closed-template's catches supplied-p
 unbound-variables (no template span; line/col=1/1).
 
 ### Source protocol
@@ -416,7 +416,7 @@ reader's stop position in the position-map, falling back to
 `source-line+column` for the line/col conversion (libc `memchr` for
 mmap-source — vectorized newline scan).
 
-Both `sexp-template` and `lambda-template` inherit the position-map
+Both `open-template` and `closed-template` inherit the position-map
 for their body region (with keys shifted by each layer's prefix
 length); prefix/suffix chars (synthesized wrapper) return NIL from
 `doc-offset->source-byte`. That's how an LSP turns a cursor in its

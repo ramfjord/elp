@@ -316,7 +316,7 @@
 ;;;;
 ;;;; Analysis lambda materialization. Driven by either MMAP-SOURCE or
 ;;;; STRING-SOURCE; the protocol abstracts the difference. Two facets
-;;;; we care about: (1) the LAMBDA-TEMPLATE-TEXT reads as one
+;;;; we care about: (1) the CLOSED-TEMPLATE-TEXT reads as one
 ;;;; well-formed (lambda ...) form whose &key list covers exactly the
 ;;;; free variables in the template, with body chars that appear in
 ;;;; the same render-shape COMPILE-TEMPLATE produces
@@ -403,7 +403,7 @@
                              (read-sequence buf f)
                              buf)))
            (tt (elp:translate-template (elp:filepath-source p)))
-           (text (elp:lambda-template-text tt))
+           (text (elp:closed-template-text tt))
            (anchored-count 0))
       (loop for pos below (length text)
             for src = (elp:doc-offset->source-byte tt pos)
@@ -422,7 +422,7 @@
    DOC-OFFSET->SOURCE-BYTE — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
     (let* ((tt (elp:translate-template (elp:filepath-source p)))
-           (text (elp:lambda-template-text tt))
+           (text (elp:closed-template-text tt))
            (results (loop for pos below (length text)
                           collect (cons pos (elp:doc-offset->source-byte tt pos)))))
       ;; The first two chars are `(l` opening the lambda — no source.
@@ -459,7 +459,7 @@
   "T methods default to identity — translators that produce a
    byte-equivalent canvas (and consumers that haven't registered a
    real mapping) get a no-op pair for free."
-  ;; A stand-in object — any value other than a lambda-template uses
+  ;; A stand-in object — any value other than a closed-template uses
   ;; the T-method identity defaults.
   (is (= 42 (elp:doc-offset->source-byte :stub 42)))
   (is (= 17 (elp:source-byte->doc-offset :stub 17))))
@@ -480,40 +480,40 @@
       (is (null (find-lambda-key-list form))))))
 
 ;;;; ============================================================
-;;;; sexp-template — the bare emitter form, sits one layer below
-;;;; lambda-template. Owns: source-wrap + handler-bind + inner
+;;;; open-template — the bare emitter form, sits one layer below
+;;;; closed-template. Owns: source-wrap + handler-bind + inner
 ;;;; translated chars; free-vars discovered during construction.
 ;;;; Does NOT have a callable signature — its TEXT, when READ and
 ;;;; evaluated, emits to current *standard-output* with free vars
 ;;;; looked up in the caller's environment.
 
-(test sexp-template-text-reads-as-one-form
-  "sexp-template-text is a single READable Lisp form. The outer
+(test open-template-text-reads-as-one-form
+  "open-template-text is a single READable Lisp form. The outer
    shape is the source wrap (a LET for string-source, a
    MULTIPLE-VALUE-BIND for mmap)."
-  (let* ((st (elp:translate-sexp
+  (let* ((st (elp:translate-open
               (elp:string-source "hi <%= who %>" :name "t.elp")))
-         (form (read-from-string (elp:sexp-template-text st))))
+         (form (read-from-string (elp:open-template-text st))))
     (is (consp form))
     ;; string-source's wrap is (LET ((ELP::SOURCE …)) …).
     (is (eq 'let (first form)))))
 
-(test sexp-template-free-vars-matches-template
-  "Free-vars discovery surfaces the same symbols the lambda-template
+(test open-template-free-vars-matches-template
+  "Free-vars discovery surfaces the same symbols the closed-template
    would expose as &key params."
-  (let ((st (elp:translate-sexp
+  (let ((st (elp:translate-open
              (elp:string-source "Hi <%= name %>, age <%= age %>"))))
     (is (equal (sort '(name age) #'string< :key #'symbol-name)
-               (sort (copy-list (elp:sexp-template-free-vars st))
+               (sort (copy-list (elp:open-template-free-vars st))
                      #'string< :key #'symbol-name)))))
 
-(test sexp-template-position-map-doc-relative
-  "Position-map keys index directly into sexp-template-text — picking
+(test open-template-position-map-doc-relative
+  "Position-map keys index directly into open-template-text — picking
    a char inside <%= name %> resolves back to a source byte in that
    region of the .elp."
-  (let* ((st (elp:translate-sexp
+  (let* ((st (elp:translate-open
               (elp:string-source "x<%= name %>y")))
-         (text (elp:sexp-template-text st))
+         (text (elp:open-template-text st))
          (anchored-doc
           (loop for pos below (length text)
                 when (integerp (elp:doc-offset->source-byte st pos))
@@ -524,30 +524,30 @@
       (is (integerp src))
       (is (= anchored-doc round-trip)))))
 
-(test lambda-template-wraps-sexp-template
-  "lambda-template composes a sexp-template. Same source → both
-   layers see the same free-vars and the inner sexp-template-text is
-   embedded in lambda-template-text."
+(test closed-template-wraps-open-template
+  "closed-template composes an open-template. Same source → both
+   layers see the same free-vars and the inner open-template-text is
+   embedded in closed-template-text."
   (let* ((src-text "Hi <%= name %>!")
          (tt (elp:translate-template (elp:string-source src-text)))
-         (inner (elp:lambda-template-sexp tt)))
-    (is (typep inner 'elp:sexp-template))
-    (is (equal (elp:sexp-template-free-vars inner) '(name)))
-    (is (search (elp:sexp-template-text inner)
-                (elp:lambda-template-text tt))
-        "lambda-template-text must contain sexp-template-text verbatim")))
+         (inner (elp:closed-template-open tt)))
+    (is (typep inner 'elp:open-template))
+    (is (equal (elp:open-template-free-vars inner) '(name)))
+    (is (search (elp:open-template-text inner)
+                (elp:closed-template-text tt))
+        "closed-template-text must contain open-template-text verbatim")))
 
 (test template-protocol-works-polymorphically
   "TEMPLATE-TEXT, TEMPLATE-FORM, and the DOC↔SOURCE generics
    dispatch on the shared TEMPLATE protocol class — same call site
-   works for both SEXP-TEMPLATE and LAMBDA-TEMPLATE."
-  (let ((st (elp:translate-sexp (elp:string-source "hi <%= who %>")))
+   works for both OPEN-TEMPLATE and CLOSED-TEMPLATE."
+  (let ((st (elp:translate-open (elp:string-source "hi <%= who %>")))
         (lt (elp:translate-template (elp:string-source "hi <%= who %>"))))
     (is (typep st 'elp:template))
     (is (typep lt 'elp:template))
     ;; TEMPLATE-TEXT agrees with each layer's specific reader.
-    (is (equal (elp:template-text st) (elp:sexp-template-text st)))
-    (is (equal (elp:template-text lt) (elp:lambda-template-text lt)))
+    (is (equal (elp:template-text st) (elp:open-template-text st)))
+    (is (equal (elp:template-text lt) (elp:closed-template-text lt)))
     ;; TEMPLATE-FORM = (read-from-string (template-text …)).
     (is (consp (elp:template-form st)))
     (is (eq 'lambda (first (elp:template-form lt))))

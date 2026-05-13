@@ -29,10 +29,10 @@
    ;; Translation interface — materialized lambda-form text plus a
    ;; reversible doc-offset ↔ source-byte mapping for static analysis.
    ;; Two layers:
-   ;;   SEXP-TEMPLATE   — bare emitter form (source-wrapped body +
+   ;;   OPEN-TEMPLATE   — bare emitter form (source-wrapped body +
    ;;                     handler-bind), free of any callable signature;
    ;;                     the LSP/analysis surface.
-   ;;   LAMBDA-TEMPLATE — composes a SEXP-TEMPLATE and adds the
+   ;;   CLOSED-TEMPLATE — composes an OPEN-TEMPLATE and adds the
    ;;                     callable (lambda (stream &key …)) wrapper
    ;;                     with supplied-p discipline; the render surface.
    ;; Shared protocol — TEMPLATE-TEXT, TEMPLATE-FORM, and the
@@ -41,12 +41,12 @@
    :template-text
    :template-form
    :translate-template
-   :lambda-template
-   :lambda-template-text
-   :lambda-template-sexp
-   :translate-sexp
-   :sexp-template
-   :sexp-template-text
-   :sexp-template-free-vars
+   :closed-template
+   :closed-template-text
+   :closed-template-open
+   :translate-open
+   :open-template
+   :open-template-text
+   :open-template-free-vars
    :doc-offset->source-byte
    :source-byte->doc-offset))
