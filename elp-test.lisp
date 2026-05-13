@@ -16,7 +16,7 @@
 ;;;;
 ;;;; What we DON'T test separately, intentionally:
 ;;;;   - tokenizer internals (memmem/memchr, byte->line+column,
-;;;;     template-body-stream lex states) — exercised end-to-end through
+;;;;     template-body-translator lex states) — exercised end-to-end through
 ;;;;     every render test.
 ;;;;   - tag/syntax permutations beyond one example per feature —
 ;;;;     each adds maintenance cost without distinct failure modes.

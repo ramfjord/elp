@@ -162,43 +162,29 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-;;;; Reader-driven codegen: template-body-stream gray stream
+;;;; Chunked codegen: template-body-translator
 ;;;;
-;;;; A SB-GRAY input stream wrapped around an mmap'd template region.
-;;;; Synthesizes Lisp source characters on the fly so that the standard
-;;;; reader can walk the template directly and produce the body sexp
-;;;; without an intermediate source-string assembly step.
+;;;; A plain state holder around an mmap'd (or string-backed) template
+;;;; region. NEXT-CHUNK is a straight-line state machine: it looks at
+;;;; the byte at CURSOR and produces *one* chunk for the next
+;;;; syntactic unit (text-up-to-tag, plain <% %>, expr <%= %>,
+;;;; comment <%# %>, or trailing text), or :EOF when CURSOR has
+;;;; reached SIZE. A chunk is a cons
+;;;;   (STRING . ANCHORS)
+;;;; where STRING is the translated characters for the unit and
+;;;; ANCHORS is a list of (CHUNK-OFFSET . SOURCE-BYTE-OR-NIL)
+;;;; checkpoints in increasing offset order. Bodies of <% ... %> and
+;;;; <%= ... %> are materialized once (SOURCE-SUBSTRING) and
+;;;; concatenated with their wrappers into the chunk's STRING. NIL
+;;;; ANCHORS means the whole chunk is synthesized. Comments and
+;;;; whitespace-only <%= %> tags yield no chunk; NEXT-CHUNK loops
+;;;; internally to skip over them.
 ;;;;
-;;;; Two layers, separated:
-;;;;
-;;;;   NEXT-CHUNK — straight-line state machine. Looks at the byte at
-;;;;   CURSOR and produces *one* chunk for the next syntactic unit
-;;;;   (text-up-to-tag, plain <% %>, expr <%= %>, comment <%# %>, or
-;;;;   trailing text), or :EOF when CURSOR has reached SIZE. A chunk
-;;;;   is a cons
-;;;;     (STRING . ANCHOR-OR-NIL)
-;;;;   where STRING is the characters to feed to the reader. ANCHOR
-;;;;   is NIL for synthesized wrappers (no meaningful source byte);
-;;;;   otherwise it is a cons (CHAR-OFFSET . SOURCE-BYTE) saying
-;;;;   "when the reader reaches CHAR-OFFSET into this chunk's string,
-;;;;   the corresponding source byte is SOURCE-BYTE." Bodies of
-;;;;   <% ... %> and <%= ... %> are materialized once (MMAP-SUBSTRING)
-;;;;   and concatenated with their wrappers into the chunk's STRING,
-;;;;   so each tag yields exactly one chunk. Comments and
-;;;;   whitespace-only <%= %> tags yield no chunk; NEXT-CHUNK loops
-;;;;   internally to skip over them.
-;;;;
-;;;;   STREAM-READ-CHAR — dumb. Drains CHUNK one character at a time;
-;;;;   when exhausted, calls NEXT-CHUNK for the next one. The only
-;;;;   state transition inside read-char is "this chunk is done,
-;;;;   ask NEXT-CHUNK for another."
-;;;;
-;;;; POSITION-MAP records (READER-POS . MMAP-BYTE) checkpoints. When a
-;;;; chunk with a non-nil ANCHOR becomes current, the checkpoint is
-;;;; pushed at key=chars-read+CHAR-OFFSET, anchor=SOURCE-BYTE — the
-;;;; reader-pos that *will* land on the anchored region.
+;;;; %DRAIN-TEMPLATE-BODY appends each chunk's STRING into the
+;;;; translator's TRANSLATED-TEXT and pushes its ANCHORS into
+;;;; POSITION-MAP at offsets relative to total chars written so far.
 
-(defclass template-body-stream (sb-gray:fundamental-character-input-stream)
+(defclass template-body-translator ()
   ((source          :initarg :source     :reader   source
     :documentation "Backing SOURCE. All byte scanning / substring
                     extraction / text-emit codegen dispatches through
@@ -208,30 +194,27 @@
    (inside-code     :initform nil        :accessor inside-code
     :documentation "T iff CURSOR sits past `<%` and the next NEXT-CHUNK
                     call should parse a tag rather than scan for one.")
-   (chunk           :initform nil        :accessor chunk
-    :documentation "Currently-draining chunk's string, or NIL when one is needed.")
-   (chunk-pos       :initform 0          :accessor chunk-pos
-    :documentation "Index of next character to return from CHUNK.")
-   (pushback        :initform nil        :accessor pushback)
-   (chars-read      :initform 0          :accessor chars-read)
+   (chars-read      :initform 0          :accessor chars-read
+    :documentation "Total characters written into TRANSLATED-TEXT so
+                    far. Used as the base offset when pushing
+                    position-map checkpoints for the next chunk.")
    (position-map    :initform '()        :accessor position-map)
    (translated-text :initform nil        :accessor translated-text
-    :documentation "Captured drained character output, populated by
-                    %DRAIN-TEMPLATE-BODY-STREAM. NIL until drain
-                    runs. Lets the stream act as its own
-                    fully-self-contained record of (source, translated
-                    chars, position-map) for downstream consumers like
-                    %TEMPLATE-FREE-VARS."))
+    :documentation "Concatenated translated character output, populated
+                    by %DRAIN-TEMPLATE-BODY. NIL until drain runs.
+                    After drain, (SOURCE, TRANSLATED-TEXT,
+                    POSITION-MAP) form a self-contained record for
+                    downstream consumers like %TEMPLATE-FREE-VARS."))
   (:documentation
-   "Gray input stream wrapping a SOURCE (mmap- or string-backed) of an
-    ELP template. The standard Lisp reader can READ from it directly;
-    the stream synthesizes text-emit wrapper forms around literal text
-    spans and feeds the bytes inside <% ... %> blocks straight through.
+   "State holder for translating an ELP template body into Lisp source
+    text. Wraps a SOURCE (mmap- or string-backed) and accumulates
+    TRANSLATED-TEXT plus a POSITION-MAP as %DRAIN-TEMPLATE-BODY walks
+    it chunk by chunk.
 
-    POSITION-MAP records (READER-POS . SOURCE-BYTE) checkpoints, oldest
-    last (push to front). A checkpoint says: at the moment the reader
-    has consumed READER-POS chars, the next character will correspond
-    to SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
+    POSITION-MAP records (CHAR-POS . SOURCE-BYTE) checkpoints, oldest
+    last (push to front). A checkpoint says: at character position
+    CHAR-POS in TRANSLATED-TEXT, the next character corresponds to
+    SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
     regions with no source backing. The map is consumed by
     CLOSED-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
     the keys by the prefix length and stores the result for
@@ -437,47 +420,6 @@
                 (return (cons (synth-text-form source text-start text-end)
                               nil)))))))))))
 
-(defmethod sb-gray:stream-read-char ((s template-body-stream))
-  ;; Pushback always wins. Re-incrementing CHARS-READ is correct
-  ;; because UNREAD-CHAR decremented it.
-  (when-let ((pb (pushback s)))
-    (setf (pushback s) nil)
-    (incf (chars-read s))
-    (return-from sb-gray:stream-read-char pb))
-  (loop
-    (when (null (chunk s))
-      (let ((next (ts-next-chunk s)))
-        (when (eq next :eof)
-          (return-from sb-gray:stream-read-char :eof))
-        (setf (chunk s)     (car next)
-              (chunk-pos s) 0)
-        ;; The chunk's ANCHORS list enumerates transitions inside the
-        ;; chunk between source-anchored and synthesized regions. Each
-        ;; entry's CDR is either an integer source-byte or NIL. NIL
-        ;; ANCHORS means the whole chunk is synthesized — push one
-        ;; barrier at chunk start.
-        (let ((anchors (cdr next))
-            (base    (chars-read s)))
-          (cond
-            ((null anchors)
-             (ts-push-checkpoint s nil base))
-            (t
-             (dolist (cp anchors)
-               (ts-push-checkpoint s (cdr cp) (+ base (car cp)))))))))
-    (let ((str (chunk s))
-          (pos (chunk-pos s)))
-      (cond
-        ((>= pos (length str))
-         (setf (chunk s) nil))
-        (t
-         (incf (chunk-pos s))
-         (incf (chars-read s))
-         (return-from sb-gray:stream-read-char (char str pos)))))))
-
-(defmethod sb-gray:stream-unread-char ((s template-body-stream) char)
-  (setf (pushback s) char)
-  (decf (chars-read s))
-  nil)
 
 ;;;; ============================================================
 ;;;; Public translation interface — full lambda form with position map.
@@ -585,8 +527,8 @@
    here and inherits the guarantee."
   (open-source source)
   (unwind-protect
-       (let* ((inner (%drain-template-body-stream
-                      (make-instance 'template-body-stream :source source)))
+       (let* ((inner (%drain-template-body
+                      (make-instance 'template-body-translator :source source)))
               ;; Parse + walk for free variables. Must run while SOURCE
               ;; is still open — reader-error translation needs
               ;; SOURCE-LINE+COLUMN against the original file.
@@ -771,23 +713,39 @@
     (destructuring-bind (cp-doc . cp-src) cp
       (+ cp-doc (- source-byte cp-src)))))
 
-(defun %drain-template-body-stream (inner)
-  "Read all characters from INNER (a TEMPLATE-BODY-STREAM) into its
-   TRANSLATED-TEXT slot. Position-map populates as a side-effect of
-   the read-char calls. Returns INNER so the caller can chain.
-   After this runs, INNER's (SOURCE, TRANSLATED-TEXT, POSITION-MAP)
-   slots form a self-contained record of the body translation."
+(defun %drain-template-body (inner)
+  "Pull chunks from INNER (a TEMPLATE-BODY-TRANSLATOR) until :EOF,
+   writing each chunk's STRING into INNER's TRANSLATED-TEXT and
+   pushing its ANCHORS into POSITION-MAP at offsets relative to the
+   running total. Returns INNER so the caller can chain. After this
+   runs, INNER's (SOURCE, TRANSLATED-TEXT, POSITION-MAP) slots form
+   a self-contained record of the body translation."
   (let ((out (make-string-output-stream)))
-    (loop for c = (sb-gray:stream-read-char inner)
-          until (eq c :eof)
-          do (write-char c out))
+    (loop
+      (let ((next (ts-next-chunk inner)))
+        (when (eq next :eof) (return))
+        ;; ANCHORS enumerates transitions inside the chunk between
+        ;; source-anchored and synthesized regions. NIL ANCHORS means
+        ;; the whole chunk is synthesized — push one barrier at the
+        ;; chunk's start.
+        (let ((str     (car next))
+              (anchors (cdr next))
+              (base    (chars-read inner)))
+          (cond
+            ((null anchors)
+             (ts-push-checkpoint inner nil base))
+            (t
+             (dolist (cp anchors)
+               (ts-push-checkpoint inner (cdr cp) (+ base (car cp))))))
+          (write-string str out)
+          (incf (chars-read inner) (length str)))))
     (setf (translated-text inner) (get-output-stream-string out))
     inner))
 
-(declaim (ftype (function (template-body-stream) list) %template-free-vars))
+(declaim (ftype (function (template-body-translator) list) %template-free-vars))
 (defun %template-free-vars (inner)
   "Discover the template's free variables from a drained
-   TEMPLATE-BODY-STREAM. Two internal steps: parse INNER's
+   TEMPLATE-BODY-TRANSLATOR. Two internal steps: parse INNER's
    captured text into a body sexp, then walk the sexp in a candidate
    that mirrors the runtime wrapper's lexical scope (so wrapper-
    introduced names ELP::PTR / SIZE / FD / SOURCE aren't classified as
@@ -809,7 +767,7 @@
               ((or reader-error end-of-file) (c)
                 ;; Walk INNER's position-map directly — same lookup
                 ;; DOC-OFFSET->SOURCE-BYTE does on the outer, but the
-                ;; inner stream is internal and doesn't get the public
+                ;; translator is internal and doesn't get the public
                 ;; generic. Position-map keys are newest-first, so the
                 ;; first entry with key <= reader-pos is the chunk.
                 (let* ((reader-pos (file-position in))
