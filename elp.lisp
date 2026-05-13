@@ -162,27 +162,45 @@
        (write-string (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
                      stream)))))
 
-;;;; Chunked codegen: template-body-translator
+;;;; Tokenization + translation: TOKEN, ANCHOR, TRANSLATION, TEMPLATE-BODY-TRANSLATOR
 ;;;;
-;;;; A plain state holder around an mmap'd (or string-backed) template
-;;;; region. NEXT-CHUNK is a straight-line state machine: it looks at
-;;;; the byte at CURSOR and produces *one* chunk for the next
-;;;; syntactic unit (text-up-to-tag, plain <% %>, expr <%= %>,
-;;;; comment <%# %>, or trailing text), or :EOF when CURSOR has
-;;;; reached SIZE. A chunk is a cons
-;;;;   (STRING . ANCHORS)
-;;;; where STRING is the translated characters for the unit and
-;;;; ANCHORS is a list of (CHUNK-OFFSET . SOURCE-BYTE-OR-NIL)
-;;;; checkpoints in increasing offset order. Bodies of <% ... %> and
-;;;; <%= ... %> are materialized once (SOURCE-SUBSTRING) and
-;;;; concatenated with their wrappers into the chunk's STRING. NIL
-;;;; ANCHORS means the whole chunk is synthesized. Comments and
-;;;; whitespace-only <%= %> tags yield no chunk; NEXT-CHUNK loops
-;;;; internally to skip over them.
+;;;; A template body is split into a stream of TOKENs (NEXT-TOKEN). Each
+;;;; token covers one syntactic unit of the source: a literal :TEXT run,
+;;;; a :CODE / :EXPR / :COMMENT tag body, etc., addressed by a byte
+;;;; range in the source.
 ;;;;
-;;;; %DRAIN-TEMPLATE-BODY appends each chunk's STRING into the
-;;;; translator's TRANSLATED-TEXT and pushes its ANCHORS into
-;;;; POSITION-MAP at offsets relative to total chars written so far.
+;;;; TRANSLATE-TOKEN turns one token into a TRANSLATION — the Lisp
+;;;; source characters that token emits plus the ANCHORs needed to map
+;;;; positions in the emitted text back to source bytes. Returns NIL
+;;;; for tokens that translate to nothing (comments, whitespace-only
+;;;; <%= %>).
+;;;;
+;;;; %DRAIN-TEMPLATE-BODY walks NEXT-TOKEN→TRANSLATE-TOKEN in a single
+;;;; loop, appending each translation's TEXT into the translator's
+;;;; TRANSLATED-TEXT and pushing each ANCHOR into POSITION-MAP at
+;;;; (CHARS-READ + ANCHOR-OFFSET).
+
+(defstruct (token (:constructor token (kind start end)))
+  "One syntactic unit in the source: KIND ∈ {:text :code :expr
+   :comment}; START and END are inclusive/exclusive byte offsets of
+   the unit's payload (the literal text run, or the tag body excluding
+   delimiters). Produced by NEXT-TOKEN; consumed by TRANSLATE-TOKEN."
+  kind start end)
+
+(defstruct (anchor (:constructor anchor (offset source-byte)))
+  "Checkpoint inside a translation's TEXT. At character OFFSET into
+   that text, the next character corresponds to SOURCE-BYTE in the
+   source — or no source byte (SOURCE-BYTE = NIL) for synthesized
+   regions (text-emit wrappers, expr-prefix FORMAT call, trailing
+   delimiter spaces)."
+  offset source-byte)
+
+(defstruct (translation (:constructor translation (text anchors)))
+  "What one TOKEN emits: TEXT is the Lisp source characters, ANCHORS
+   is a list of ANCHOR ordered by OFFSET. ANCHORS always starts at
+   offset 0 so the translation's source-anchored state at its first
+   character is explicit."
+  text anchors)
 
 (defclass template-body-translator ()
   ((source          :initarg :source     :reader   source
@@ -190,14 +208,14 @@
                     extraction / text-emit codegen dispatches through
                     the SOURCE protocol.")
    (cursor          :initform 0          :accessor cursor
-    :documentation "Next source byte NEXT-CHUNK will look at.")
+    :documentation "Next source byte NEXT-TOKEN will look at.")
    (inside-code     :initform nil        :accessor inside-code
-    :documentation "T iff CURSOR sits past `<%` and the next NEXT-CHUNK
+    :documentation "T iff CURSOR sits past `<%` and the next NEXT-TOKEN
                     call should parse a tag rather than scan for one.")
    (chars-read      :initform 0          :accessor chars-read
     :documentation "Total characters written into TRANSLATED-TEXT so
                     far. Used as the base offset when pushing
-                    position-map checkpoints for the next chunk.")
+                    position-map checkpoints for the next token.")
    (position-map    :initform '()        :accessor position-map)
    (translated-text :initform nil        :accessor translated-text
     :documentation "Concatenated translated character output, populated
@@ -209,16 +227,14 @@
    "State holder for translating an ELP template body into Lisp source
     text. Wraps a SOURCE (mmap- or string-backed) and accumulates
     TRANSLATED-TEXT plus a POSITION-MAP as %DRAIN-TEMPLATE-BODY walks
-    it chunk by chunk.
+    it token by token.
 
-    POSITION-MAP records (CHAR-POS . SOURCE-BYTE) checkpoints, oldest
-    last (push to front). A checkpoint says: at character position
-    CHAR-POS in TRANSLATED-TEXT, the next character corresponds to
-    SOURCE-BYTE in the source. NIL SOURCE-BYTE marks synthesized
-    regions with no source backing. The map is consumed by
-    CLOSED-TEMPLATE's INITIALIZE-INSTANCE :AFTER, which shifts
-    the keys by the prefix length and stores the result for
-    DOC-OFFSET->SOURCE-BYTE / SOURCE-BYTE->DOC-OFFSET lookup."))
+    POSITION-MAP is a list of (CHAR-POS . SOURCE-BYTE) cons cells
+    (the storage form of ANCHOR after offset-shift), oldest last
+    (push to front). The map is consumed by CLOSED-TEMPLATE's
+    INITIALIZE-INSTANCE :AFTER, which shifts the keys by the prefix
+    length and stores the result for DOC-OFFSET->SOURCE-BYTE /
+    SOURCE-BYTE->DOC-OFFSET lookup."))
 
 (defun synth-text-form (source start end)
   "Source string for a literal-text span covering source bytes
@@ -322,103 +338,99 @@
        (1- close))
       (t close))))
 
-(defun ts-push-checkpoint (s anchor &optional (key (chars-read s)))
-  "Push (KEY . ANCHOR) onto S's POSITION-MAP unless it is already the
-   most recent entry. Checkpoints are pushed every time the source of
-   the next characters changes (text wrapper, code body, expr body).
+(defun push-anchor (s a base)
+  "Push ANCHOR A onto S's POSITION-MAP at key=(BASE + ANCHOR-OFFSET),
+   skipped if it would duplicate the most recent entry. Position-map
+   entries are stored as (CHAR-POS . SOURCE-BYTE) conses (the
+   storage form of an anchor after offset-shift)."
+  (let* ((entry (cons (+ base (anchor-offset a)) (anchor-source-byte a)))
+         (top   (car (position-map s))))
+    (unless (equal top entry)
+      (push entry (position-map s)))))
 
-   ANCHOR is either an integer source-byte (for chars that originated
-   in the .elp file) or NIL (for synthesized chars — text-emit
-   wrappers, the expr-prefix FORMAT call, the lambda signature, etc).
-   NIL-anchored checkpoints survive into the outer CLOSED-TEMPLATE
-   so DOC-OFFSET->SOURCE-BYTE can return NIL for those regions."
-  (let ((top (car (position-map s))))
-    (unless (equal top (cons key anchor))
-      (push (cons key anchor) (position-map s)))))
-
-(defun ts-parse-tag-chunk (s)
+(defun parse-tag-token (s)
   "Cursor sits just past the open delimiter (`<%` or `<%-`). Classify
-   by the byte at cursor (`=` expr / `#` comment / anything else
-   plain code), advance cursor past the closing `%>` (and one
+   the tag by the byte at cursor (`=` expr / `#` comment / anything
+   else plain code), advance cursor past the closing `%>` (and one
    trailing newline if `-%>`), clear INSIDE-CODE, and return the
-   chunk — or NIL for tags that emit nothing.
-
-   The chunk is (STRING . ANCHORS), where ANCHORS is a list of
-   (CHUNK-OFFSET . SOURCE-BYTE-OR-NIL) checkpoints in increasing
-   offset order. SOURCE-BYTE is an integer for chunk regions whose
-   bytes originated in the source; NIL marks synthesized regions
-   (text-emit wrappers, the FORMAT prefix on expr blocks, trailing
-   delimiter spaces). NIL ANCHORS means the whole chunk is synthesized."
+   TOKEN covering the body bytes (between delimiters)."
   (let* ((source     (source s))
          (size       (source-length source))
          (after-open (cursor s))
          (first      (and (< after-open size)
                           (source-byte source after-open)))
-         (flavor     (cond ((eql first (char-code #\=)) :expr)
+         (kind       (cond ((eql first (char-code #\=)) :expr)
                            ((eql first (char-code #\#)) :comment)
                            (t                           :code)))
-         (body-start (if (eq flavor :code) after-open (1+ after-open))))
+         (body-start (if (eq kind :code) after-open (1+ after-open))))
     (setf (cursor s) body-start)
     (let ((body-end (ts-find-code-end s)))
       (setf (inside-code s) nil)
-      (ecase flavor
-        (:comment nil)
-        (:code
-         ;; Body bytes followed by a synthesized delimiter space.
-         (let* ((body (source-substring source body-start body-end))
-                (body-len (length body)))
-           (cons (concatenate 'string body " ")
-                 `((0 . ,body-start)
-                   (,body-len . nil)))))
-        (:expr
-         ;; Whitespace-only <%= %> silently emits nothing — surfacing
-         ;; it would only produce a render-time FORMAT error with no
-         ;; obvious link back to the empty body. The FORMAT wrapper
-         ;; references elp::*current-template-span* for error
-         ;; reporting; the lambda wrapper provides that binding (real
-         ;; for render; stub for analysis).
-         (let* ((body (source-substring source body-start body-end))
-                (body-len (length body)))
-           (unless (cl-ppcre:scan *blank-rx* body)
-             (let* ((prefix (format nil
-                                    "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
-                                    body-start body-end))
-                    (prefix-len (length prefix)))
-               (cons (concatenate 'string prefix body ")) ")
-                     `((0 . nil)
-                       (,prefix-len . ,body-start)
-                       (,(+ prefix-len body-len) . nil)))))))))))
+      (token kind body-start body-end))))
 
-(defun ts-next-chunk (s)
-  "Parse the next syntactic unit at (TS-CURSOR S) and return its
-   chunk, or :EOF when CURSOR has reached SIZE. Dispatches on
+(defun next-token (s)
+  "Parse the next syntactic unit at (CURSOR S) and return its TOKEN,
+   or :EOF when CURSOR has reached source length. Dispatches on
    INSIDE-CODE: T means cursor sits past `<%` and the next unit is a
    tag; NIL means scan forward for the next tag, emitting any
-   leading text run as a chunk. Loops internally to skip units that
-   emit no chunk (comments, whitespace-only <%= %>, fully-trimmed
-   text runs)."
+   leading text run as a :TEXT token first. Empty text runs (the tag
+   abuts the cursor, or trim consumed the whole prefix) are skipped
+   so the caller never has to filter them — same goes for hitting
+   EOF mid-scan with no further tags but no trailing text either."
   (let ((source (source s)))
     (loop
       (when (>= (cursor s) (source-length source))
         (return :eof))
       (cond
         ((inside-code s)
-         (when-let ((c (ts-parse-tag-chunk s)))
-           (return c)))
+         (return (parse-tag-token s)))
         (t
          (let* ((text-start (cursor s))
                 (text-end   (ts-find-code-start s)))
            (cond
              ((eq text-end :eof)
-              ;; No more tags; trailing literal text to EOF.
-              (return (cons (synth-text-form source text-start
-                                             (source-length source))
-                            nil)))
+              (when (> (source-length source) text-start)
+                (return (token :text text-start (source-length source)))))
              (t
               (setf (inside-code s) t)
               (when (> text-end text-start)
-                (return (cons (synth-text-form source text-start text-end)
-                              nil)))))))))))
+                (return (token :text text-start text-end)))))))))))
+
+(defun translate-token (source tok)
+  "Translate one TOKEN to its TRANSLATION, or NIL if it emits nothing.
+   :TEXT tokens become a SOURCE-EMIT-TEXT-FORM call (synthesized text,
+   one anchor at offset 0 with NIL source-byte). :CODE tokens emit
+   the body bytes plus a synthesized trailing space. :EXPR tokens
+   wrap the body in a FORMAT call that records the source span in
+   ELP::*CURRENT-TEMPLATE-SPAN* for error reporting; whitespace-only
+   bodies are silently dropped (a render-time FORMAT error would
+   give no obvious link back to the empty body). :COMMENT tokens
+   emit nothing."
+  (let ((start (token-start tok))
+        (end   (token-end tok)))
+    (ecase (token-kind tok)
+      (:comment nil)
+      (:text
+       (translation (synth-text-form source start end)
+                    (list (anchor 0 nil))))
+      (:code
+       (let* ((body (source-substring source start end))
+              (body-len (length body)))
+         (translation (concatenate 'string body " ")
+                      (list (anchor 0 start)
+                            (anchor body-len nil)))))
+      (:expr
+       (let* ((body (source-substring source start end))
+              (body-len (length body)))
+         (unless (cl-ppcre:scan *blank-rx* body)
+           (let* ((prefix (format nil
+                                  "(let ((elp::*current-template-span* '(~D ~D))) (format t \"~~A\" "
+                                  start end))
+                  (prefix-len (length prefix)))
+             (translation (concatenate 'string prefix body ")) ")
+                          (list (anchor 0 nil)
+                                (anchor prefix-len start)
+                                (anchor (+ prefix-len body-len) nil))))))))))
 
 
 ;;;; ============================================================
@@ -714,31 +726,25 @@
       (+ cp-doc (- source-byte cp-src)))))
 
 (defun %drain-template-body (inner)
-  "Pull chunks from INNER (a TEMPLATE-BODY-TRANSLATOR) until :EOF,
-   writing each chunk's STRING into INNER's TRANSLATED-TEXT and
-   pushing its ANCHORS into POSITION-MAP at offsets relative to the
-   running total. Returns INNER so the caller can chain. After this
-   runs, INNER's (SOURCE, TRANSLATED-TEXT, POSITION-MAP) slots form
-   a self-contained record of the body translation."
-  (let ((out (make-string-output-stream)))
+  "Walk INNER (a TEMPLATE-BODY-TRANSLATOR) NEXT-TOKEN→TRANSLATE-TOKEN
+   until :EOF, writing each translation's TEXT into INNER's
+   TRANSLATED-TEXT and pushing each ANCHOR into POSITION-MAP at
+   (CHARS-READ + ANCHOR-OFFSET). Returns INNER so the caller can
+   chain. After this runs, INNER's (SOURCE, TRANSLATED-TEXT,
+   POSITION-MAP) slots form a self-contained record of the body
+   translation."
+  (let ((source (source inner))
+        (out    (make-string-output-stream)))
     (loop
-      (let ((next (ts-next-chunk inner)))
-        (when (eq next :eof) (return))
-        ;; ANCHORS enumerates transitions inside the chunk between
-        ;; source-anchored and synthesized regions. NIL ANCHORS means
-        ;; the whole chunk is synthesized — push one barrier at the
-        ;; chunk's start.
-        (let ((str     (car next))
-              (anchors (cdr next))
-              (base    (chars-read inner)))
-          (cond
-            ((null anchors)
-             (ts-push-checkpoint inner nil base))
-            (t
-             (dolist (cp anchors)
-               (ts-push-checkpoint inner (cdr cp) (+ base (car cp))))))
-          (write-string str out)
-          (incf (chars-read inner) (length str)))))
+      (let ((tok (next-token inner)))
+        (when (eq tok :eof) (return))
+        (when-let ((tr (translate-token source tok)))
+          (let ((base (chars-read inner))
+                (text (translation-text tr)))
+            (dolist (a (translation-anchors tr))
+              (push-anchor inner a base))
+            (write-string text out)
+            (incf (chars-read inner) (length text))))))
     (setf (translated-text inner) (get-output-stream-string out))
     inner))
 
@@ -769,7 +775,7 @@
                 ;; DOC-OFFSET->SOURCE-BYTE does on the outer, but the
                 ;; translator is internal and doesn't get the public
                 ;; generic. Position-map keys are newest-first, so the
-                ;; first entry with key <= reader-pos is the chunk.
+                ;; first entry with key <= reader-pos is the one we want.
                 (let* ((reader-pos (file-position in))
                        (cp (find-if (lambda (c) (<= (car c) reader-pos))
                                     (position-map inner)))
