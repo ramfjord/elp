@@ -484,6 +484,64 @@
       (is (null (find-lambda-key-list form))))))
 
 ;;;; ============================================================
+;;;; sexp-template — the bare emitter form, sits one layer below
+;;;; translated-template. Owns: source-wrap + handler-bind + inner
+;;;; translated chars; free-vars discovered during construction.
+;;;; Does NOT have a callable signature — its TEXT, when READ and
+;;;; evaluated, emits to current *standard-output* with free vars
+;;;; looked up in the caller's environment.
+
+(test sexp-template-text-reads-as-one-form
+  "sexp-template-text is a single READable Lisp form. The outer
+   shape is the source wrap (a LET for string-source, a
+   MULTIPLE-VALUE-BIND for mmap)."
+  (let* ((st (elp:translate-sexp
+              (elp:string-source "hi <%= who %>" :name "t.elp")))
+         (form (read-from-string (elp:sexp-template-text st))))
+    (is (consp form))
+    ;; string-source's wrap is (LET ((ELP::SOURCE …)) …).
+    (is (eq 'let (first form)))))
+
+(test sexp-template-free-vars-matches-template
+  "Free-vars discovery surfaces the same symbols the lambda-template
+   would expose as &key params."
+  (let ((st (elp:translate-sexp
+             (elp:string-source "Hi <%= name %>, age <%= age %>"))))
+    (is (equal (sort '(name age) #'string< :key #'symbol-name)
+               (sort (copy-list (elp:sexp-template-free-vars st))
+                     #'string< :key #'symbol-name)))))
+
+(test sexp-template-position-map-doc-relative
+  "Position-map keys index directly into sexp-template-text — picking
+   a char inside <%= name %> resolves back to a source byte in that
+   region of the .elp."
+  (let* ((st (elp:translate-sexp
+              (elp:string-source "x<%= name %>y")))
+         (text (elp:sexp-template-text st))
+         (anchored-doc
+          (loop for pos below (length text)
+                when (integerp (elp:doc-offset->source-byte st pos))
+                  return pos)))
+    (is (integerp anchored-doc))
+    (let* ((src (elp:doc-offset->source-byte st anchored-doc))
+           (round-trip (elp:source-byte->doc-offset st src)))
+      (is (integerp src))
+      (is (= anchored-doc round-trip)))))
+
+(test translated-template-wraps-sexp-template
+  "translated-template composes a sexp-template. Same source → both
+   layers see the same free-vars and the inner sexp-template-text is
+   embedded in translated-template-text."
+  (let* ((src-text "Hi <%= name %>!")
+         (tt (elp:translate-template (elp:string-source src-text)))
+         (inner (elp:translated-template-sexp tt)))
+    (is (typep inner 'elp:sexp-template))
+    (is (equal (elp:sexp-template-free-vars inner) '(name)))
+    (is (search (elp:sexp-template-text inner)
+                (elp:translated-template-text tt))
+        "translated-template-text must contain sexp-template-text verbatim")))
+
+;;;; ============================================================
 
 (defun run-tests ()
   "Run all ELP tests."

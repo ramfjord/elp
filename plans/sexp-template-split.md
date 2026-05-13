@@ -72,7 +72,7 @@ single reviewable diff.
    `elp-template-error` with the supplied display name (not the raw
    unbound-variable crash). Existing tests stay green.
 
-2. **Extract `sexp-template` class.** New class owning text,
+2. ✅ **Extract `sexp-template` class.** New class owning text,
    position-map, source-name, free-vars. Constructor eagerly drains
    a `template-body-stream`, applies `source-wrap-lambda-body`, and
    wraps the handler-bind inside that. Stream class becomes a
@@ -84,6 +84,24 @@ single reviewable diff.
    `sexp-template`, READ its text, and confirm free-vars and
    position-map match what `translated-template` produced on the
    same source.
+   **Decisions:**
+   - **`*print-circle*` must be NIL for sexp-template's PRIN1.** Each
+     layer PRIN1s separately, then their texts are concatenated. With
+     `*print-circle* T` the two outputs assign overlapping `#N=`
+     labels and the concatenated text fails to READ
+     ("multiply-defined label"). Lambda-template still needs
+     `*print-circle* T` to share supplied-p gensym labels across its
+     `&key` declaration and `unless` checks.
+   - **Two handler-binds instead of cross-layer splicing.**
+     Sexp-template owns the runtime-error handler-bind (needs
+     `elp::source` from source-wrap). Lambda-template adds its own
+     `(handler-bind ((unbound-variable …)))` outside sexp-template
+     to translate supplied-p check failures. Keeps the layer
+     boundary clean — no marker-splicing to insert lambda-template
+     prelude inside sexp-template's body.
+   - **Doc↔source methods on sexp-template duplicate the
+     translated-template body** — both will collapse onto a protocol
+     class in commit 4.
 
 3. **Rename `translated-template` → `lambda-template`; switch to
    composition.** Holds a `sexp-template` slot; constructor builds

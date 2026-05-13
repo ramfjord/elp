@@ -505,70 +505,157 @@
 ;;;; time; for static analysis the consumer reads the text, not runs
 ;;;; it.
 
-(defclass translated-template ()
-  ;; All three slots are populated by INITIALIZE-INSTANCE :AFTER from
-  ;; the :SOURCE initarg. Callers don't construct the inner stream,
-  ;; don't drive the drain, don't see the codegen pipeline — just hand
-  ;; the constructor a SOURCE and the resulting object is the
-  ;; materialized analysis lambda for that template.
+;;;; ============================================================
+;;;; SEXP-TEMPLATE — the bare emitter form.
+;;;;
+;;;; A SEXP-TEMPLATE owns the translated template body wrapped in:
+;;;;   1. SOURCE-WRAP-LAMBDA-BODY (binds ELP::SOURCE, plus ELP::PTR
+;;;;      etc. for mmap backends so text-emits can dispatch).
+;;;;   2. A HANDLER-BIND that translates runtime conditions inside
+;;;;      the template body into ELP-TEMPLATE-ERROR using
+;;;;      *CURRENT-TEMPLATE-SPAN* for source line/column.
+;;;;
+;;;; Its TEXT, when READ and evaluated, emits the rendered template
+;;;; to whatever *STANDARD-OUTPUT* is currently bound to — given
+;;;; bindings for the template's free variables. There is no
+;;;; callable signature: free vars are looked up in the calling
+;;;; environment. Missing-binding detection lives one layer up at
+;;;; LAMBDA-TEMPLATE; sexp-template is the surface a LSP wants
+;;;; (no synthetic &key shadowing of project-bound names).
+
+(defclass sexp-template ()
   ((text
-    :reader translated-template-text
-    :documentation "Full lambda text: synthesized prefix (signature,
-                    wrapper open, handler-bind, supplied-p checks) +
-                    translated inner-template chars (text-emit forms,
-                    code blocks, expr blocks) + synthesized suffix
-                    (closing parens, cleanup, (values)). Pass through
-                    READ-FROM-STRING to get the lambda sexp.")
+    :reader sexp-template-text
+    :documentation "PRIN1'd source-wrapped body. READable; evaluating
+                    it emits the rendered template to current
+                    *standard-output*, contingent on free vars being
+                    bound.")
    (position-map
     :reader position-map
     :documentation "Doc-offset-relative position-map — pre-shifted so
-                    keys directly index into TEXT. Anchored entries
-                    (integer CDR) cover their chunk; NIL CDR marks
-                    synthesized regions (the prefix, inter-block
-                    text-emit wrappers, the suffix).")
+                    keys directly index into TEXT.")
    (source-name
     :reader source-name
-    :documentation "Display name for the source (pathname for files,
-                    caller-supplied for strings). Retained for
-                    diagnostics."))
+    :documentation "Display name for the source.")
+   (free-vars
+    :reader sexp-template-free-vars
+    :documentation "List of symbols referenced free in the template
+                    body, in stable order (the order LAMBDA-TEMPLATE
+                    will turn into &key params)."))
   (:documentation
-   "Materialized analysis form for an ELP template: the wrapped
-    lambda's printed text bundled with a position-map that translates
-    document offsets back to source bytes. Built from a SOURCE via
-    TRANSLATE-TEMPLATE (or `(make-instance 'translated-template
-    :source source)` directly). DOC-OFFSET->SOURCE-BYTE and
-    SOURCE-BYTE->DOC-OFFSET specialize on this class for cursor
-    translation in both directions; NIL out for synthesized (non-
-    source-anchored) regions."))
+   "Translated template body: the inner translated chars wrapped in
+    the source-specific lexical context (ELP::SOURCE etc.) and
+    error-translating handler-bind. Construct via TRANSLATE-SEXP
+    (manages source lifecycle) or `(make-instance 'sexp-template
+    :source source)` directly (caller closes the source)."))
 
-(defmethod initialize-instance :after ((s translated-template) &key source)
-  "Run the codegen pipeline: drain a fresh TEMPLATE-BODY-STREAM over
-   SOURCE, walk for free variables, build the wrapped lambda sexp
-   with a body-splice marker, PRIN1 it, split the printed text on the
-   marker, and populate S's TEXT / POSITION-MAP / SOURCE-NAME slots
-   with the prefix + inner translation + suffix concatenated."
+(defmethod initialize-instance :after ((s sexp-template) &key source)
+  "Drain a fresh TEMPLATE-BODY-STREAM over SOURCE, walk for free
+   variables, build the source-wrap + handler-bind sexp around a
+   body-splice marker, PRIN1 it, splice the inner translated chars
+   in, and populate S's slots."
   (let* ((inner (%drain-template-body-stream
                  (make-instance 'template-body-stream :source source)))
          ;; Parse + walk for free variables. Must run while SOURCE is
          ;; still open — reader-error translation needs
-         ;; SOURCE-LINE+COLUMN against the original .elp file.
+         ;; SOURCE-LINE+COLUMN against the original file.
          (free-vars (%template-free-vars inner))
-         ;; One gensym per free var; each appears twice in the wrapped
-         ;; sexp (the &key declaration and the UNLESS check), and
-         ;; *PRINT-CIRCLE* T below makes the two prints share a #N=
-         ;; label.
+         ;; Uninterned sentinel marking where the inner chars splice.
+         (marker (make-symbol "ELP-SEXP-TEMPLATE-BODY-PLACEHOLDER"))
+         (wrapped-sexp
+          (source-wrap-lambda-body
+           source
+           `(handler-bind
+                ((elp-template-error (lambda (c) (error c)))
+                 (error
+                   (lambda (c)
+                     (multiple-value-bind (line col)
+                         (if *current-template-span*
+                             (source-line+column elp::source
+                                                 (first *current-template-span*))
+                             (values 1 1))
+                       (error 'elp-template-error
+                              :file (source-name elp::source)
+                              :line line :column col
+                              :original c)))))
+              ,marker)))
+         ;; *print-circle* NIL: SEXP-TEMPLATE has no twice-referenced
+         ;; gensyms, and the text is concatenated into LAMBDA-TEMPLATE's
+         ;; PRIN1 output — sharing labels (#N=) generated here would
+         ;; collide with labels generated there.
+         (text (let ((*print-pretty* nil)
+                     (*print-circle* nil)
+                     (*package*       (find-package :cl)))
+                 (prin1-to-string wrapped-sexp))))
+    (multiple-value-bind (prefix suffix)
+        (%split-text-on-marker text marker)
+      (let ((pl (length prefix)))
+        (setf (slot-value s 'text)
+              (concatenate 'string prefix (translated-text inner) suffix)
+              (slot-value s 'position-map)
+              (mapcar (lambda (cp)
+                        (destructuring-bind (body-pos . source-byte) cp
+                          (cons (+ pl body-pos) source-byte)))
+                      (position-map inner))
+              (slot-value s 'source-name)
+              (source-name source)
+              (slot-value s 'free-vars)
+              free-vars)))))
+
+(declaim (ftype (function (t) sexp-template) translate-sexp))
+(defun translate-sexp (source)
+  "Consume SOURCE and return a SEXP-TEMPLATE. Mirrors
+   TRANSLATE-TEMPLATE's source-lifecycle ownership: closes SOURCE on
+   return."
+  (unwind-protect
+       (make-instance 'sexp-template :source source)
+    (close-source source)))
+
+(defclass translated-template ()
+  ;; LAMBDA-TEMPLATE composition: holds a SEXP-TEMPLATE and adds the
+  ;; callable (LAMBDA (STREAM &KEY …)) wrapper plus supplied-p
+  ;; discipline. SEXP-TEMPLATE owns the source-wrap and the
+  ;; body-error handler-bind; this layer owns the kwargs interface
+  ;; and the missing-kwarg → ELP-TEMPLATE-ERROR translation.
+  ((sexp-template
+    :reader translated-template-sexp
+    :documentation "Inner SEXP-TEMPLATE — the bare emitter form this
+                    callable wraps.")
+   (text
+    :reader translated-template-text
+    :documentation "Full lambda text. Pass through READ-FROM-STRING
+                    to get the lambda sexp.")
+   (position-map
+    :reader position-map
+    :documentation "Doc-offset-relative position-map — pre-shifted so
+                    keys directly index into TEXT.")
+   (source-name
+    :reader source-name
+    :documentation "Display name for the source."))
+  (:documentation
+   "Materialized analysis lambda for an ELP template, built by
+    wrapping a SEXP-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
+    signature. Construct via TRANSLATE-TEMPLATE or `(make-instance
+    'translated-template :source source)`."))
+
+(defmethod initialize-instance :after ((s translated-template) &key source)
+  "Build the inner SEXP-TEMPLATE, then wrap with the kwarg signature,
+   *standard-output* let, and unbound-variable handler-bind that
+   covers the supplied-p checks. Splice the sexp-template's text in
+   at the body marker; shift its position-map by the prefix length."
+  (let* ((inner (make-instance 'sexp-template :source source))
+         (free-vars (sexp-template-free-vars inner))
+         (name (source-name inner))
          (supplied-p-vars
           (mapcar (lambda (v)
                     (gensym (format nil "~A-SUPPLIED-P-" v)))
                   free-vars))
-         ;; Uninterned sentinel marking where the body chars get
-         ;; spliced after PRIN1.
-         (marker (make-symbol "ELP-TEMPLATE-BODY-PLACEHOLDER"))
-         ;; The full wrapped lambda sexp. Per-source outer wrap (if
-         ;; any) comes from SOURCE-WRAP-LAMBDA-BODY. Free-var supplied-p
-         ;; checks live inside HANDLER-BIND so missing kwargs surface
-         ;; as ELP-TEMPLATE-ERROR with location instead of unwrapped
-         ;; UNBOUND-VARIABLE.
+         (marker (make-symbol "ELP-LAMBDA-TEMPLATE-BODY-PLACEHOLDER"))
+         ;; Outer wrap: lambda signature + *standard-output* rebind +
+         ;; handler-bind that translates supplied-p UNBOUND-VARIABLE
+         ;; into ELP-TEMPLATE-ERROR. Missing-kwarg errors come from
+         ;; outside any template span, so line/col are 1/1 and the
+         ;; source-name is spliced as a literal.
          (wrapped-sexp
           `(lambda (stream
                     &key ,@(mapcar (lambda (var supplied-p)
@@ -578,32 +665,19 @@
                                    free-vars supplied-p-vars)
                     &allow-other-keys)
              (let ((*standard-output* stream))
-               ,(source-wrap-lambda-body
-                 source
-                 `(handler-bind
-                      ((elp-template-error (lambda (c) (error c)))
-                       (error
-                         (lambda (c)
-                           (multiple-value-bind (line col)
-                               (if *current-template-span*
-                                   (source-line+column elp::source
-                                                       (first *current-template-span*))
-                                   (values 1 1))
-                             (error 'elp-template-error
-                                    :file (source-name elp::source)
-                                    :line line :column col
-                                    :original c)))))
-                    ,@(mapcar (lambda (var supplied-p)
-                                `(unless ,supplied-p
-                                   (error 'unbound-variable
-                                          :name ',var)))
-                              free-vars supplied-p-vars)
-                    ,marker)))
+               (handler-bind
+                   ((unbound-variable
+                      (lambda (c)
+                        (error 'elp-template-error
+                               :file ,name
+                               :line 1 :column 1
+                               :original c))))
+                 ,@(mapcar (lambda (var supplied-p)
+                             `(unless ,supplied-p
+                                (error 'unbound-variable :name ',var)))
+                           free-vars supplied-p-vars)
+                 ,marker))
              (values)))
-         ;; PRIN1 with *PACKAGE*=:CL so ELP-internal symbols print
-         ;; package-qualified (they aren't visible from :CL) and CL
-         ;; symbols stay bare. Without this, ELP helpers would print
-         ;; unqualified and intern in whatever package READ-back ran in.
          (text (let ((*print-pretty* nil)
                      (*print-circle* t)
                      (*package*       (find-package :cl)))
@@ -611,18 +685,15 @@
     (multiple-value-bind (prefix suffix)
         (%split-text-on-marker text marker)
       (let ((pl (length prefix)))
-        (setf (slot-value s 'text)
-              (concatenate 'string prefix (translated-text inner) suffix)
-              ;; Shift the inner position-map's body-relative keys to
-              ;; doc-relative by adding the prefix length. Now keys
-              ;; index directly into TEXT.
+        (setf (slot-value s 'sexp-template) inner
+              (slot-value s 'text)
+              (concatenate 'string prefix (sexp-template-text inner) suffix)
               (slot-value s 'position-map)
               (mapcar (lambda (cp)
                         (destructuring-bind (body-pos . source-byte) cp
                           (cons (+ pl body-pos) source-byte)))
                       (position-map inner))
-              (slot-value s 'source-name)
-              (source-name source))))))
+              (slot-value s 'source-name) name)))))
 
 ;;;; ============================================================
 ;;;; Reversible doc-offset ↔ source-byte mapping.
@@ -667,7 +738,22 @@
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
+(defmethod doc-offset->source-byte ((s sexp-template) doc-offset)
+  ;; Same lookup shape as TRANSLATED-TEMPLATE's method — these collapse
+  ;; into one method on the shared protocol class in a later commit.
+  (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
+                          (position-map s))))
+    (destructuring-bind (cp-doc . cp-src) cp
+      (when cp-src (+ cp-src (- doc-offset cp-doc))))))
+
 (defmethod source-byte->doc-offset ((s translated-template) source-byte)
+  (when-let ((cp (find-if (lambda (c)
+                            (and (integerp (cdr c)) (<= (cdr c) source-byte)))
+                          (position-map s))))
+    (destructuring-bind (cp-doc . cp-src) cp
+      (+ cp-doc (- source-byte cp-src)))))
+
+(defmethod source-byte->doc-offset ((s sexp-template) source-byte)
   (when-let ((cp (find-if (lambda (c)
                             (and (integerp (cdr c)) (<= (cdr c) source-byte)))
                           (position-map s))))
