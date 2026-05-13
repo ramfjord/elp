@@ -100,7 +100,7 @@
 ;;;; Compile-once / render-many: COMPILE-TEMPLATE returns a function,
 ;;;; reusable across calls with different kwargs.
 
-(declaim (ftype (function (t) function) compile-template))
+(declaim (ftype (function (source) function) compile-template))
 (defun compile-template (source)
   "Compile the template SOURCE and return a function of
    (STREAM &KEY var-1 var-2 … &ALLOW-OTHER-KEYS). The function may
@@ -118,7 +118,7 @@
   (compile nil (read-from-string
                 (closed-template-text (translate-closed source)))))
 
-(declaim (ftype (function (t stream &rest t) t) render))
+(declaim (ftype (function (source stream &rest t) t) render))
 (defun render (source stream &rest kwargs)
   "Compile SOURCE and render it to STREAM with KWARGS as the
    template's free-variable bindings.
@@ -588,7 +588,7 @@
                    free-vars))))
     (close-source source)))
 
-(declaim (ftype (function (t) open-template) translate-open))
+(declaim (ftype (function (source) open-template) translate-open))
 (defun translate-open (source)
   "Build an OPEN-TEMPLATE from SOURCE. One-liner alias for
    `(make-instance 'open-template :source source)`. The constructor
@@ -812,7 +812,7 @@
     (values (subseq text 0 split)
             (subseq text (+ split (length marker-text))))))
 
-(declaim (ftype (function (t) closed-template) translate-closed))
+(declaim (ftype (function (source) closed-template) translate-closed))
 (defun translate-closed (source)
   "Build a CLOSED-TEMPLATE from SOURCE — the analysis lambda's text
    plus a position-map. One-liner alias for `(make-instance
