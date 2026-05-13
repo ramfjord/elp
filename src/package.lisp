@@ -35,6 +35,11 @@
    ;;   LAMBDA-TEMPLATE — composes a SEXP-TEMPLATE and adds the
    ;;                     callable (lambda (stream &key …)) wrapper
    ;;                     with supplied-p discipline; the render surface.
+   ;; Shared protocol — TEMPLATE-TEXT, TEMPLATE-FORM, and the
+   ;; DOC↔SOURCE generics work on either subclass.
+   :template
+   :template-text
+   :template-form
    :translate-template
    :lambda-template
    :lambda-template-text
@@ -44,10 +49,4 @@
    :sexp-template-text
    :sexp-template-free-vars
    :doc-offset->source-byte
-   :source-byte->doc-offset
-   ;; Deprecated aliases for the pre-split class name. Remove once
-   ;; downstream consumers (mediaserver render path, swank-elp)
-   ;; migrate to LAMBDA-TEMPLATE.
-   :translated-template
-   :translated-template-text
-   :translated-template-sexp))
+   :source-byte->doc-offset))

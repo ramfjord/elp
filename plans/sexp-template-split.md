@@ -128,13 +128,31 @@ single reviewable diff.
      consumer code reads naturally as "translate a template", not
      tied to the return class's name.
 
-4. **Protocol class + shared generics.** Introduce a small protocol
+4. ✅ **Protocol class + shared generics.** Introduce a small protocol
    class both implement. `template-text`, `template-form`, and the
    doc↔source generics live there. Compile-to-callable stays
    lambda-template-only. Update exports; retire the deprecated
    `translated-template` alias.
    *Verify:* `make test` green. Add tests that exercise the
    protocol generics polymorphically across both classes.
+   **Decisions:**
+   - **Protocol class uses shared slots, not pure abstract methods.**
+     `template` owns `text`, `position-map`, `source-name`;
+     subclasses re-list slot names just to add their own
+     class-specific readers (`sexp-template-text` etc.) — CLOS
+     slot inheritance merges the definitions onto one slot.
+     Constructors keep using `(setf (slot-value s 'text) …)` and
+     it Just Works.
+   - **The deprecated `translated-template` alias was retired in
+     this commit, not held for a cycle.** A grep across the
+     mediaserver checkout showed zero downstream uses of the old
+     names, so there was nothing to migrate away from.
+   - **Test helper `template-form` had to be deleted.** It shadowed
+     the new `elp:template-form` GF via the test package's
+     `:use :elp`, redefining the fdefinition on the imported symbol
+     so all calls (including `elp:template-form`) hit the
+     test-local function that called `lambda-template-text`
+     directly. Replaced helper calls with `elp:template-form`.
 
 5. **Docs.** README.md, package docstrings, internal comments
    referencing the old single-class design. No code changes.

@@ -506,6 +506,45 @@
 ;;;; it.
 
 ;;;; ============================================================
+;;;; TEMPLATE — protocol class shared by SEXP-TEMPLATE and
+;;;; LAMBDA-TEMPLATE. Owns the three slots both layers carry:
+;;;; TEXT, POSITION-MAP, SOURCE-NAME. Not intended for direct
+;;;; instantiation; the subclasses fill the slots in their own
+;;;; INITIALIZE-INSTANCE :AFTER methods.
+
+(defclass template ()
+  ((text
+    :reader template-text
+    :documentation "PRIN1'd generated code, READable. Layer-specific
+                    contract:
+                      SEXP-TEMPLATE — emits to current
+                        *standard-output* when evaluated (given
+                        free-var bindings).
+                      LAMBDA-TEMPLATE — a (lambda (stream &key …))
+                        form ready for COMPILE.")
+   (position-map
+    :reader position-map
+    :documentation "Doc-offset-relative position-map — pre-shifted so
+                    keys directly index into TEXT.")
+   (source-name
+    :reader source-name
+    :documentation "Display name for the source."))
+  (:documentation
+   "Protocol class for ELP-generated template forms. Concrete
+    subclasses are SEXP-TEMPLATE (bare emitter form, LSP/analysis
+    surface) and LAMBDA-TEMPLATE (callable wrapper, render surface).
+    Shared generics live on this class; layer-specific contract
+    lives on the subclasses."))
+
+(defgeneric template-form (template)
+  (:documentation
+   "READ the template's text and return the resulting Lisp form.
+    Convenience over `(read-from-string (template-text template))`
+    so callers don't have to know TEXT is the canonical IR.")
+  (:method ((s template))
+    (read-from-string (template-text s))))
+
+;;;; ============================================================
 ;;;; SEXP-TEMPLATE — the bare emitter form.
 ;;;;
 ;;;; A SEXP-TEMPLATE owns the translated template body wrapped in:
@@ -523,20 +562,11 @@
 ;;;; LAMBDA-TEMPLATE; sexp-template is the surface a LSP wants
 ;;;; (no synthetic &key shadowing of project-bound names).
 
-(defclass sexp-template ()
-  ((text
-    :reader sexp-template-text
-    :documentation "PRIN1'd source-wrapped body. READable; evaluating
-                    it emits the rendered template to current
-                    *standard-output*, contingent on free vars being
-                    bound.")
-   (position-map
-    :reader position-map
-    :documentation "Doc-offset-relative position-map — pre-shifted so
-                    keys directly index into TEXT.")
-   (source-name
-    :reader source-name
-    :documentation "Display name for the source.")
+(defclass sexp-template (template)
+  ;; TEXT, POSITION-MAP, SOURCE-NAME inherited from TEMPLATE. Re-list
+  ;; TEXT only to add the subclass-specific reader SEXP-TEMPLATE-TEXT
+  ;; for callers that want the explicit name.
+  ((text :reader sexp-template-text)
    (free-vars
     :reader sexp-template-free-vars
     :documentation "List of symbols referenced free in the template
@@ -611,27 +641,19 @@
        (make-instance 'sexp-template :source source)
     (close-source source)))
 
-(defclass lambda-template ()
+(defclass lambda-template (template)
   ;; LAMBDA-TEMPLATE composition: holds a SEXP-TEMPLATE and adds the
   ;; callable (LAMBDA (STREAM &KEY …)) wrapper plus supplied-p
   ;; discipline. SEXP-TEMPLATE owns the source-wrap and the
   ;; body-error handler-bind; this layer owns the kwargs interface
   ;; and the missing-kwarg → ELP-TEMPLATE-ERROR translation.
-  ((sexp-template
+  ;;
+  ;; TEXT, POSITION-MAP, SOURCE-NAME inherited from TEMPLATE.
+  ((text :reader lambda-template-text)
+   (sexp-template
     :reader lambda-template-sexp
     :documentation "Inner SEXP-TEMPLATE — the bare emitter form this
-                    callable wraps.")
-   (text
-    :reader lambda-template-text
-    :documentation "Full lambda text. Pass through READ-FROM-STRING
-                    to get the lambda sexp.")
-   (position-map
-    :reader position-map
-    :documentation "Doc-offset-relative position-map — pre-shifted so
-                    keys directly index into TEXT.")
-   (source-name
-    :reader source-name
-    :documentation "Display name for the source."))
+                    callable wraps."))
   (:documentation
    "Materialized analysis lambda for an ELP template, built by
     wrapping a SEXP-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
@@ -730,30 +752,17 @@
 (defmethod doc-offset->source-byte ((s t) doc-offset) doc-offset)
 (defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
 
-(defmethod doc-offset->source-byte ((s lambda-template) doc-offset)
-  ;; Position-map keys are already doc-relative (shifted during
-  ;; construction). Direct lookup. NIL CDR marks synthesized regions.
+(defmethod doc-offset->source-byte ((s template) doc-offset)
+  ;; Single method on the protocol class — both SEXP-TEMPLATE and
+  ;; LAMBDA-TEMPLATE pre-shift their position-map keys to be
+  ;; doc-relative at construction, so the lookup is identical.
+  ;; NIL CDR marks synthesized regions.
   (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
                           (position-map s))))
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
-(defmethod doc-offset->source-byte ((s sexp-template) doc-offset)
-  ;; Same lookup shape as LAMBDA-TEMPLATE's method — these collapse
-  ;; into one method on the shared protocol class in a later commit.
-  (when-let ((cp (find-if (lambda (c) (<= (car c) doc-offset))
-                          (position-map s))))
-    (destructuring-bind (cp-doc . cp-src) cp
-      (when cp-src (+ cp-src (- doc-offset cp-doc))))))
-
-(defmethod source-byte->doc-offset ((s lambda-template) source-byte)
-  (when-let ((cp (find-if (lambda (c)
-                            (and (integerp (cdr c)) (<= (cdr c) source-byte)))
-                          (position-map s))))
-    (destructuring-bind (cp-doc . cp-src) cp
-      (+ cp-doc (- source-byte cp-src)))))
-
-(defmethod source-byte->doc-offset ((s sexp-template) source-byte)
+(defmethod source-byte->doc-offset ((s template) source-byte)
   (when-let ((cp (find-if (lambda (c)
                             (and (integerp (cdr c)) (<= (cdr c) source-byte)))
                           (position-map s))))
@@ -862,12 +871,4 @@
   (unwind-protect
        (make-instance 'lambda-template :source source)
     (close-source source)))
-
-;;;; Deprecated aliases — TRANSLATED-TEMPLATE was the original class
-;;;; name before the SEXP-TEMPLATE / LAMBDA-TEMPLATE split. Kept for
-;;;; one cycle so external callers don't break on rename; remove once
-;;;; downstream consumers (mediaserver render path, swank-elp) migrate.
-(setf (find-class 'translated-template) (find-class 'lambda-template))
-(setf (fdefinition 'translated-template-text) #'lambda-template-text)
-(setf (fdefinition 'translated-template-sexp) #'lambda-template-sexp)
 

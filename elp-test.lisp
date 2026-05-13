@@ -325,10 +325,6 @@
 ;;;; bytes, returning NIL for synthesized wrapper / text-emit chars.
 ;;;; The render path (RENDER / COMPILE-TEMPLATE) is unaffected.
 
-(defun template-form (tt)
-  "Read one Lisp form from TT's translated text."
-  (read-from-string (elp:lambda-template-text tt)))
-
 (defun find-lambda-key-list (form)
   "Given a (lambda (stream &key …) …) form, return the &key params'
    variable names. Handles both the analyze shape (bare symbols) and
@@ -356,7 +352,7 @@
    free variables; user symbols appear somewhere in the body."
   (with-template-file (p "Hi <%= name %>, age <%= age %>")
     (let* ((s (elp:translate-template (elp:filepath-source p)))
-           (form (template-form s)))
+           (form (elp:template-form s)))
       (is (eq 'lambda (first form)))
       (is (equal (sort (list 'age 'name) #'string< :key #'symbol-name)
                  (sort (copy-list (find-lambda-key-list form))
@@ -369,7 +365,7 @@
    the string's free variables. Text spans become inlined (write-string
    ...) calls — no on-disk file involved."
   (let* ((s (elp:translate-template (elp:string-source "hello <%= who %>")))
-         (form (template-form s)))
+         (form (elp:template-form s)))
     (is (eq 'lambda (first form)))
     (is (equal '(who) (find-lambda-key-list form)))
     (is (tree-find 'who form))
@@ -382,7 +378,7 @@
    engine uses."
   (with-template-file (p "<% (when active %>ON<% ) %>")
     (let* ((s (elp:translate-template (elp:filepath-source p)))
-           (form (template-form s))
+           (form (elp:template-form s))
            (when-form (labels ((walk (x)
                                  (cond ((atom x) nil)
                                        ((and (eq (first x) 'when)
@@ -472,7 +468,7 @@
   "Empty .elp yields a minimal lambda that drains and reads as a
    single LAMBDA form without raising."
   (with-template-file (p "")
-    (let ((form (template-form (elp:translate-template (elp:filepath-source p)))))
+    (let ((form (elp:template-form (elp:translate-template (elp:filepath-source p)))))
       (is (eq 'lambda (first form))))))
 
 (test translate-template-no-free-vars
@@ -480,7 +476,7 @@
    has no user-facing entries — just &allow-other-keys."
   (with-template-file (p "plain text only")
     (let* ((s (elp:translate-template (elp:filepath-source p)))
-           (form (template-form s)))
+           (form (elp:template-form s)))
       (is (null (find-lambda-key-list form))))))
 
 ;;;; ============================================================
@@ -541,20 +537,28 @@
                 (elp:lambda-template-text tt))
         "lambda-template-text must contain sexp-template-text verbatim")))
 
-(test translated-template-alias-still-works
-  "TRANSLATED-TEMPLATE survives as an alias for LAMBDA-TEMPLATE for
-   one cycle so downstream consumers (mediaserver render, swank-elp)
-   can migrate without breaking. Same class identity, same accessor
-   functions."
-  (let ((tt (elp:translate-template (elp:string-source "hi <%= who %>"))))
-    (is (typep tt 'elp:translated-template))
-    (is (typep tt 'elp:lambda-template))
-    (is (eq (find-class 'elp:translated-template)
-            (find-class 'elp:lambda-template)))
-    (is (equal (elp:translated-template-text tt)
-               (elp:lambda-template-text tt)))
-    (is (eq (elp:translated-template-sexp tt)
-            (elp:lambda-template-sexp tt)))))
+(test template-protocol-works-polymorphically
+  "TEMPLATE-TEXT, TEMPLATE-FORM, and the DOC↔SOURCE generics
+   dispatch on the shared TEMPLATE protocol class — same call site
+   works for both SEXP-TEMPLATE and LAMBDA-TEMPLATE."
+  (let ((st (elp:translate-sexp (elp:string-source "hi <%= who %>")))
+        (lt (elp:translate-template (elp:string-source "hi <%= who %>"))))
+    (is (typep st 'elp:template))
+    (is (typep lt 'elp:template))
+    ;; TEMPLATE-TEXT agrees with each layer's specific reader.
+    (is (equal (elp:template-text st) (elp:sexp-template-text st)))
+    (is (equal (elp:template-text lt) (elp:lambda-template-text lt)))
+    ;; TEMPLATE-FORM = (read-from-string (template-text …)).
+    (is (consp (elp:template-form st)))
+    (is (eq 'lambda (first (elp:template-form lt))))
+    ;; DOC↔SOURCE generics work on either subclass.
+    (let ((doc-pos (loop for pos below (length (elp:template-text st))
+                         when (integerp (elp:doc-offset->source-byte st pos))
+                           return pos)))
+      (is (integerp doc-pos))
+      (is (= doc-pos
+             (elp:source-byte->doc-offset
+              st (elp:doc-offset->source-byte st doc-pos)))))))
 
 ;;;; ============================================================
 
