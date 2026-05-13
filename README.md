@@ -256,13 +256,35 @@ automatically.
 
 **Two layers: `open-template` and `closed-template`**
 
-Translation runs in two composed steps. `open-template` carries the
-template body wrapped in just enough scaffolding to be evaluable
-(the source-specific lexical context plus the runtime-error
-handler-bind) — free variables stay as bare symbols, no keyword-arg
-signature shadowing them. `closed-template` wraps an open-template
-with the callable `(lambda (stream &key …))` signature and
-supplied-p discipline; it's what `compile-template` compiles.
+Translation runs in two composed steps, named by the standard PL
+distinction between *open terms* (formulas with free variables) and
+*closed terms* (formulas without).
+
+- **`open-template`** — the bare emitter form. Free variables in
+  the template body (`<%= name %>`) stay as bare symbols, resolved
+  by whatever lexical scope the caller evaluates the form inside.
+  Wrapped in just enough scaffolding to be evaluable: the
+  source-specific lexical context (`elp::source`, plus
+  `elp::ptr/size/fd` for mmap-source) and a handler-bind that
+  translates runtime errors into `elp-template-error` with source
+  line/column.
+- **`closed-template`** — wraps an open-template in a callable
+  `(lambda (stream &key var-1 var-2 …))` signature. Free variables
+  surface as keyword parameters; supplied-p discipline turns
+  missing kwargs into `elp-template-error` rather than silent NILs.
+  This is what `compile-template` compiles.
+
+The two are useful for different things:
+
+- **Closed** is the default for rendering — pass it kwargs, get
+  output. Self-contained and reusable.
+- **Open** is the surface for static analysis (LSPs, walkers) and
+  for embedding the body inside a host form that already binds the
+  right symbols. Because free vars stay as bare symbols rather than
+  keyword params, an editor's go-to-def lands on whatever the host
+  project's lexical scope binds those names to (e.g., a
+  `loop-services` macro that locally binds service fields),
+  instead of bottoming out at a synthesized `&key` parameter.
 
 Both implement a shared `template` protocol:
 
