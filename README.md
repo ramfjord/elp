@@ -254,41 +254,55 @@ Releases any OS resources the source holds. Idempotent; no-op on
 `render` / `compile-template` / `translate-template` do it
 automatically.
 
-**`(translate-template source)` → `translated-template`**
+**Two layers: `sexp-template` and `lambda-template`**
 
-Returns a `translated-template` object holding the complete
-`(lambda (stream &key …) …)` form that `compile-template` would
-compile, as text, plus a position-map for cursor translation. In
-fact, `compile-template` is literally
-`(compile nil (read-from-string (translated-template-text
-(translate-template source))))` — the translated-template is the
+Translation runs in two composed steps. `sexp-template` carries the
+template body wrapped in just enough scaffolding to be evaluable
+(the source-specific lexical context plus the runtime-error
+handler-bind) — free variables stay as bare symbols, no keyword-arg
+signature shadowing them. `lambda-template` wraps a sexp-template
+with the callable `(lambda (stream &key …))` signature and
+supplied-p discipline; it's what `compile-template` compiles.
+
+Both implement a shared `template` protocol:
+
+- **`(template-text t)`** — string. PRIN1'd generated code, READable.
+- **`(template-form t)`** — convenience: `(read-from-string (template-text t))`.
+- **`(doc-offset->source-byte t doc-offset)`** / **`(source-byte->doc-offset t source-byte)`**
+  — paired position mapping. Forward direction returns the
+  originating source byte (NIL for synthesized wrapper / delimiter /
+  text-emit territory). Reverse returns the document offset where
+  `source-byte` appears (NIL if the byte doesn't surface in the
+  document, e.g. inside a stripped `<%# comment %>`). Both default
+  to identity via T methods, so byte-equivalent translators get
+  no-op behavior for free.
+
+**`(translate-template source)` → `lambda-template`**
+
+Returns the callable lambda surface. `compile-template` is literally
+`(compile nil (read-from-string (lambda-template-text
+(translate-template source))))` — the lambda-template is the
 canonical surface; the compiled function is one `read-from-string` +
 `compile` away.
 
-**`(translated-template-text tt)` → string**
+**`(translate-sexp source)` → `sexp-template`**
 
-The full lambda text. For static analysis (Lisp walkers, LSPs),
-paste this into a document buffer and walk the form. The mapping
-between document text and source bytes is a paired protocol — two
-generics, each direction:
-
-- **`(doc-offset->source-byte tt doc-offset)`** — forward. Returns
-  the originating source byte, or NIL if `doc-offset` lies in
-  synthesized wrapper / delimiter / text-emit territory.
-- **`(source-byte->doc-offset tt source-byte)`** — reverse.
-  Returns the document offset where `source-byte` appears, or NIL if
-  the byte doesn't surface in the document (e.g. inside a stripped
-  `<%# comment %>`).
-
-Both default to identity via T methods, so translators that produce
-byte-equivalent canvases (source and document offsets coincide) get
-no-op behavior without writing any methods.
+Returns the bare emitter surface — same source, one fewer wrap.
+Useful for Lisp LSPs / static analyzers that want template-body
+references (`<%= name %>`) to resolve to whatever lexical scope the
+host project provides, instead of being shadowed by a synthesized
+`&key` parameter.
 
 ```lisp
 (let ((tt (translate-template (filepath-source #p"foo.elp"))))
-  (translated-template-text tt)      ; → "(lambda (stream &key name) …)"
-  (doc-offset->source-byte tt 42)    ; → 17 (or NIL)
-  (source-byte->doc-offset tt 17))   ; → 42 (or NIL)
+  (template-text tt)               ; → "(lambda (stream &key name) …)"
+  (lambda-template-sexp tt)        ; → #<sexp-template …>
+  (doc-offset->source-byte tt 42)  ; → 17 (or NIL)
+  (source-byte->doc-offset tt 17)) ; → 42 (or NIL)
+
+(let ((st (translate-sexp (filepath-source #p"foo.elp"))))
+  (template-text st)               ; → "(let ((elp::source …)) (handler-bind …))"
+  (sexp-template-free-vars st))    ; → (NAME)
 ```
 
 ### Errors
@@ -325,7 +339,7 @@ Or load directly:
 
 ## Implementation Notes
 
-### One stream, one materialized result
+### One stream, two materialized layers
 
 A `template-body-stream` is a Gray input stream wrapped around a
 source (mmap-source or string-source). It synthesizes a continuous
@@ -338,15 +352,28 @@ string-source — inlined); `<%= … %>` blocks become
 checkpoints accumulate at chunk transitions, mapping
 character-positions to source bytes.
 
-The `translated-template` object holds the **materialized** result:
-the body-stream is drained into a string, spliced between a
-synthesized prefix (lambda signature, per-source outer wrap —
-`multiple-value-bind` + `unwind-protect` for mmap-source, identity
-for string-source — `handler-bind` for error translation, `&key`
-supplied-p checks) and suffix (closing parens, cleanup, `(values)`).
-The position-map's keys shift by the prefix length so they index
-directly into the final text. `compile-template` is then a one-line
-`read-from-string` + `compile` over `translated-template-text`.
+The drain feeds two composed layers:
+
+- **`sexp-template`** wraps the inner chars in
+  `source-wrap-lambda-body` (binds `elp::source`, plus
+  `elp::ptr/size/fd` for mmap-source) and a `handler-bind` that
+  translates runtime errors inside the body into
+  `elp-template-error` with source line/column from
+  `*current-template-span*`. Its text, when READ and evaluated,
+  emits to current `*standard-output*` given free-var bindings.
+- **`lambda-template`** wraps a sexp-template in
+  `(lambda (stream &key …) (let ((*standard-output* stream)) …))`
+  with one supplied-p check per free variable and an outer
+  `handler-bind` that translates missing-kwarg `unbound-variable`
+  errors into `elp-template-error`. `compile-template` is then a
+  one-line `read-from-string` + `compile` over `template-text`.
+
+Each layer pre-shifts its inner position-map by the prefix length
+its outer text adds, so position-map keys always index directly
+into that layer's text. The two `handler-bind`s split cleanly by
+responsibility: sexp-template's catches body-runtime errors (needs
+`elp::source` in scope); lambda-template's catches supplied-p
+unbound-variables (no template span; line/col=1/1).
 
 ### Source protocol
 
@@ -389,9 +416,9 @@ reader's stop position in the position-map, falling back to
 `source-line+column` for the line/col conversion (libc `memchr` for
 mmap-source — vectorized newline scan).
 
-The `translated-template` inherits the position-map for its body
-region (with keys shifted by the prefix length); prefix/suffix chars
-(synthesized wrapper) return NIL from `doc-offset->source-byte`.
-That's how an LSP turns a cursor in its translated buffer back into a
-source-file byte.
+Both `sexp-template` and `lambda-template` inherit the position-map
+for their body region (with keys shifted by each layer's prefix
+length); prefix/suffix chars (synthesized wrapper) return NIL from
+`doc-offset->source-byte`. That's how an LSP turns a cursor in its
+translated buffer back into a source-file byte.
 

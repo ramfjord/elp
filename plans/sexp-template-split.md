@@ -154,6 +154,12 @@ single reviewable diff.
      test-local function that called `lambda-template-text`
      directly. Replaced helper calls with `elp:template-form`.
 
-5. **Docs.** README.md, package docstrings, internal comments
+5. ✅ **Docs.** README.md, package docstrings, internal comments
    referencing the old single-class design. No code changes.
    *Verify:* spot-read rendered docs; `make test` green.
+   **Decisions:**
+   - Package.lisp inline comment for the two layers and the
+     in-code docstrings already landed alongside earlier commits;
+     this commit only touches README.md (the public-facing
+     translation API section and the implementation-notes section
+     "One stream, two materialized layers").
