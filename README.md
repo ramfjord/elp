@@ -144,7 +144,7 @@ bindings and let each template pick the subset it needs.
 
 ## Sources
 
-`render`, `compile-template`, and `translate-template` all take a
+`render`, `compile-template`, and `translate-closed` all take a
 **source** — an object that knows where to find the template bytes.
 Two backends, plus a path-dispatching convenience:
 
@@ -167,7 +167,7 @@ a descriptor, no IO. Resource acquisition happens via the
 `open-source` / `close-source` pair, idiomatically through the
 `with-open-source` macro. The template constructors do this
 internally, so callers usually just hand a source to
-`compile-template` / `render` / `translate-template` and ignore the
+`compile-template` / `render` / `translate-closed` and ignore the
 mechanics. The descriptor survives the call and can be reused for
 further template construction; nothing is "consumed."
 
@@ -255,7 +255,7 @@ name used in error messages.
 
 Releases any OS resources the source holds. Idempotent; no-op on
 `string-source`. Most callers don't invoke this directly —
-`render` / `compile-template` / `translate-template` do it
+`render` / `compile-template` / `translate-closed` do it
 automatically.
 
 **Two layers: `open-template` and `closed-template`**
@@ -303,11 +303,11 @@ Both implement a shared `template` protocol:
   to identity via T methods, so byte-equivalent translators get
   no-op behavior for free.
 
-**`(translate-template source)` → `closed-template`**
+**`(translate-closed source)` → `closed-template`**
 
 Returns the callable lambda surface. `compile-template` is literally
 `(compile nil (read-from-string (closed-template-text
-(translate-template source))))` — the closed-template is the
+(translate-closed source))))` — the closed-template is the
 canonical surface; the compiled function is one `read-from-string` +
 `compile` away.
 
@@ -320,7 +320,7 @@ host project provides, instead of being shadowed by a synthesized
 `&key` parameter.
 
 ```lisp
-(let ((tt (translate-template (filepath-source #p"foo.elp"))))
+(let ((tt (translate-closed (filepath-source #p"foo.elp"))))
   (template-text tt)               ; → "(lambda (stream &key name) …)"
   (closed-template-open tt)        ; → #<open-template …>
   (doc-offset->source-byte tt 42)  ; → 17 (or NIL)

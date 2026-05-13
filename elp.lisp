@@ -84,7 +84,7 @@
 ;;;; Two-step model:
 ;;;;   1. Build a SOURCE (see src/source.lisp for constructors).
 ;;;;   2. Hand it to RENDER (one-shot), COMPILE-TEMPLATE (reusable
-;;;;      function), or TRANSLATE-TEMPLATE (analysis lambda stream
+;;;;      function), or TRANSLATE-CLOSED (analysis lambda stream
 ;;;;      for static walkers / LSPs).
 ;;;;
 ;;;; All three drive the source's OPEN-SOURCE / CLOSE-SOURCE pair
@@ -110,13 +110,13 @@
    ELP-TEMPLATE-ERROR with the correct line/column. Extra keyword
    arguments are silently ignored.
 
-   Reads the lambda form from TRANSLATE-TEMPLATE's materialized text.
+   Reads the lambda form from TRANSLATE-CLOSED's materialized text.
    The translator opens SOURCE, drains it, and closes it; SOURCE may
    be reused for further calls. The compiled lambda is self-contained
    — runtime acquisition (if any) lives in the source's
    SOURCE-WRAP-LAMBDA-BODY."
   (compile nil (read-from-string
-                (closed-template-text (translate-template source)))))
+                (closed-template-text (translate-closed source)))))
 
 (declaim (ftype (function (t stream &rest t) t) render))
 (defun render (source stream &rest kwargs)
@@ -482,33 +482,22 @@
 ;;;; ============================================================
 ;;;; Public translation interface — full lambda form with position map.
 ;;;;
-;;;; TRANSLATE-TEMPLATE returns a CLOSED-TEMPLATE: a materialized
-;;;; analysis lambda form for the template — same body shape the
-;;;; render path produces, wrapped so a static walker / LSP sees every
-;;;; symbol as a real lexical or function reference. Bytes produced
-;;;; from the user's <% %> / <%= %> blocks are anchored;
-;;;; DOC-OFFSET->SOURCE-BYTE translates document offsets into source
-;;;; bytes (NIL for synthesized prefix/suffix/text-emit chars).
+;;;; Translation surface — two composed layers:
+;;;;   OPEN-TEMPLATE   — the body wrapped just enough to be evaluable
+;;;;                     (source-wrap + handler-bind). Free vars stay
+;;;;                     as bare symbols; the LSP/analysis surface.
+;;;;   CLOSED-TEMPLATE — wraps OPEN-TEMPLATE in a callable
+;;;;                     (lambda (stream &key …)) signature; the
+;;;;                     render surface, COMPILE-TEMPLATE-compatible.
 ;;;;
-;;;; The text + position-map travel together — a Lisp-LSP can paste
-;;;; CLOSED-TEMPLATE-TEXT into a document buffer and use the
-;;;; position-map for cursor translation, without knowing anything
-;;;; about ELP's internals.
-;;;;
-;;;; Implementation:
-;;;;   1. Accept a SOURCE (see src/source.lisp).
-;;;;   2. Drain a TEMPLATE-BODY-STREAM over that source to materialize
-;;;;      the inner body text + per-chunk position-map checkpoints.
-;;;;   3. Walk the parsed body sexp for free variables.
-;;;;   4. Synthesize an analysis lambda prefix (signature, wrapper
-;;;;      open, handler-bind, supplied-p checks) and suffix; splice
-;;;;      the inner body between them. Shift the inner position-map
-;;;;      keys by the prefix length so they index into the final text.
-;;;;
-;;;; The analysis lambda doesn't COMPILE+RUN usefully on its own —
-;;;; SOURCE-WRAP-LAMBDA-BODY's mmap mvb re-opens the source at render
-;;;; time; for static analysis the consumer reads the text, not runs
-;;;; it.
+;;;; Both share TEMPLATE — text + position-map + source-name + the
+;;;; DOC↔SOURCE generics. Body chars (from the user's <% %> / <%= %>
+;;;; blocks) carry DOC-OFFSET->SOURCE-BYTE anchors back to source
+;;;; bytes; wrapper chars (signature, handler-bind, etc.) return NIL.
+;;;; Each layer's text + position-map travel together — a Lisp-LSP
+;;;; can paste TEMPLATE-TEXT into a buffer and use the position-map
+;;;; for cursor translation, without knowing anything about ELP's
+;;;; internals.
 
 ;;;; ============================================================
 ;;;; TEMPLATE — protocol class shared by OPEN-TEMPLATE and
@@ -596,59 +585,54 @@
    here and inherits the guarantee."
   (open-source source)
   (unwind-protect
-       (%populate-open-template s source)
+       (let* ((inner (%drain-template-body-stream
+                      (make-instance 'template-body-stream :source source)))
+              ;; Parse + walk for free variables. Must run while SOURCE
+              ;; is still open — reader-error translation needs
+              ;; SOURCE-LINE+COLUMN against the original file.
+              (free-vars (%template-free-vars inner))
+              ;; Uninterned sentinel marking where the inner chars splice.
+              (marker (make-symbol "ELP-OPEN-TEMPLATE-BODY-PLACEHOLDER"))
+              (wrapped-sexp
+               (source-wrap-lambda-body
+                source
+                `(handler-bind
+                     ((elp-template-error (lambda (c) (error c)))
+                      (error
+                        (lambda (c)
+                          (multiple-value-bind (line col)
+                              (if *current-template-span*
+                                  (source-line+column elp::source
+                                                      (first *current-template-span*))
+                                  (values 1 1))
+                            (error 'elp-template-error
+                                   :file (source-name elp::source)
+                                   :line line :column col
+                                   :original c)))))
+                   ,marker)))
+              ;; *print-circle* NIL: OPEN-TEMPLATE has no twice-referenced
+              ;; gensyms, and the text is concatenated into CLOSED-TEMPLATE's
+              ;; PRIN1 output — sharing labels (#N=) generated here would
+              ;; collide with labels generated there.
+              (text (let ((*print-pretty* nil)
+                          (*print-circle* nil)
+                          (*package*       (find-package :cl)))
+                      (prin1-to-string wrapped-sexp))))
+         (multiple-value-bind (prefix suffix)
+             (%split-text-on-marker text marker)
+           (let ((pl (length prefix)))
+             (setf (slot-value s 'text)
+                   (concatenate 'string prefix (translated-text inner) suffix)
+                   (slot-value s 'position-map)
+                   (mapcar (lambda (cp)
+                             (destructuring-bind (body-pos . source-byte) cp
+                               (cons (+ pl body-pos) source-byte)))
+                           (position-map inner))
+                   (slot-value s 'source-name)
+                   (source-name source)
+                   (slot-value s 'free-vars)
+                   free-vars))))
     (close-source source)))
-
-(defun %populate-open-template (s source)
-  "Slot-filling helper for OPEN-TEMPLATE's INITIALIZE-INSTANCE :AFTER.
-   Pulled out as a defun so the unwind-protect form stays readable."
-  (let* ((inner (%drain-template-body-stream
-                 (make-instance 'template-body-stream :source source)))
-         ;; Parse + walk for free variables. Must run while SOURCE is
-         ;; still open — reader-error translation needs
-         ;; SOURCE-LINE+COLUMN against the original file.
-         (free-vars (%template-free-vars inner))
-         ;; Uninterned sentinel marking where the inner chars splice.
-         (marker (make-symbol "ELP-OPEN-TEMPLATE-BODY-PLACEHOLDER"))
-         (wrapped-sexp
-          (source-wrap-lambda-body
-           source
-           `(handler-bind
-                ((elp-template-error (lambda (c) (error c)))
-                 (error
-                   (lambda (c)
-                     (multiple-value-bind (line col)
-                         (if *current-template-span*
-                             (source-line+column elp::source
-                                                 (first *current-template-span*))
-                             (values 1 1))
-                       (error 'elp-template-error
-                              :file (source-name elp::source)
-                              :line line :column col
-                              :original c)))))
-              ,marker)))
-         ;; *print-circle* NIL: OPEN-TEMPLATE has no twice-referenced
-         ;; gensyms, and the text is concatenated into CLOSED-TEMPLATE's
-         ;; PRIN1 output — sharing labels (#N=) generated here would
-         ;; collide with labels generated there.
-         (text (let ((*print-pretty* nil)
-                     (*print-circle* nil)
-                     (*package*       (find-package :cl)))
-                 (prin1-to-string wrapped-sexp))))
-    (multiple-value-bind (prefix suffix)
-        (%split-text-on-marker text marker)
-      (let ((pl (length prefix)))
-        (setf (slot-value s 'text)
-              (concatenate 'string prefix (translated-text inner) suffix)
-              (slot-value s 'position-map)
-              (mapcar (lambda (cp)
-                        (destructuring-bind (body-pos . source-byte) cp
-                          (cons (+ pl body-pos) source-byte)))
-                      (position-map inner))
-              (slot-value s 'source-name)
-              (source-name source)
-              (slot-value s 'free-vars)
-              free-vars)))))
 
 (declaim (ftype (function (t) open-template) translate-open))
 (defun translate-open (source)
@@ -675,7 +659,7 @@
   (:documentation
    "Materialized analysis lambda for an ELP template, built by
     wrapping a OPEN-TEMPLATE in a callable (LAMBDA (STREAM &KEY …))
-    signature. Construct via TRANSLATE-TEMPLATE or `(make-instance
+    signature. Construct via TRANSLATE-CLOSED or `(make-instance
     'closed-template :source source)`."))
 
 (defmethod initialize-instance :after ((s closed-template) &key source)
@@ -864,17 +848,17 @@
     (values (subseq text 0 split)
             (subseq text (+ split (length marker-text))))))
 
-(declaim (ftype (function (t) closed-template) translate-template))
-(defun translate-template (source)
+(declaim (ftype (function (t) closed-template) translate-closed))
+(defun translate-closed (source)
   "Build a CLOSED-TEMPLATE from SOURCE — the analysis lambda's text
    plus a position-map. One-liner alias for `(make-instance
    'closed-template :source source)`; the inner OPEN-TEMPLATE
    constructor opens SOURCE, drains it, and closes it. SOURCE is
-   reusable across multiple TRANSLATE-TEMPLATE calls.
+   reusable across multiple TRANSLATE-CLOSED calls.
 
    COMPILE-TEMPLATE is literally
        (compile nil (read-from-string
-                     (closed-template-text (translate-template source))))
+                     (closed-template-text (translate-closed source))))
    — the closed-template is the canonical surface; the compiled
    function is one READ-FROM-STRING + COMPILE away.
 

@@ -123,7 +123,7 @@ single reviewable diff.
    - **Aliases use `(setf (find-class …))` + `(setf (fdefinition …))`
      rather than a subclass or deftype** — gives full transparency
      for `make-instance`, `typep`, accessor calls, all in one form.
-   - **Entry function `translate-template` was *not* renamed.** Its
+   - **Entry function `translate-closed` was *not* renamed.** Its
      return-type name changed, but the function name is fine —
      consumer code reads naturally as "translate a template", not
      tied to the return class's name.

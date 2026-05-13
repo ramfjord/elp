@@ -42,7 +42,7 @@
    :template
    :template-text
    :template-form
-   :translate-template
+   :translate-closed
    :closed-template
    :closed-template-text
    :closed-template-open

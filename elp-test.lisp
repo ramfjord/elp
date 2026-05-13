@@ -312,7 +312,7 @@
               ratio read-ms baseline-ms)))))))
 
 ;;;; ============================================================
-;;;; translate-template
+;;;; translate-closed
 ;;;;
 ;;;; Analysis lambda materialization. Driven by either MMAP-SOURCE or
 ;;;; STRING-SOURCE; the protocol abstracts the difference. Two facets
@@ -346,12 +346,12 @@
         ((atom tree) nil)
         (t (or (tree-find sym (car tree)) (tree-find sym (cdr tree))))))
 
-(test translate-template-shape
+(test translate-closed-shape
   "Returned stream drains to (lambda (stream &key …) (let stub-bindings
    (declare …) (progn …))). &key list contains exactly the template's
    free variables; user symbols appear somewhere in the body."
   (with-template-file (p "Hi <%= name %>, age <%= age %>")
-    (let* ((s (elp:translate-template (elp:filepath-source p)))
+    (let* ((s (elp:translate-closed (elp:filepath-source p)))
            (form (elp:template-form s)))
       (is (eq 'lambda (first form)))
       (is (equal (sort (list 'age 'name) #'string< :key #'symbol-name)
@@ -360,24 +360,24 @@
       (is (tree-find 'name form))
       (is (tree-find 'age form)))))
 
-(test translate-template-from-string-basic
+(test translate-closed-from-string-basic
   "STRING-SOURCE entry point produces a lambda whose &key list reflects
    the string's free variables. Text spans become inlined (write-string
    ...) calls — no on-disk file involved."
-  (let* ((s (elp:translate-template (elp:string-source "hello <%= who %>")))
+  (let* ((s (elp:translate-closed (elp:string-source "hello <%= who %>")))
          (form (elp:template-form s)))
     (is (eq 'lambda (first form)))
     (is (equal '(who) (find-lambda-key-list form)))
     (is (tree-find 'who form))
     (is (tree-find 'write-string form))))
 
-(test translate-template-spanning-paren
+(test translate-closed-spanning-paren
   "Spanning-paren constructs survive as one user form. <% (when active %>
    ON<% ) %> reads as a single (when active …) somewhere in the body,
    with the dangling-paren halves stitched by the same reader trick the
    engine uses."
   (with-template-file (p "<% (when active %>ON<% ) %>")
-    (let* ((s (elp:translate-template (elp:filepath-source p)))
+    (let* ((s (elp:translate-closed (elp:filepath-source p)))
            (form (elp:template-form s))
            (when-form (labels ((walk (x)
                                  (cond ((atom x) nil)
@@ -391,7 +391,7 @@
       (is (eq 'when (first when-form)))
       (is (eq 'active (second when-form))))))
 
-(test translate-template-doc->source-anchored-bytes
+(test translate-closed-doc->source-anchored-bytes
   "Body chars whose source is a <% %> or <%= %> block map to their
    original .elp byte. Walk every char of the drained stream and
    verify that anchored chars round-trip to bytes whose template
@@ -402,7 +402,7 @@
                                                   :element-type '(unsigned-byte 8))))
                              (read-sequence buf f)
                              buf)))
-           (tt (elp:translate-template (elp:filepath-source p)))
+           (tt (elp:translate-closed (elp:filepath-source p)))
            (text (elp:closed-template-text tt))
            (anchored-count 0))
       (loop for pos below (length text)
@@ -416,12 +416,12 @@
       ;; <%= %> delimiters were anchored.
       (is (>= anchored-count 4)))))
 
-(test translate-template-doc->source-synth-chars-nil
+(test translate-closed-doc->source-synth-chars-nil
   "Prefix chars (the (lambda …) signature, the (declare …), the (progn)
    opener) and inter-tag synthesized chars all return NIL from
    DOC-OFFSET->SOURCE-BYTE — they have no .elp source byte to point at."
   (with-template-file (p "x<%= name %>y")
-    (let* ((tt (elp:translate-template (elp:filepath-source p)))
+    (let* ((tt (elp:translate-closed (elp:filepath-source p)))
            (text (elp:closed-template-text tt))
            (results (loop for pos below (length text)
                           collect (cons pos (elp:doc-offset->source-byte tt pos)))))
@@ -437,13 +437,13 @@
       ;; Positions past EOF return NIL.
       (is (null (elp:doc-offset->source-byte tt (1+ (length text))))))))
 
-(test translate-template-source->doc-round-trip
+(test translate-closed-source->doc-round-trip
   "DOC-OFFSET->SOURCE-BYTE and SOURCE-BYTE->DOC-OFFSET form a
    reversible mapping for body chars: forward then reverse returns
    the same doc-offset. The pair is what swank-lsp uses for cursor
    translation in both directions."
   (with-template-file (p "x<%= name %>y")
-    (let* ((s (elp:translate-template (elp:filepath-source p)))
+    (let* ((s (elp:translate-closed (elp:filepath-source p)))
            ;; Pick an anchored doc offset by scanning forward.
            (anchored-doc
             (loop for pos from 0
@@ -464,18 +464,18 @@
   (is (= 42 (elp:doc-offset->source-byte :stub 42)))
   (is (= 17 (elp:source-byte->doc-offset :stub 17))))
 
-(test translate-template-empty-template
+(test translate-closed-empty-template
   "Empty .elp yields a minimal lambda that drains and reads as a
    single LAMBDA form without raising."
   (with-template-file (p "")
-    (let ((form (elp:template-form (elp:translate-template (elp:filepath-source p)))))
+    (let ((form (elp:template-form (elp:translate-closed (elp:filepath-source p)))))
       (is (eq 'lambda (first form))))))
 
-(test translate-template-no-free-vars
+(test translate-closed-no-free-vars
   "Template with no free variables yields a lambda whose &key list
    has no user-facing entries — just &allow-other-keys."
   (with-template-file (p "plain text only")
-    (let* ((s (elp:translate-template (elp:filepath-source p)))
+    (let* ((s (elp:translate-closed (elp:filepath-source p)))
            (form (elp:template-form s)))
       (is (null (find-lambda-key-list form))))))
 
@@ -529,7 +529,7 @@
    layers see the same free-vars and the inner open-template-text is
    embedded in closed-template-text."
   (let* ((src-text "Hi <%= name %>!")
-         (tt (elp:translate-template (elp:string-source src-text)))
+         (tt (elp:translate-closed (elp:string-source src-text)))
          (inner (elp:closed-template-open tt)))
     (is (typep inner 'elp:open-template))
     (is (equal (elp:open-template-free-vars inner) '(name)))
@@ -542,7 +542,7 @@
    dispatch on the shared TEMPLATE protocol class — same call site
    works for both OPEN-TEMPLATE and CLOSED-TEMPLATE."
   (let ((st (elp:translate-open (elp:string-source "hi <%= who %>")))
-        (lt (elp:translate-template (elp:string-source "hi <%= who %>"))))
+        (lt (elp:translate-closed (elp:string-source "hi <%= who %>"))))
     (is (typep st 'elp:template))
     (is (typep lt 'elp:template))
     ;; TEMPLATE-TEXT agrees with each layer's specific reader.
@@ -597,10 +597,10 @@
     (let* ((src (elp:filepath-source p))
            (fn-1 (compile nil (read-from-string
                                (elp:template-text
-                                (elp:translate-template src)))))
+                                (elp:translate-closed src)))))
            (fn-2 (compile nil (read-from-string
                                (elp:template-text
-                                (elp:translate-template src))))))
+                                (elp:translate-closed src))))))
       (is (equal "Hi Alice"
                  (with-output-to-string (s) (funcall fn-1 s :name "Alice"))))
       (is (equal "Hi Bob"
