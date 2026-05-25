@@ -22,11 +22,14 @@ $(LARGE_FIXTURE):
 
 test:
 	sbcl --non-interactive \
-	     --eval "(ql:quickload :fiveam)" \
+	     --eval "(ql:quickload '(:fiveam :drakma))" \
 	     --eval "(push #p\"$(CURDIR)/\" asdf:*central-registry*)" \
 	     --eval "(asdf:load-system :elp)" \
+	     --eval "(asdf:load-system :elp/server)" \
 	     --eval "(load \"elp-test.lisp\")" \
-	     --eval "(elp-test:run-tests)"
+	     --eval "(load \"elp-server-test.lisp\")" \
+	     --eval "(elp-test:run-tests)" \
+	     --eval "(elp-server-test:run-tests)"
 
 bin/elp: elp.lisp elp.asd cli.lisp
 	mkdir -p bin

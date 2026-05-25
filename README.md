@@ -469,3 +469,36 @@ length); prefix/suffix chars (synthesized wrapper) return NIL from
 `doc-offset->source-byte`. That's how an LSP turns a cursor in its
 translated buffer back into a source-file byte.
 
+## Long-lived server (`elp/server`)
+
+Opt-in subsystem that exposes ELP over HTTP, amortizing SBCL startup
+across many renders — useful when a build tool would otherwise spawn
+a fresh image per template. Depends on Hunchentoot; kept out of core
+`elp` so the standard system stays lean. Load and start:
+
+```lisp
+(asdf:load-system :elp/server)
+(elp.server:start-render-server :port 7890)
+(loop (sleep most-positive-fixnum))   ; keep the image alive
+```
+
+`POST /render` accepts `src` (filepath) or `text` (literal) and
+passes every other param through as a string-valued kwarg to the
+template. Rendered output is the response body, so clients consume
+it with a plain shell redirect:
+
+```sh
+curl -d src=/path/to/template.elp -d name=Alice -d age=30 \
+     http://localhost:7890/render > out.txt
+```
+
+`GET /health` returns `"OK"` so clients can probe liveness.
+
+Signaled conditions during render translate to HTTP 500 with
+`"ERR <message>"` as the body. The full render completes before any
+bytes leave the daemon, so HTTP status accurately reflects success
+or failure.
+
+The acceptor is multi-threaded by default — concurrent handler calls
+share the same image.
+

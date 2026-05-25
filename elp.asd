@@ -17,6 +17,12 @@
    (:file "cli" :depends-on ("elp")))
   :in-order-to ((test-op (test-op "elp/tests"))))
 
+(defsystem "elp/server"
+  :description "HTTP render daemon for ELP — long-lived process that renders templates on demand, avoiding per-template SBCL startup."
+  :depends-on ("elp" "hunchentoot")
+  :components
+  ((:module "src" :components ((:file "server")))))
+
 (defsystem "elp/tests"
   :description "Tests for ELP"
   :depends-on ("elp" "fiveam")
