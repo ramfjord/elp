@@ -1,0 +1,126 @@
+{
+  "name": "elp",
+  "displayName": "ELP Templates",
+  "description": "Syntax highlighting for ELP (ERB-style Common Lisp) templates",
+  "version": "0.2.0",
+  "publisher": "ramfjord",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ramfjord/elp"
+  },
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "elp",
+        "aliases": ["ELP", "elp"],
+        "extensions": [".elp"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "yaml",
+        "filenamePatterns": ["*.yml.elp", "*.yaml.elp"]
+      },
+      {
+        "id": "json",
+        "filenamePatterns": ["*.json.elp"]
+      },
+      {
+        "id": "shellscript",
+        "filenamePatterns": ["*.sh.elp", "*.bash.elp", "*.zsh.elp", "*.env.elp"]
+      },
+      {
+        "id": "makefile",
+        "filenamePatterns": ["Makefile.elp", "*.mk.elp"]
+      },
+      {
+        "id": "ini",
+        "filenamePatterns": [
+          "*.service.elp",
+          "*.timer.elp",
+          "*.socket.elp",
+          "*.mount.elp",
+          "*.path.elp",
+          "*.target.elp",
+          "*.ini.elp",
+          "*.conf.elp"
+        ]
+      },
+      {
+        "id": "dockerfile",
+        "filenamePatterns": ["Dockerfile.elp", "*.dockerfile.elp"]
+      },
+      {
+        "id": "python",
+        "filenamePatterns": ["*.py.elp"]
+      },
+      {
+        "id": "ruby",
+        "filenamePatterns": ["*.rb.elp"]
+      },
+      {
+        "id": "javascript",
+        "filenamePatterns": ["*.js.elp"]
+      },
+      {
+        "id": "typescript",
+        "filenamePatterns": ["*.ts.elp"]
+      },
+      {
+        "id": "css",
+        "filenamePatterns": ["*.css.elp"]
+      },
+      {
+        "id": "xml",
+        "filenamePatterns": ["*.xml.elp"]
+      },
+      {
+        "id": "html",
+        "filenamePatterns": ["*.html.elp", "*.htm.elp"]
+      },
+      {
+        "id": "markdown",
+        "filenamePatterns": ["*.md.elp"]
+      },
+      {
+        "id": "toml",
+        "filenamePatterns": ["*.toml.elp"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "elp",
+        "scopeName": "text.elp",
+        "path": "./syntaxes/elp.tmLanguage.json"
+      },
+      {
+        "scopeName": "elp.injection",
+        "path": "./syntaxes/elp-injection.tmLanguage.json",
+        "injectTo": [
+          "source.yaml",
+          "source.json",
+          "source.makefile",
+          "source.ini",
+          "source.shell",
+          "source.dockerfile",
+          "source.python",
+          "source.ruby",
+          "source.js",
+          "source.ts",
+          "source.css",
+          "source.toml",
+          "source.xml",
+          "text.xml",
+          "text.html.basic",
+          "text.html.derivative",
+          "text.html.markdown"
+        ]
+      }
+    ]
+  }
+}

@@ -1,14 +1,20 @@
 # ELP editor support
 
 Neovim is the reference setup — tree-sitter with full host-language
-injection, plus a regex syntax fallback. Emacs (30+) has parallel
-tree-sitter support sharing the same grammar.
+injection, plus a regex syntax fallback. Emacs (29+) and VS Code
+have first-cut support: tag highlighting, Common-Lisp inside the
+tags, and host-language highlighting outside the tags driven by
+the inner filename extension (`*.yml.elp` → yaml, `*.service.elp`
+→ ini, `Makefile.elp` → make, …). Hosts with no built-in grammar
+in that editor (notably caddy, nginx) fall through to plain text
+outside the tags.
 
 ```
 editor/
 ├── nvim/                      reference setup, full injection
-├── emacs/elp-ts-mode.el       treesit mode for `.elp' files
-└── tree-sitter-elp/           shared grammar (used by both)
+├── emacs/elp-ts-mode.el       minimal treesit mode (Emacs 29+)
+├── vscode/                    TextMate-grammar extension
+└── tree-sitter-elp/           shared grammar (used by nvim + emacs)
     ├── grammar.js             minimal ERB-subset grammar
     └── queries/highlights.scm parser-level highlights
 ```
@@ -193,8 +199,8 @@ become available across all your Emacs sessions, not just for ELP.
 silently skipped — that filename's outer text renders as plain
 text, but ELP tags and (if `commonlisp` is installed) Lisp inside
 them still highlight.  Some host languages have no upstream
-tree-sitter grammar at all; files with those extensions get
-plain-text outer content.
+tree-sitter grammar at all (notably caddy, nginx, and systemd
+units); files with those extensions get plain-text outer content.
 
 Verify:
 
@@ -224,4 +230,83 @@ on every symbol, and every paren as `@punctuation.bracket`.  These
 are kept at `treesit-font-lock-level` 4 (off at the default 3) so
 you don't get a sea of variable-faced symbols in templated calls
 where they wouldn't be useful.  Opt in with
-`(setq treesit-font-lock-level 4)` if you want them.
+`(setq treesit-font-lock-level 4)' if you want them.
+
+## VS Code
+
+VS Code doesn't use tree-sitter for syntax highlighting — it uses
+TextMate grammars. So `editor/vscode/` is a parallel implementation
+(not a port of the tree-sitter grammar): a small extension with two
+grammar files plus a `package.json` of filename associations.
+
+```
+vscode/
+├── package.json                              extension manifest +
+│                                             filename → host language map
+├── language-configuration.json               brackets, comment, auto-close
+└── syntaxes/
+    ├── elp.tmLanguage.json                   ELP tags + inline CL patterns
+    └── elp-injection.tmLanguage.json         injects ELP tags into host scopes
+```
+
+The model mirrors nvim's two-axis split:
+
+1. **Host outside the tags** — `package.json` maps filename
+   patterns to built-in VS Code languages: `*.yml.elp` → yaml,
+   `*.service.elp`/`*.timer.elp`/`*.path.elp`/`*.conf.elp` → ini,
+   `Makefile.elp` → makefile, `Dockerfile.elp` → dockerfile,
+   `*.json.elp` → json, `*.sh.elp` → shellscript, and the obvious
+   rest (py, rb, ts, js, css, toml, xml, html, md). The file
+   opens *as* the host language, so the host's grammar fontifies
+   everything outside the tags.
+2. **Tags + Lisp inside** — `elp-injection.tmLanguage.json` is an
+   injection grammar that overlays the `<% %>` / `<%= %>` /
+   `<%# %>` patterns on top of every supported host scope. Inside
+   the tags, `elp.tmLanguage.json` provides inline Common-Lisp
+   patterns (keywords, strings, `;` comments, parens, numbers,
+   common special forms / builtins, ELP helpers like
+   `for-service` and `loop-services`) — no Common-Lisp extension
+   dependency.
+
+Files with extensions outside the association list (`foo.elp`,
+`Caddyfile.elp`, `*.nginx.elp`) fall back to language ID `elp`:
+tags and Lisp inside them highlight, outer content stays plain.
+This matches the gap emacs has (no upstream tree-sitter grammar
+for caddy / nginx / systemd-unit).
+
+Install locally (no marketplace publish yet):
+
+```sh
+# from the elp checkout
+cd editor/vscode
+npm i -g @vscode/vsce
+vsce package          # produces elp-0.2.0.vsix
+code --install-extension elp-0.2.0.vsix
+```
+
+Or for live editing, symlink into VS Code's extensions dir:
+
+```sh
+ln -s "$PWD/editor/vscode" ~/.vscode/extensions/ramfjord.elp-0.2.0
+```
+
+Then reload VS Code (`Developer: Reload Window`).
+
+Verify:
+
+- A `*.yml.elp` file shows yaml language ID in the status bar;
+  yaml keys, scalars, and indentation get yaml colors; `<% %>` /
+  `<%= %>` tags are highlighted on top with CL inside them
+- A `*.service.elp` file shows ini; section headers and key=value
+  pairs get ini colors; tags overlay
+- A `foo.elp` file with no recognised inner extension shows ELP;
+  outer content is plain; tags + CL inside them still highlight
+- `:keyword` symbols and bare symbols inside tags get distinct
+  colors (keywords as constants, symbols as variables)
+
+To add a host mapping not covered out of the box, edit the
+`contributes.languages` list in `package.json` and add a
+`filenamePatterns` entry under the desired language ID. The
+injection grammar already targets the common host scopes; if the
+new host's scope isn't in `injectionSelector` / `injectTo`,
+extend both there too.

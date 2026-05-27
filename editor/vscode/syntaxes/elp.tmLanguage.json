@@ -1,0 +1,131 @@
+{
+  "name": "ELP",
+  "scopeName": "text.elp",
+  "patterns": [
+    { "include": "#comment-directive" },
+    { "include": "#output-directive" },
+    { "include": "#directive" }
+  ],
+  "repository": {
+    "tags": {
+      "patterns": [
+        { "include": "#comment-directive" },
+        { "include": "#output-directive" },
+        { "include": "#directive" }
+      ]
+    },
+    "comment-directive": {
+      "name": "comment.block.elp",
+      "begin": "<%-?#",
+      "end": "-?%>",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.comment.begin.elp" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.comment.end.elp" }
+      }
+    },
+    "output-directive": {
+      "begin": "(<%-?=)",
+      "end": "(-?%>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.section.embedded.begin.elp" }
+      },
+      "endCaptures": {
+        "1": { "name": "punctuation.section.embedded.end.elp" }
+      },
+      "name": "meta.embedded.line.elp",
+      "patterns": [
+        { "include": "#lisp" }
+      ]
+    },
+    "directive": {
+      "begin": "(<%-?)(?!#|=)",
+      "end": "(-?%>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.section.embedded.begin.elp" }
+      },
+      "endCaptures": {
+        "1": { "name": "punctuation.section.embedded.end.elp" }
+      },
+      "name": "meta.embedded.block.elp",
+      "patterns": [
+        { "include": "#lisp" }
+      ]
+    },
+    "lisp": {
+      "patterns": [
+        { "include": "#lisp-comment" },
+        { "include": "#lisp-string" },
+        { "include": "#lisp-number" },
+        { "include": "#lisp-keyword" },
+        { "include": "#lisp-quote" },
+        { "include": "#lisp-defun-name" },
+        { "include": "#lisp-special-form" },
+        { "include": "#lisp-elp-helper" },
+        { "include": "#lisp-builtin" },
+        { "include": "#lisp-constant" },
+        { "include": "#lisp-paren" },
+        { "include": "#lisp-symbol" }
+      ]
+    },
+    "lisp-comment": {
+      "name": "comment.line.semicolon.lisp",
+      "match": ";[^\\n]*"
+    },
+    "lisp-string": {
+      "name": "string.quoted.double.lisp",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.lisp",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "lisp-number": {
+      "name": "constant.numeric.lisp",
+      "match": "(?<![\\w-])[+-]?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?(?![\\w-])"
+    },
+    "lisp-keyword": {
+      "name": "constant.other.keyword.lisp",
+      "match": "(?<![\\w-]):[A-Za-z][\\w?!*+/<>=.-]*"
+    },
+    "lisp-quote": {
+      "name": "keyword.operator.quote.lisp",
+      "match": "['`,@#]"
+    },
+    "lisp-special-form": {
+      "name": "keyword.control.lisp",
+      "match": "(?<=\\()(?:defun|defmacro|defvar|defparameter|defconstant|defclass|defmethod|defgeneric|defpackage|in-package|let|let\\*|labels|flet|lambda|loop|do|do\\*|dolist|dotimes|if|when|unless|cond|case|ecase|typecase|progn|prog1|prog2|setf|setq|setq\\*|return|return-from|block|tagbody|go|handler-case|handler-bind|restart-case|unwind-protect|catch|throw|values|multiple-value-bind|multiple-value-list|destructuring-bind|with-slots|with-accessors|eval-when|macrolet|symbol-macrolet|declare|declaim|the|check-type|assert)(?![\\w?!*+/<>=.-])"
+    },
+    "lisp-elp-helper": {
+      "name": "support.function.elp.lisp",
+      "match": "(?<=\\()(?:for-service|loop-services|service-where|field|with-service-scope)(?![\\w?!*+/<>=.-])"
+    },
+    "lisp-builtin": {
+      "name": "support.function.lisp",
+      "match": "(?<=\\()(?:format|print|princ|prin1|write|write-string|write-line|read|read-from-string|car|cdr|cons|list|list\\*|append|nconc|reverse|nreverse|length|nth|nthcdr|first|second|third|fourth|fifth|last|butlast|elt|aref|svref|getf|gethash|assoc|member|find|find-if|find-if-not|position|position-if|count|count-if|mapcar|mapc|mapcan|maplist|mapcon|reduce|remove|remove-if|remove-if-not|delete|delete-if|delete-if-not|sort|stable-sort|funcall|apply|identity|complement|constantly|equal|equalp|eql|eq|null|atom|consp|listp|stringp|numberp|symbolp|keywordp|integerp|floatp|zerop|plusp|minusp|evenp|oddp|not|and|or|xor|\\+|-|\\*|/|=|/=|<|>|<=|>=|min|max|abs|mod|rem|floor|ceiling|round|truncate|incf|decf|push|pop|concatenate|string|symbol-name|symbol-value|symbol-package|intern|make-symbol|make-string|make-list|make-array|make-hash-table|coerce|typep|type-of|error|warn|signal|cerror|format|with-output-to-string|with-input-from-string|with-open-file|open|close|read-line|read-char|write-char|terpri|fresh-line|finish-output|force-output|getf|remf|substitute|substitute-if|subseq|search|string=|string-equal|string<|string>|string<=|string>=|string-upcase|string-downcase|string-capitalize|string-trim|char|schar)(?![\\w?!*+/<>=.-])"
+    },
+    "lisp-constant": {
+      "name": "constant.language.lisp",
+      "match": "(?<![\\w?!*+/<>=.-])(?:t|nil)(?![\\w?!*+/<>=.-])"
+    },
+    "lisp-defun-name": {
+      "match": "(?<=\\()(defun|defmacro|defvar|defparameter|defconstant|defclass|defmethod|defgeneric|defpackage)\\s+([\\w?!*+/<>=.-]+)",
+      "captures": {
+        "1": { "name": "keyword.control.lisp" },
+        "2": { "name": "entity.name.function.lisp" }
+      }
+    },
+    "lisp-paren": {
+      "name": "punctuation.section.parens.lisp",
+      "match": "[()]"
+    },
+    "lisp-symbol": {
+      "name": "variable.other.lisp",
+      "match": "[A-Za-z_][\\w?!*+/<>=.-]*"
+    }
+  }
+}

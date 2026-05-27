@@ -1,0 +1,7 @@
+{
+  "scopeName": "elp.injection",
+  "injectionSelector": "source.yaml, source.json, source.makefile, source.ini, source.shell, source.dockerfile, source.python, source.ruby, source.js, source.ts, source.css, source.toml, source.xml, text.xml, text.html.basic, text.html.derivative, text.html.markdown",
+  "patterns": [
+    { "include": "text.elp#tags" }
+  ]
+}
