@@ -26,6 +26,13 @@
 
 (require 'treesit)
 
+(defvar elp-ts-mode--root
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory containing this file, captured at load time.
+Used to locate the bundled `queries/' tree regardless of where the
+mode is later activated.  Computing this at activation time would
+pick up the user's `.elp' buffer's directory instead.")
+
 ;; Self-register the elp grammar source so users get
 ;; `M-x treesit-install-language-grammar RET elp' for free without
 ;; copying the URL into their own config.  Only adds the entry if
@@ -94,35 +101,135 @@ toml, lua, …) resolve via fallthrough — no entry needed."
    '((comment_directive (comment) @font-lock-comment-face)))
   "Font-lock rules for the ELP tags themselves.")
 
-(defun elp-ts-mode--commonlisp-font-lock-rules ()
-  "Minimal font-lock for Common Lisp inside <% %>.
-Targets the node names of the `theHamsta/tree-sitter-commonlisp'
-grammar.  No-op if that grammar isn't installed."
+;; nvim-treesitter capture names → Emacs font-lock faces.  Ordered
+;; longest-first so dotted forms (`@variable.builtin') get replaced
+;; before their bare prefixes (`@variable').
+(defconst elp-ts-mode--commonlisp-capture-map
+  '(("@variable.builtin"      . "@font-lock-variable-name-face")
+    ("@variable.parameter"    . "@font-lock-variable-name-face")
+    ("@variable"              . "@font-lock-variable-name-face")
+    ("@function.macro"        . "@font-lock-keyword-face")
+    ("@function.builtin"      . "@font-lock-builtin-face")
+    ("@function"              . "@font-lock-function-name-face")
+    ("@string.special.symbol" . "@font-lock-builtin-face")
+    ("@string.escape"         . "@font-lock-escape-face")
+    ("@string"                . "@font-lock-string-face")
+    ("@punctuation.special"   . "@font-lock-delimiter-face")
+    ("@punctuation.bracket"   . "@font-lock-bracket-face")
+    ("@constant.builtin"      . "@font-lock-constant-face")
+    ("@constant"              . "@font-lock-constant-face")
+    ("@number"                . "@font-lock-number-face")
+    ("@boolean"               . "@font-lock-constant-face")
+    ("@character"             . "@font-lock-constant-face")
+    ("@comment"               . "@font-lock-comment-face")
+    ("@module"                . "@font-lock-type-face")
+    ("@operator"              . "@font-lock-operator-face")
+    ("@type"                  . "@font-lock-type-face")
+    ;; `@spell' is an nvim concept (spell-check inside captures); we
+    ;; just strip it.  Tree-sitter accepts multi-tag captures so the
+    ;; remaining face still applies cleanly.
+    ("@spell"                 . "")))
+
+(defun elp-ts-mode--double-backslashes (s)
+  "Double every backslash in S.
+Tree-sitter's query string parser collapses `\\X' → `X' for
+unknown escapes, so to land a single `\\' at the regex engine we
+have to emit `\\\\' in the .scm source."
+  (replace-regexp-in-string "\\\\" "\\\\\\\\" s t t))
+
+(defun elp-ts-mode--any-of-to-match (s)
+  "Rewrite each `(#any-of? @CAP \"a\" \"b\" …)' in S to an
+equivalent `(#match? @CAP \"\\\\`\\\\(?:a\\\\|b\\\\|…\\\\)\\\\'\")'.
+Emacs treesit only supports `equal', `match', and `pred'
+predicates at query-execution time, even though it accepts
+`#any-of?' at compile-time as a no-op.  Backslashes are doubled
+because tree-sitter's string parser eats one level."
+  (with-temp-buffer
+    (insert s)
+    (goto-char (point-min))
+    (while (re-search-forward "(#any-of\\?[ \t\n]+" nil t)
+      (let ((open  (match-beginning 0))
+            (close (save-excursion
+                     (goto-char (match-beginning 0))
+                     (forward-list 1)
+                     (point))))
+        (re-search-forward "@\\([A-Za-z._-]+\\)" close)
+        (let ((cap (match-string 1))
+              strings)
+          (while (re-search-forward "\"\\([^\"]*\\)\"" close t)
+            (push (match-string 1) strings))
+          (let* ((quoted (mapcar (lambda (str)
+                                   (elp-ts-mode--double-backslashes
+                                    (regexp-quote str)))
+                                 (nreverse strings)))
+                 (alts (mapconcat #'identity quoted "\\\\|")))
+            (delete-region open close)
+            (goto-char open)
+            (insert (format "(#match? @%s \"\\\\`\\\\(?:%s\\\\)\\\\'\")"
+                            cap alts))))))
+    (buffer-string)))
+
+(defun elp-ts-mode--translate-commonlisp-query (s)
+  "Translate nvim-treesitter captures and predicates in S.
+Applies `elp-ts-mode--commonlisp-capture-map' longest-first,
+rewrites `#lua-match?' → `#match?' (the upstream's three lua
+patterns happen to be valid Emacs regex too), and expands
+`#any-of?' into a `#match?' alternation."
+  (let ((result s))
+    (dolist (mapping elp-ts-mode--commonlisp-capture-map)
+      (setq result (replace-regexp-in-string
+                    (regexp-quote (car mapping))
+                    (cdr mapping)
+                    result t t)))
+    (setq result (replace-regexp-in-string "#lua-match\\?" "#match?"
+                                           result t t))
+    ;; Upstream's lone PCRE-style #match? regex for operator-leading
+    ;; lists.  Convert to Emacs regex syntax (escape group/alternation).
+    (setq result (replace-regexp-in-string
+                  (regexp-quote "\"^([+*-+=<>]|<=|>=|/=)$\"")
+                  "\"\\\\`\\\\(?:[+*=<>]\\\\|<=\\\\|>=\\\\|/=\\\\)\\\\'\""
+                  result t t))
+    (elp-ts-mode--any-of-to-match result)))
+
+(defun elp-ts-mode--split-commonlisp-rules (body)
+  "Split BODY into (MAIN . NOISY) where NOISY carries the two
+catch-all rules whose default presence would over-paint Lisp
+regions: `(sym_lit) @variable' and `[\"(\" \")\"] @punctuation.bracket'.
+Falls back to leaving them in MAIN if upstream changes them."
+  (let ((noisy "")
+        (main body))
+    (when (string-match "^(sym_lit) @variable\n" main)
+      (setq noisy (concat noisy (match-string 0 main))
+            main (replace-match "" t t main)))
+    (when (string-match "\\[\n[ \t]*\"(\"\n[ \t]*\")\"\n\\] @punctuation\\.bracket\n"
+                        main)
+      (setq noisy (concat noisy "\n" (match-string 0 main))
+            main (replace-match "" t t main)))
+    (cons main noisy)))
+
+(defun elp-ts-mode--load-commonlisp-rules ()
+  "Build treesit font-lock rules from the vendored highlights.scm.
+Returns nil if the `commonlisp' grammar isn't available."
   (when (treesit-language-available-p 'commonlisp)
-    ;; `:override t' on every CL rule because templated `.elp' code
-    ;; often sits inside a host-language string scalar (yaml's
-    ;; (double_quote_scalar) node spans across our excluded tag
-    ;; ranges and would otherwise paint over the Lisp content).
-    (treesit-font-lock-rules
-     :language 'commonlisp
-     :feature 'comment
-     :override t
-     '((comment) @font-lock-comment-face)
-
-     :language 'commonlisp
-     :feature 'string
-     :override t
-     '((str_lit) @font-lock-string-face)
-
-     :language 'commonlisp
-     :feature 'number
-     :override t
-     '([(num_lit) (char_lit)] @font-lock-number-face)
-
-     :language 'commonlisp
-     :feature 'keyword
-     :override t
-     '((kwd_lit) @font-lock-builtin-face))))
+    (let* ((file (expand-file-name "queries/commonlisp/highlights.scm"
+                                    elp-ts-mode--root))
+           (body (with-temp-buffer
+                   (insert-file-contents file)
+                   (buffer-string)))
+           (split (elp-ts-mode--split-commonlisp-rules body))
+           (main  (elp-ts-mode--translate-commonlisp-query (car split)))
+           (noisy (elp-ts-mode--translate-commonlisp-query (cdr split))))
+      ;; `:override t' on both groups because templated `.elp' code
+      ;; often sits inside a host-language string scalar; yaml's
+      ;; (double_quote_scalar) node spans across our excluded tag
+      ;; ranges and would otherwise paint over the Lisp content.
+      (append
+       (treesit-font-lock-rules
+        :language 'commonlisp :feature 'commonlisp :override t main)
+       (when (> (length (string-trim noisy)) 0)
+         (treesit-font-lock-rules
+          :language 'commonlisp :feature 'commonlisp-noisy :override t
+          noisy))))))
 
 (defun elp-ts-mode--host-font-lock-rules (host)
   "Font-lock rules for HOST language.
@@ -141,11 +248,14 @@ highlighting without reimplementing it."
     (comment delimiter definition)
     ;; level 2: strings + keywords
     (string keyword constant number type)
-    ;; level 3: defaults
-    (property assignment bracket function variable misc-punctuation
-              escape-sequence)
-    ;; level 4: noisy
-    (error operator builtin))
+    ;; level 3: defaults — full Common Lisp coverage from vendored
+    ;; highlights.scm goes here so users at the default level 3 see
+    ;; defun-name highlighting, builtin/macro recognition, etc.
+    (commonlisp property assignment bracket function variable
+                misc-punctuation escape-sequence)
+    ;; level 4: noisy — sym_lit catch-all + every paren.  Opt in via
+    ;; `(setq treesit-font-lock-level 4)' if you want it.
+    (commonlisp-noisy error operator builtin))
   "Combined feature list for the ELP + embedded languages.
 Union of features we expect across hosts; per-language rules just
 ignore features they don't define.")
@@ -182,8 +292,12 @@ run M-x treesit-install-language-grammar"))
          (host-ready (and host (treesit-language-available-p host)))
          (ranges     (append
                       (when cl-ready
+                        ;; Shared (non-`:local') parser for commonlisp
+                        ;; across all (code) ranges — required for the
+                        ;; vendored highlights.scm rules to see a
+                        ;; persistent parser at fontification time.
                         (treesit-range-rules
-                         :embed 'commonlisp :host 'elp :local t
+                         :embed 'commonlisp :host 'elp
                          '((code) @cap)))
                       (when host-ready
                         ;; No `:local t' for the host — yaml/json/etc.
@@ -207,7 +321,7 @@ run M-x treesit-install-language-grammar"))
                       (and host-ready
                            (elp-ts-mode--host-font-lock-rules host))
                       (and cl-ready
-                           (elp-ts-mode--commonlisp-font-lock-rules))
+                           (elp-ts-mode--load-commonlisp-rules))
                       elp-ts-mode--elp-font-lock-rules)))
 
     (setq-local treesit-range-settings        ranges

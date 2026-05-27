@@ -202,13 +202,26 @@ Verify:
 - `M-x treesit-explore-mode` shows `template` / `directive` /
   `output_directive` / `comment_directive` nodes
 - `<% %>` delimiters get `font-lock-keyword-face`
-- Inside `<%= %>`: strings/numbers/`:keywords` get Lisp faces
+- Inside `<%= %>`: builtins (`mapcar`, `format`, …), special forms
+  (`defun`, `let`, `loop`, …), `loop` keywords, defun names,
+  parameters, `:keywords`, `*dynamic-vars*`, `+constants+`, strings
+  and numbers all get their respective Lisp faces
 - Outside: yaml keys, JSON keys, etc. get their host-mode faces
 
-**Common Lisp font-lock is intentionally minimal** (strings,
-numbers, comments, `:keywords`) because no `commonlisp-ts-mode`
-ships in Emacs, so there's no `--font-lock-settings` to lift —
-unlike yaml/bash/json which we borrow wholesale.  Emacs has
-beautiful Lisp highlighting elsewhere via `lisp-mode`, but that's
-regex/`syntax-table`-based and doesn't compose with the treesit
-multi-language machinery.
+**Common Lisp highlighting comes from nvim-treesitter** —
+`editor/emacs/queries/commonlisp/highlights.scm` is vendored
+verbatim from upstream (Apache-2.0) and translated to Emacs
+capture names and predicates at load time.  See the header of
+that file for the source commit and refresh procedure.  No
+`commonlisp-ts-mode` ships in Emacs (Lisp's classic
+`lisp-mode`/`font-lock-keywords` + `syntax-table` stack already
+covers plain `.lisp` files beautifully — but that machinery
+doesn't compose with treesit's multi-language injection, so we
+need a tree-sitter grammar here).
+
+Two rules from the upstream paint everything — `(sym_lit) @variable`
+on every symbol, and every paren as `@punctuation.bracket`.  These
+are kept at `treesit-font-lock-level` 4 (off at the default 3) so
+you don't get a sea of variable-faced symbols in templated calls
+where they wouldn't be useful.  Opt in with
+`(setq treesit-font-lock-level 4)` if you want them.
