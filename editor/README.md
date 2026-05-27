@@ -1,30 +1,38 @@
 # ELP editor support
 
-Two parallel paths for editing `.elp` files in Neovim, sharing the
-same filename-based subtype detection: tree-sitter (better — gives
-injections, text objects, runs vlime cleanly inside `<% %>`) and a
-vim regex syntax fallback (works without `tree-sitter-cli` or any
-parser build).
-
-The fallback is loaded unconditionally; tree-sitter takes precedence
-when its `elp` parser is installed.
+Neovim is the reference setup — tree-sitter with full host-language
+injection, plus a regex syntax fallback. Emacs (30+) has parallel
+tree-sitter support sharing the same grammar.
 
 ```
 editor/
-├── nvim/
-│   ├── ftdetect/elp.vim       `*.elp` → filetype `elp`
-│   ├── ftplugin/elp.lua       sets vim.b.elp_host from filename
-│   ├── plugin/elp.lua         registers `#elp-host!` query directive
-│   ├── syntax/elp.vim         regex syntax + subtype dispatch
-│   ├── lua/elp/init.lua       filename → tree-sitter-parser map
-│   └── queries/elp/
-│       ├── highlights.scm     delimiter highlights
-│       └── injections.scm     `(code) → commonlisp`,
-│                              `(content) → vim.b.elp_host`
-└── tree-sitter-elp/
+├── nvim/                      reference setup, full injection
+├── emacs/elp-ts-mode.el       treesit mode for `.elp' files
+└── tree-sitter-elp/           shared grammar (used by both)
     ├── grammar.js             minimal ERB-subset grammar
-    └── queries/
-        └── highlights.scm     parser-level highlights
+    └── queries/highlights.scm parser-level highlights
+```
+
+## Neovim
+
+Two parallel paths sharing the same filename-based subtype detection:
+tree-sitter (better — injections, text objects, runs vlime cleanly
+inside `<% %>`) and a vim regex syntax fallback (works without
+`tree-sitter-cli` or any parser build). Fallback loads
+unconditionally; tree-sitter takes precedence when its `elp` parser
+is installed.
+
+```
+nvim/
+├── ftdetect/elp.vim       `*.elp` → filetype `elp`
+├── ftplugin/elp.lua       sets vim.b.elp_host from filename
+├── plugin/elp.lua         registers `#elp-host!` query directive
+├── syntax/elp.vim         regex syntax + subtype dispatch
+├── lua/elp/init.lua       filename → tree-sitter-parser map
+└── queries/elp/
+    ├── highlights.scm     delimiter highlights
+    └── injections.scm     `(code) → commonlisp`,
+                           `(content) → vim.b.elp_host`
 ```
 
 ## Subtype detection
@@ -131,8 +139,76 @@ Tracks `plans/elp-nvim-filetype.md`:
       respects injection boundaries
 - [ ] Polish: ftplugin (`commentstring`, `iskeyword`)
 
-## Other editors
+## Emacs (30+)
 
-Not yet. Other editors / plugin managers would need their own
-integration; nothing here has been verified outside lazy.nvim with
-nvim-treesitter `main`.
+Requires Emacs built with tree-sitter (`(treesit-available-p)` → `t`)
+and a C compiler on PATH for the grammar build.  Tested on Emacs
+30.2; should also work on 29 but no longer verified there.
+
+Multi-language by construction: `<% %>` tags inject `commonlisp`,
+the outer text injects a host language resolved from the filename
+(`service.yml.elp` → yaml, `Makefile.elp` → make, etc.) via
+`elp-ts-mode-host-language-alist`.  Host font-lock is **lifted from
+the host's own `*-ts-mode` `--font-lock-settings`**, so yaml/bash/
+json/etc. highlighting inside `.elp` files matches what you'd see
+opening a plain `.yml`/`.sh`/`.json` — no reimplementation.
+
+Load the mode (from a local checkout):
+
+```elisp
+(add-to-list 'load-path "/path/to/elp/editor/emacs")
+(require 'elp-ts-mode)
+;; M-x treesit-install-language-grammar RET elp RET
+;; (the mode self-registers the source — no URL to copy)
+```
+
+Or with `use-package`:
+
+```elisp
+(use-package elp-ts-mode
+  :load-path "/path/to/elp/editor/emacs"
+  :mode "\\.elp\\'")
+```
+
+Then install any host grammars you'll use.  Emacs ships a default
+`treesit-language-source-alist` covering the common ones; otherwise
+add entries (see this repo's `~/.emacs.d/init.el` example).  Typical
+set for templates in this repo:
+
+| Grammar    | Source repo                                 |
+| ---------- | ------------------------------------------- |
+| commonlisp | `theHamsta/tree-sitter-commonlisp`          |
+| yaml       | `ikatyang/tree-sitter-yaml`                 |
+| bash       | `tree-sitter/tree-sitter-bash`              |
+| json       | `tree-sitter/tree-sitter-json`              |
+| dockerfile | `camdencheek/tree-sitter-dockerfile`        |
+| make       | `alemuller/tree-sitter-make`                |
+| ini        | `justinmk/tree-sitter-ini` (for `*.service.elp`) |
+
+Install with `M-x treesit-install-language-grammar RET <name> RET`
+for each — the `.so` files land in `~/.emacs.d/tree-sitter/` and
+become available across all your Emacs sessions, not just for ELP.
+
+**Graceful degradation.**  Any host grammar that isn't installed is
+silently skipped — that filename's outer text renders as plain
+text, but ELP tags and (if `commonlisp` is installed) Lisp inside
+them still highlight.  Some host languages have no upstream
+tree-sitter grammar at all; files with those extensions get
+plain-text outer content.
+
+Verify:
+
+- `M-x elp-ts-mode` in a `.elp` buffer doesn't error
+- `M-x treesit-explore-mode` shows `template` / `directive` /
+  `output_directive` / `comment_directive` nodes
+- `<% %>` delimiters get `font-lock-keyword-face`
+- Inside `<%= %>`: strings/numbers/`:keywords` get Lisp faces
+- Outside: yaml keys, JSON keys, etc. get their host-mode faces
+
+**Common Lisp font-lock is intentionally minimal** (strings,
+numbers, comments, `:keywords`) because no `commonlisp-ts-mode`
+ships in Emacs, so there's no `--font-lock-settings` to lift —
+unlike yaml/bash/json which we borrow wholesale.  Emacs has
+beautiful Lisp highlighting elsewhere via `lisp-mode`, but that's
+regex/`syntax-table`-based and doesn't compose with the treesit
+multi-language machinery.
