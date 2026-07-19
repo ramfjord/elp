@@ -37,10 +37,23 @@
   "Write CONTENT to a fresh .elp file in the system temp directory,
    bind PATH-VAR to its pathname for BODY, and delete the file on
    exit (normal or non-local)."
+  ;; :EXTERNAL-FORMAT is explicit because tests assert on byte offsets
+  ;; into the written file. Leaving it to the implementation default
+  ;; would make those assertions depend on the host's locale.
   `(uiop:with-temporary-file (:pathname ,path-var :type "elp")
-     (with-open-file (f ,path-var :direction :output :if-exists :supersede)
+     (with-open-file (f ,path-var :direction :output :if-exists :supersede
+                                  :external-format :utf-8)
        (write-string ,content f))
      ,@body))
+
+(defparameter +utf8-template+
+  (concatenate 'string "x" (string (code-char 233)) (string (code-char 233))
+               "y<%= name %>z")
+  "Shared non-ASCII fixture: two e-acutes (2 UTF-8 bytes each) precede
+   the tag, so \"name\" begins at CHARACTER index 8 and BYTE offset 10.
+   Any assertion that conflates the two units fails on this input and
+   passes on an ASCII one — which is precisely how the units confusion
+   went unnoticed.")
 
 (defun render-string (template &rest kwargs)
   "Write TEMPLATE to a temp file, render it with KWARGS as the
@@ -395,8 +408,14 @@
   "Body chars whose source is a <% %> or <%= %> block map to their
    original .elp byte. Walk every char of the drained stream and
    verify that anchored chars round-trip to bytes whose template
-   content matches the read char."
-  (with-template-file (p "x<%= name %>y")
+   content matches the read char.
+
+   Runs on the non-ASCII fixture: MMAP-SOURCE offsets are byte offsets
+   and its text decode is latin-1 (one char per byte), so indexing the
+   raw byte vector with the mapped offset stays exact even where a
+   character spans several bytes. On an ASCII template this assertion
+   would hold for the wrong reason."
+  (with-template-file (p +utf8-template+)
     (let* ((source-bytes (with-open-file (f p :element-type '(unsigned-byte 8))
                            (let ((buf (make-array (file-length f)
                                                   :element-type '(unsigned-byte 8))))
@@ -456,13 +475,45 @@
       (is (= anchored-doc round-trip)))))
 
 (test source-offset->doc-offset-identity-default
-  "T methods default to identity — translators that produce a
-   byte-equivalent canvas (and consumers that haven't registered a
+  "T methods default to identity — translators that produce an
+   offset-equivalent canvas (and consumers that haven't registered a
    real mapping) get a no-op pair for free."
   ;; A stand-in object — any value other than a closed-template uses
   ;; the T-method identity defaults.
   (is (= 42 (elp:doc-offset->source-offset :stub 42)))
   (is (= 17 (elp:source-offset->doc-offset :stub 17))))
+
+(defun %anchor-of-name (source)
+  "Source offset the position-map assigns to \"name\" in
+   +UTF8-TEMPLATE+, whatever unit SOURCE counts in."
+  (let* ((tmpl (elp:translate-open source))
+         (doc  (elp:open-template-text tmpl)))
+    (loop for d below (- (length doc) 4)
+          when (and (string= "name" (subseq doc d (+ d 4)))
+                    (integerp (elp:doc-offset->source-offset tmpl d)))
+            return (elp:doc-offset->source-offset tmpl d))))
+
+(test position-map-source-offsets-use-each-backends-unit
+  "Source offsets are reported in the backing source's own unit, and
+   the two backends legitimately differ.
+
+   On +UTF8-TEMPLATE+ the token \"name\" begins at character 8 and byte
+   10. STRING-SOURCE is backed by a Lisp string and reports 8;
+   MMAP-SOURCE addresses mapped memory and reports 10. Neither is
+   wrong — they are answering in different units, which is why
+   SOURCE-OFFSET-UNIT exists and why callers must consult it instead
+   of assuming.
+
+   This is the pairing an ASCII fixture cannot express: there, 8 and
+   10 would both be 8 and the test would pass no matter which unit the
+   implementation used."
+  (is (eq :character (elp:source-offset-unit (elp:string-source "x"))))
+  (is (= 8 (%anchor-of-name (elp:string-source +utf8-template+)))
+      "string-source anchors \"name\" at character index 8")
+  (with-template-file (p +utf8-template+)
+    (is (eq :byte (elp:source-offset-unit (elp:filepath-source p))))
+    (is (= 10 (%anchor-of-name (elp:filepath-source p)))
+        "mmap-source anchors the same token at byte offset 10")))
 
 (test translate-closed-empty-template
   "Empty .elp yields a minimal lambda that drains and reads as a
