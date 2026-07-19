@@ -744,12 +744,38 @@
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
+(defun %run-extent (map cp)
+  "Length of the run CP describes, or NIL if CP is the last checkpoint
+   (its run extends to the end of the document).
+
+   Checkpoints record only where a run *starts*. Between two adjacent
+   checkpoints the mapping is affine, so a run's length is the gap to
+   the next checkpoint's doc key -- and because the mapping is affine,
+   that same length measures the run in the source coordinate space
+   too. MAP is newest-first (strictly descending doc keys), so the
+   successor in doc order is the entry immediately *before* CP."
+  (let ((successor nil))
+    (dolist (entry map)
+      (when (eq entry cp)
+        (return (and successor (- (car successor) (car cp)))))
+      (setf successor entry))))
+
 (defmethod source-offset->doc-offset ((s template) source-offset)
-  (when-let ((cp (find-if (lambda (c)
-                            (and (integerp (cdr c)) (<= (cdr c) source-offset)))
-                          (position-map s))))
-    (destructuring-bind (cp-doc . cp-src) cp
-      (+ cp-doc (- source-offset cp-src)))))
+  ;; Unlike the doc side, source offsets are not partitioned by the
+  ;; checkpoint sequence: source that produces no document text (a
+  ;; stripped <%# comment %>, template literal past the final anchored
+  ;; run) has no checkpoint of its own. Without a bound, the nearest
+  ;; preceding anchor would be extrapolated indefinitely and return a
+  ;; confident doc offset pointing into unrelated synthesized wrapper.
+  ;; Bound the extrapolation by the run's extent instead.
+  (let ((map (position-map s)))
+    (when-let ((cp (find-if (lambda (c)
+                              (and (integerp (cdr c)) (<= (cdr c) source-offset)))
+                            map)))
+      (destructuring-bind (cp-doc . cp-src) cp
+        (let ((extent (%run-extent map cp)))
+          (when (or (null extent) (< (- source-offset cp-src) extent))
+            (+ cp-doc (- source-offset cp-src))))))))
 
 (defun %drain-template-body (inner)
   "Walk INNER (a TEMPLATE-BODY-TRANSLATOR) NEXT-TOKEN→TRANSLATE-TOKEN

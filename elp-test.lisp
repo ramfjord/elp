@@ -474,6 +474,39 @@
       (is (integerp src))
       (is (= anchored-doc round-trip)))))
 
+(test source-offset->doc-offset-stops-at-the-end-of-a-run
+  "SOURCE-OFFSET->DOC-OFFSET must not invent a document position for
+   source that produces no document text.
+
+   Source offsets are not partitioned by the checkpoint sequence the
+   way doc offsets are: template literal text past the final anchored
+   run has no checkpoint of its own. Extrapolating from the nearest
+   preceding anchor without bounding it by that anchor's extent yields
+   a plausible-looking offset pointing into synthesized wrapper code.
+   DOC-OFFSET->SOURCE-OFFSET is the honest direction, so a result that
+   does not map back is the signature of the bug."
+  (let* ((content "hello<%= name %>world")
+         (tmpl    (elp:translate-open (elp:string-source content)))
+         (phantoms '()))
+    (dotimes (i (length content))
+      (let ((d (elp:source-offset->doc-offset tmpl i)))
+        (when (and (integerp d)
+                   (null (elp:doc-offset->source-offset tmpl d)))
+          (push (list i (char content i) d) phantoms))))
+    (is (null phantoms)
+        "these source offsets claim a document position that maps back ~
+         to NIL (offset char doc-offset): ~S"
+        (nreverse phantoms)))
+  ;; The anchored region itself must still map, or the bound is too
+  ;; tight and we have traded a false positive for a false negative.
+  (let* ((content "hello<%= name %>world")
+         (tmpl    (elp:translate-open (elp:string-source content)))
+         (mapped  (loop for i below (length content)
+                        count (integerp (elp:source-offset->doc-offset tmpl i)))))
+    (is (>= mapped 4)
+        "the source inside <%= name %> must still resolve; only ~D ~
+         offsets mapped" mapped)))
+
 (test source-offset->doc-offset-identity-default
   "T methods default to identity — translators that produce an
    offset-equivalent canvas (and consumers that haven't registered a
