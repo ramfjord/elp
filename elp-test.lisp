@@ -406,7 +406,7 @@
            (text (elp:closed-template-text tt))
            (anchored-count 0))
       (loop for pos below (length text)
-            for src = (elp:doc-offset->source-byte tt pos)
+            for src = (elp:doc-offset->source-offset tt pos)
             when src
               do (is (char= (char text pos) (code-char (aref source-bytes src)))
                      "char ~S at doc-offset ~D → source-byte ~D should match source byte ~A"
@@ -424,7 +424,7 @@
     (let* ((tt (elp:translate-closed (elp:filepath-source p)))
            (text (elp:closed-template-text tt))
            (results (loop for pos below (length text)
-                          collect (cons pos (elp:doc-offset->source-byte tt pos)))))
+                          collect (cons pos (elp:doc-offset->source-offset tt pos)))))
       ;; The first two chars are `(l` opening the lambda — no source.
       (is (null (cdr (assoc 0 results)))
           "first char (the '(' of lambda) has no source")
@@ -435,7 +435,7 @@
       (is (find-if (lambda (pair) (integerp (cdr pair))) results)
           "at least one body char has a numeric source byte")
       ;; Positions past EOF return NIL.
-      (is (null (elp:doc-offset->source-byte tt (1+ (length text))))))))
+      (is (null (elp:doc-offset->source-offset tt (1+ (length text))))))))
 
 (test translate-closed-source->doc-round-trip
   "DOC-OFFSET->SOURCE-BYTE and SOURCE-BYTE->DOC-OFFSET form a
@@ -447,22 +447,22 @@
            ;; Pick an anchored doc offset by scanning forward.
            (anchored-doc
             (loop for pos from 0
-                  for src = (elp:doc-offset->source-byte s pos)
+                  for src = (elp:doc-offset->source-offset s pos)
                   until (integerp src)
                   finally (return pos)))
-           (src (elp:doc-offset->source-byte s anchored-doc))
-           (round-trip (elp:source-byte->doc-offset s src)))
+           (src (elp:doc-offset->source-offset s anchored-doc))
+           (round-trip (elp:source-offset->doc-offset s src)))
       (is (integerp src))
       (is (= anchored-doc round-trip)))))
 
-(test source-byte->doc-offset-identity-default
+(test source-offset->doc-offset-identity-default
   "T methods default to identity — translators that produce a
    byte-equivalent canvas (and consumers that haven't registered a
    real mapping) get a no-op pair for free."
   ;; A stand-in object — any value other than a closed-template uses
   ;; the T-method identity defaults.
-  (is (= 42 (elp:doc-offset->source-byte :stub 42)))
-  (is (= 17 (elp:source-byte->doc-offset :stub 17))))
+  (is (= 42 (elp:doc-offset->source-offset :stub 42)))
+  (is (= 17 (elp:source-offset->doc-offset :stub 17))))
 
 (test translate-closed-empty-template
   "Empty .elp yields a minimal lambda that drains and reads as a
@@ -516,11 +516,11 @@
          (text (elp:open-template-text st))
          (anchored-doc
           (loop for pos below (length text)
-                when (integerp (elp:doc-offset->source-byte st pos))
+                when (integerp (elp:doc-offset->source-offset st pos))
                   return pos)))
     (is (integerp anchored-doc))
-    (let* ((src (elp:doc-offset->source-byte st anchored-doc))
-           (round-trip (elp:source-byte->doc-offset st src)))
+    (let* ((src (elp:doc-offset->source-offset st anchored-doc))
+           (round-trip (elp:source-offset->doc-offset st src)))
       (is (integerp src))
       (is (= anchored-doc round-trip)))))
 
@@ -553,12 +553,12 @@
     (is (eq 'lambda (first (elp:template-form lt))))
     ;; DOC↔SOURCE generics work on either subclass.
     (let ((doc-pos (loop for pos below (length (elp:template-text st))
-                         when (integerp (elp:doc-offset->source-byte st pos))
+                         when (integerp (elp:doc-offset->source-offset st pos))
                            return pos)))
       (is (integerp doc-pos))
       (is (= doc-pos
-             (elp:source-byte->doc-offset
-              st (elp:doc-offset->source-byte st doc-pos)))))))
+             (elp:source-offset->doc-offset
+              st (elp:doc-offset->source-offset st doc-pos)))))))
 
 ;;;; ============================================================
 ;;;; Source open/close protocol — pure construction, explicit

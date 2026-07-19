@@ -25,11 +25,14 @@
    :string-source
    :filepath-source
    :source-name
+   :source-offset-unit
    :open-source
    :close-source
    :with-open-source
    ;; Translation interface — materialized lambda-form text plus a
-   ;; reversible doc-offset ↔ source-byte mapping for static analysis.
+   ;; reversible doc-offset ↔ source-offset mapping for static
+   ;; analysis. Source offsets are in the backing source's own unit;
+   ;; see SOURCE-OFFSET-UNIT.
    ;; Two layers:
    ;;   OPEN-TEMPLATE   — bare emitter form (source-wrapped body +
    ;;                     handler-bind), free of any callable signature;
@@ -51,5 +54,5 @@
    :open-template
    :open-template-text
    :open-template-free-vars
-   :doc-offset->source-byte
-   :source-byte->doc-offset))
+   :doc-offset->source-offset
+   :source-offset->doc-offset))

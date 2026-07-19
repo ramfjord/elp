@@ -143,6 +143,30 @@
    "Return a display name for SOURCE — typically a pathname for
     MMAP-SOURCE, a caller-supplied string for STRING-SOURCE."))
 
+(defgeneric source-offset-unit (source)
+  (:documentation
+   "Return the unit SOURCE's offsets are counted in: :BYTE or
+    :CHARACTER. Every offset in the SOURCE protocol — and every source
+    offset in a template's position-map — is expressed in this unit.
+
+    The backends genuinely differ, and the difference is not an
+    oversight to be unified away:
+
+      MMAP-SOURCE   → :BYTE. It addresses mapped memory directly and
+                      decodes latin-1 (one char per byte), which is
+                      what lets its codegen emit byte ranges instead of
+                      embedding the template text. Byte addressing is
+                      the point of the backend.
+
+      STRING-SOURCE → :CHARACTER. It is backed by a Lisp string, whose
+                      only natural index is the character.
+
+    For ASCII input the two coincide, which is why the distinction is
+    easy to miss; they diverge by the accumulated UTF-8 overhead as
+    soon as a template holds a multi-byte character. A consumer that
+    needs one specific unit should pick the backend providing it (or
+    convert); this generic is how it finds out which it has."))
+
 (defgeneric source-emit-text-form (source start end)
   (:documentation
    "Return a STRING of Lisp source — one form — that writes the
@@ -280,6 +304,10 @@
 (defmethod source-name ((s mmap-source))
   (mmap-source-pathname s))
 
+(defmethod source-offset-unit ((s mmap-source))
+  "Offsets index mapped memory directly."
+  :byte)
+
 (defmethod source-emit-text-form ((s mmap-source) start end)
   ;; Zero-copy: references elp::ptr bound by SOURCE-WRAP-LAMBDA-BODY.
   (format nil "(elp::write-mmap-range elp::ptr ~D ~D) " start end))
@@ -344,6 +372,10 @@
 
 (defmethod source-name ((s string-source))
   (string-source-name s))
+
+(defmethod source-offset-unit ((s string-source))
+  "Offsets index a Lisp string."
+  :character)
 
 (defmethod source-emit-text-form ((s string-source) start end)
   ;; Inline the literal — no runtime source binding needed.

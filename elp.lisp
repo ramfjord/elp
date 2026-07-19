@@ -684,41 +684,57 @@
               (slot-value s 'source-name) name)))))
 
 ;;;; ============================================================
-;;;; Reversible doc-offset ↔ source-byte mapping.
+;;;; Reversible doc-offset ↔ source-offset mapping.
 ;;;;
-;;;; Two paired generics. CLOSED-TEMPLATE specializes both;
-;;;; together they form a reversible mapping between coordinates in
-;;;; the translated text and bytes in the original source.
+;;;; Two paired generics. CLOSED-TEMPLATE specializes both; together
+;;;; they form a reversible mapping between coordinates in the
+;;;; translated text and positions in the original source.
 ;;;;
-;;;; T methods on both default to identity — translators that produce
-;;;; a byte-equivalent canvas (source and document offsets coincide)
-;;;; inherit identity behavior for free.
+;;;; UNITS. The doc side is always a character index into
+;;;; TEMPLATE-TEXT, which is a Lisp string. The source side is in
+;;;; whatever unit the backing SOURCE counts in -- bytes for
+;;;; MMAP-SOURCE, characters for STRING-SOURCE. Ask the source via
+;;;; SOURCE-OFFSET-UNIT; do not assume. The two agree for ASCII and
+;;;; diverge by the accumulated UTF-8 overhead after the first
+;;;; multi-byte character, so an unchecked assumption here produces
+;;;; positions that drift rather than an outright failure.
 ;;;;
-;;;; Returns NIL when the input position has no corresponding location
-;;;; in the other coordinate system: synthesized chars (no source
-;;;; backing) for DOC-OFFSET->SOURCE-BYTE, and source bytes that don't
+;;;; These generics deliberately do NOT normalize the two backends to
+;;;; a common unit. The backends produce structurally different
+;;;; documents to begin with (MMAP-SOURCE emits byte-range writes and
+;;;; never embeds the template text; STRING-SOURCE inlines it), so
+;;;; there is no shared coordinate space to normalize into.
+;;;;
+;;;; T methods on both default to identity -- translators whose canvas
+;;;; is offset-equivalent to their source inherit that for free.
+;;;;
+;;;; Returns NIL when the input position has no counterpart in the
+;;;; other coordinate system: synthesized characters (no source
+;;;; backing) for DOC-OFFSET->SOURCE-OFFSET, and source that does not
 ;;;; appear in the document (e.g. inside a stripped <%# comment %>)
-;;;; for SOURCE-BYTE->DOC-OFFSET.
+;;;; for SOURCE-OFFSET->DOC-OFFSET.
 
-(defgeneric doc-offset->source-byte (s doc-offset)
+(defgeneric doc-offset->source-offset (s doc-offset)
   (:documentation
    "Map DOC-OFFSET (a character index into S's translated text) to the
-    corresponding source byte in the .elp file. Returns NIL when
+    corresponding position in the source. The result is in the backing
+    source's own unit -- see SOURCE-OFFSET-UNIT. Returns NIL when
     DOC-OFFSET lies in synthesized (non-source-anchored) territory."))
 
-(defgeneric source-byte->doc-offset (s source-byte)
+(defgeneric source-offset->doc-offset (s source-offset)
   (:documentation
-   "Map SOURCE-BYTE (an offset into the .elp file) to the
-    corresponding character index in S's translated text. Returns NIL
-    when SOURCE-BYTE has no representation in the document (e.g.
-    bytes inside a comment tag that was stripped)."))
+   "Map SOURCE-OFFSET (a position in the source, in that source's own
+    unit -- see SOURCE-OFFSET-UNIT) to the corresponding character
+    index in S's translated text. Returns NIL when SOURCE-OFFSET has
+    no representation in the document (e.g. inside a comment tag that
+    was stripped)."))
 
-;; T-method identity defaults — byte-equivalent translators inherit
+;; T-method identity defaults -- offset-equivalent translators inherit
 ;; these without writing any methods.
-(defmethod doc-offset->source-byte ((s t) doc-offset) doc-offset)
-(defmethod source-byte->doc-offset  ((s t) source-byte) source-byte)
+(defmethod doc-offset->source-offset ((s t) doc-offset) doc-offset)
+(defmethod source-offset->doc-offset ((s t) source-offset) source-offset)
 
-(defmethod doc-offset->source-byte ((s template) doc-offset)
+(defmethod doc-offset->source-offset ((s template) doc-offset)
   ;; Single method on the protocol class — both OPEN-TEMPLATE and
   ;; CLOSED-TEMPLATE pre-shift their position-map keys to be
   ;; doc-relative at construction, so the lookup is identical.
@@ -728,12 +744,12 @@
     (destructuring-bind (cp-doc . cp-src) cp
       (when cp-src (+ cp-src (- doc-offset cp-doc))))))
 
-(defmethod source-byte->doc-offset ((s template) source-byte)
+(defmethod source-offset->doc-offset ((s template) source-offset)
   (when-let ((cp (find-if (lambda (c)
-                            (and (integerp (cdr c)) (<= (cdr c) source-byte)))
+                            (and (integerp (cdr c)) (<= (cdr c) source-offset)))
                           (position-map s))))
     (destructuring-bind (cp-doc . cp-src) cp
-      (+ cp-doc (- source-byte cp-src)))))
+      (+ cp-doc (- source-offset cp-src)))))
 
 (defun %drain-template-body (inner)
   "Walk INNER (a TEMPLATE-BODY-TRANSLATOR) NEXT-TOKEN→TRANSLATE-TOKEN

@@ -294,14 +294,25 @@ Both implement a shared `template` protocol:
 
 - **`(template-text t)`** — string. PRIN1'd generated code, READable.
 - **`(template-form t)`** — convenience: `(read-from-string (template-text t))`.
-- **`(doc-offset->source-byte t doc-offset)`** / **`(source-byte->doc-offset t source-byte)`**
+- **`(doc-offset->source-offset t doc-offset)`** / **`(source-offset->doc-offset t source-offset)`**
   — paired position mapping. Forward direction returns the
-  originating source byte (NIL for synthesized wrapper / delimiter /
+  originating source offset (NIL for synthesized wrapper / delimiter /
   text-emit territory). Reverse returns the document offset where
-  `source-byte` appears (NIL if the byte doesn't surface in the
+  `source-offset` appears (NIL if it doesn't surface in the
   document, e.g. inside a stripped `<%# comment %>`). Both default
-  to identity via T methods, so byte-equivalent translators get
+  to identity via T methods, so offset-equivalent translators get
   no-op behavior for free.
+
+  **Units:** the doc side is always a character index into
+  `template-text`. The source side is in the backing source's own
+  unit — **bytes** for `mmap-source`, **characters** for
+  `string-source`. Ask `(source-offset-unit source)`; don't assume.
+  The two coincide for ASCII and diverge by the accumulated UTF-8
+  overhead after the first multi-byte character, so guessing gives
+  you positions that drift rather than an error. The backends aren't
+  normalized to a common unit because they don't produce a common
+  document — `mmap-source` emits byte-range writes and never embeds
+  the template text, `string-source` inlines it.
 
 **`(translate-closed source)` → `closed-template`**
 
@@ -323,8 +334,8 @@ host project provides, instead of being shadowed by a synthesized
 (let ((tt (translate-closed (filepath-source #p"foo.elp"))))
   (template-text tt)               ; → "(lambda (stream &key name) …)"
   (closed-template-open tt)        ; → #<open-template …>
-  (doc-offset->source-byte tt 42)  ; → 17 (or NIL)
-  (source-byte->doc-offset tt 17)) ; → 42 (or NIL)
+  (doc-offset->source-offset tt 42)  ; → 17 (or NIL)
+  (source-offset->doc-offset tt 17)) ; → 42 (or NIL)
 
 (let ((st (translate-open (filepath-source #p"foo.elp"))))
   (template-text st)               ; → "(let ((elp::source …)) (handler-bind …))"
@@ -466,8 +477,8 @@ mmap-source — vectorized newline scan).
 Both `open-template` and `closed-template` inherit the position-map
 for their body region (with keys shifted by each layer's prefix
 length); prefix/suffix chars (synthesized wrapper) return NIL from
-`doc-offset->source-byte`. That's how an LSP turns a cursor in its
-translated buffer back into a source-file byte.
+`doc-offset->source-offset`. That's how an LSP turns a cursor in its
+translated buffer back into a position in the source file.
 
 ## Long-lived server (`elp/server`)
 
